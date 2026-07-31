@@ -17,9 +17,9 @@ ando-deploy/
 ## 버전 브랜치
 
 - `main` — 항상 최신 버전
-- `release/x.y.z` — 각 배포 시점의 스냅샷 (예: `release/1.0.0`)
+- `release_v1`, `release_v2` … — 각 배포 시점의 스냅샷
 
-새 버전을 배포할 때는 `main`에서 `release/x.y.z` 브랜치를 새로 따서 태깅하는 방식을 씁니다.
+새 버전을 배포할 때는 `main`에서 `release_vN` 브랜치를 새로 따는 방식을 씁니다.
 
 ## 시작하기
 
