@@ -1,0 +1,31 @@
+# ── secrets ──────────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+frontend/google-services.json
+frontend/GoogleService-Info.plist
+backend/firebase-key.json
+
+# ── frontend (Expo/React Native) ──────────────────────────────────────────────
+frontend/node_modules/
+frontend/.expo/
+frontend/android/
+frontend/ios/
+frontend/dist/
+
+# ── backend (Python) ───────────────────────────────────────────────────────────
+backend/venv/
+backend/.venv/
+backend/__pycache__/
+backend/**/__pycache__/
+*.pyc
+
+# 그래프 원본/캐시 — 용량 커서 git에 포함 안 함 (backend/README.md 참고)
+backend/data/*
+!backend/data/.gitkeep
+
+# ── OS / editor ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
