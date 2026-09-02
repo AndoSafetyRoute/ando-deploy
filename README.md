@@ -40,7 +40,7 @@ git에 커밋하지 않았습니다:
 
 경사 비용 곡선 `c_u(g)` 개인화를 위한 **신호 A~D 수집 파이프라인**이 들어갔습니다.
 아직 학습(⑨ θ 적합)은 없고, **데이터를 모으는 코드만** 완성된 상태입니다.
-설계 근거: `ando_ml_plan_v2.md`, `ando_cch_personalization.md`, `ando_personalization_be_handoff.md`.
+설계 근거 문서(`ando_ml_plan_v2` 등)는 개발 레포에 있습니다.
 
 - **백엔드**: `POST /collect/batch`(신호 A~D 배치, `(uid,session_id,seq)` 멱등),
   `POST /route?candidates=compare`(경로 비교용 후보 배열), 신규 테이블 8종,

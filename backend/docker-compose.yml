@@ -1,0 +1,29 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: ando-backend
+
+    ports:
+      - "5000:5000"
+
+    env_file:
+      - .env
+
+    volumes:
+      # 대용량 경사도 데이터와 생성된 pickle 캐시 유지
+      - ./data:/app/data
+
+      # Firebase 키를 읽기 전용으로 연결
+      - ./firebase-key.json:/app/firebase-key.json:ro
+
+    restart: unless-stopped
+
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+        reservations:
+          memory: 4G
