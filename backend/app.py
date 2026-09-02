@@ -14,6 +14,7 @@ from config import GEOJSON_PATH
 from routing import build_graph, find_route, USER_TYPES, classify_zone, precompute_edge_costs
 from routing.search import build_spatial_index
 from routing.cch_engine import build_cch_engine, CCHEngine
+from routing.personal_cache import PersonalMetricCache
 from places.kakao import search_places, debug_raw
 from database import (
     init_db, get_db, get_or_create_user, update_user_type,
@@ -22,7 +23,8 @@ from database import (
     get_user_bookmarks, save_user_bookmark, delete_user_bookmark,
     get_search_history, save_search_history,
     start_navigation, add_navigation_segment, complete_navigation,
-    save_zone_observation, get_user_speed_profile, delete_user_account,
+    save_zone_observation, get_user_speed_profile, save_collect_batch,
+    delete_user_account,
 )
 from routing.speed import get_zone_key, estimate_route_time, get_default_speed
 from routing.segments import build_navigation_segments, extract_waypoints
@@ -36,6 +38,7 @@ from lowfloor_bus import get_lowfloor_info
 G = None
 _spatial_index = None
 _cch: CCHEngine | None = None
+_personal_cache: PersonalMetricCache | None = None
 _subway_db: SubwayFacilityDB | None = None
 # extract_waypoints(G)는 그래프 전체 노드를 순회해 교차로를 찾는다 — 서울 전역
 # 그래프(수십만 노드)에서 이걸 매 /route 요청마다 다시 계산하면 요청당 유의미한
@@ -45,7 +48,7 @@ _waypoints_set: set | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global G, _spatial_index, _cch, _subway_db, _waypoints_set
+    global G, _spatial_index, _cch, _personal_cache, _subway_db, _waypoints_set
     print("그래프 로딩 중... (최초 1회)")
     G = build_graph(GEOJSON_PATH)
     precompute_edge_costs(G)
@@ -56,14 +59,19 @@ async def lifespan(app: FastAPI):
     # CCH 전처리 (서울 전역 그래프에서 유효, 용산구는 NetworkX로도 충분)
     if G.number_of_nodes() > 200_000:
         try:
-            print(f"[CCH] 노드 {G.number_of_nodes():,}개 — CCH 전처리 시작 (1~5분 소요)")
+            print(f"[CCH] 노드 {G.number_of_nodes():,}개 - CCH 전처리 시작 (1~5분 소요)")
             _cch = build_cch_engine(G)
-            print("[CCH] 준비 완료 — 이후 /route 요청은 CCH로 처리됩니다")
+            print("[CCH] 준비 완료 - 이후 /route 요청은 CCH로 처리됩니다")
+            # 개인 맞춤 metric 캐시 (⑧) - 시작 시엔 비어있음, 배치 스크립트(⑨)가
+            # /personal/refresh 등으로 채워야 우선 채워짐. 요청 경로에서는
+            # 절대 여기서 학습하지 않고, 이미 채워진 걸 읽기만 한다.
+            _personal_cache = PersonalMetricCache(_cch.cch, _cch.basis_weights)
         except Exception as e:
-            print(f"[CCH] 초기화 실패 → NetworkX fallback: {e}")
+            print(f"[CCH] 초기화 실패 -> NetworkX fallback: {e}")
             _cch = None
+            _personal_cache = None
     else:
-        print(f"[CCH] 노드 {G.number_of_nodes():,}개 — NetworkX 모드 유지")
+        print(f"[CCH] 노드 {G.number_of_nodes():,}개 - NetworkX 모드 유지")
 
     try:
         init_db()
@@ -508,6 +516,79 @@ def api_complete_navigation(
     return result
 
 
+# ── 개인 맞춤 경로 추천 — 데이터 수집 (ando_dev_final.md 3.9절) ───────────────
+# 신호 A~D를 세션 종료 시 1회(또는 2분/200행마다 중간 플러시) 배치로 받는다.
+# 개별 전환마다 개별 POST를 쏘면 요청 폭증 + 배터리 소모가 커서 4종 엔드포인트가
+# 아니라 1종으로 통합했다.
+
+class SlopeObservationPayload(BaseModel):
+    route_id:     int | None = None
+    slope_bin:    float
+    distance_m:   float
+    elapsed_ms:   int
+    stop_ms:      int = 0
+    gps_sample_n: int
+
+
+class SpeedSamplePayload(BaseModel):
+    route_id:       int | None = None
+    slope_bin:      float
+    sub_distance_m: float
+    speed_ms:       float       # 원본 순간속도. 감속 판정(40% 등)은 학습 시점에 계산 (3.8절)
+
+
+class RouteCandidatePayload(BaseModel):
+    kind:      str              # 'type' | 'distance' | 'personal'
+    profile:   list[dict]       # [{bin, length_m}, ...] 경사 히스토그램
+    length_m:  float
+    shown_pos: int               # 화면에 표시된 위치 (라벨 편향 방지용 무작위 순서 기록)
+
+
+class RouteChoicePayload(BaseModel):
+    candidates:  list[RouteCandidatePayload]
+    n_shown:     int
+    chosen_kind: str | None = None   # 'type'|'distance'|'personal', None이면 "비교 없음"
+
+
+class SegmentFeedbackPayload(BaseModel):
+    route_id:   int | None = None
+    slope_mean: float
+    length_m:   float
+    verdict:    int             # -1 불편 / 0 보통 / +1 편함
+
+
+class CollectBatchRequest(BaseModel):
+    session_id:          str
+    seq:                 int
+    slope_observations:  list[SlopeObservationPayload] = []
+    speed_samples:       list[SpeedSamplePayload] = []
+    route_choice:        RouteChoicePayload | None = None
+    segment_feedback:    list[SegmentFeedbackPayload] = []
+
+
+@app.post("/collect/batch")
+def api_collect_batch(
+    body: CollectBatchRequest,
+    db: Session = Depends(get_db),
+    decoded: dict = Depends(_verified),
+):
+    """
+    개인 맞춤 경로 추천용 신호 A~D 배치 저장.
+    (uid, session_id, seq) 조합으로 멱등 처리 — 같은 배치를 재전송해도 중복 저장 안 됨.
+    """
+    result = save_collect_batch(
+        db,
+        uid=decoded["uid"],
+        session_id=body.session_id,
+        seq=body.seq,
+        slope_observations=[o.model_dump() for o in body.slope_observations],
+        speed_samples_in=[s.model_dump() for s in body.speed_samples],
+        route_choice=body.route_choice.model_dump() if body.route_choice else None,
+        segment_feedback_in=[f.model_dump() for f in body.segment_feedback],
+    )
+    return result
+
+
 # ── 요청 모델 ─────────────────────────────────────────────────────────────────
 class RouteRequest(BaseModel):
     origin_lon: float
@@ -517,6 +598,11 @@ class RouteRequest(BaseModel):
     user_type:  str = "elderly"
     algorithm:  str = "auto"
     mode:       str = "accessibility"
+    # ando_dev_final.md 8.2절 — 개인화 3경로 비교는 순수 보행 탐색 화면에서만 쓴다.
+    # 대중교통 도보 구간(TransitContent.tsx의 requestWalkLeg 등)은 반드시 기본값인
+    # "single"을 써야 한다. 안 그러면 카카오 후보 15개 × 도보구간 2개 = 최대 30개
+    # 쿼리가 90개로 늘어나 대중교통 탭이 지금보다 더 심하게 타임아웃 난다 (8.1절).
+    candidates: str = "single"   # "single" | "compare"
     # 목적지가 지하철역이면 역명을 함께 보냄 — 있으면 해당 역의 유형별 최적 출구
     # (엘리베이터/에스컬레이터) 좌표로 도착지를 스냅해서 경로를 계산한다.
     end_station_name: str | None = None
@@ -551,6 +637,8 @@ def api_route(
 ):
     if body.user_type not in USER_TYPES:
         raise HTTPException(400, f"유효하지 않은 user_type: {body.user_type}")
+    if body.candidates not in ("single", "compare"):
+        raise HTTPException(400, "candidates는 'single' 또는 'compare'여야 합니다")
 
     try:
         origin = (body.origin_lon, body.origin_lat)
@@ -724,6 +812,104 @@ def api_route(
             ],
             "waypoints": waypoints,
         }
+
+        if body.candidates == "compare":
+            # "personal" 후보는 로그인한 사용자의 캐시에 θ 기반 metric이 이미 있을
+            # 때만 채워진다 (⑧ PersonalMetricCache). 배치 스크립트(⑨)가 아직 없어서
+            # 지금은 캐시가 항상 비어있고, 그래서 아직은 사실상 "type"+"distance" 2개
+            # 뿐이다 — 배치가 채워지기 시작하면 코드 변경 없이 자동으로 3개가 된다.
+            # FE는 candidateRoutes 배열을 그대로 순회하면 되고, 길이를 2/3으로
+            # 가정하면 안 된다. 라벨은 반드시 중립(예: "경로 A/B/C")으로 표시하고,
+            # shown_pos는 매 응답마다 무작위로 섞어서 내려줘야 한다 (6.4절).
+            candidate_routes = [
+                {
+                    "kind":          "type",
+                    "coordinates":   coords,
+                    "totalDistance": total_length_m,
+                    "avgSlope":      avg_slope_pct,
+                    "estimatedTimeS": estimated_time_s,
+                    "routeSegments": segs,
+                },
+            ]
+
+            dist_result = None
+            if _cch is not None:
+                try:
+                    dist_result = _cch.find_distance_route(origin, dest)
+                    dist_coords = [
+                        [G.nodes[n]["lon"], G.nodes[n]["lat"]]
+                        for n in dist_result["path_nodes"]
+                    ]
+                    # 같은 경로면(노드열 동일) 중복 후보로 넣지 않는다 (6.3절 —
+                    # 가짜 선택이 쌓이면 β·γ 추정이 오염됨).
+                    if dist_result["path_nodes"] != result["path_nodes"]:
+                        dist_speed_profile: dict = {}
+                        if decoded:
+                            try:
+                                dist_speed_profile = get_user_speed_profile(db, decoded["uid"])
+                            except Exception:
+                                pass
+                        dist_segs_for_time = [
+                            {"zone": classify_zone(s["slope_pct"], s["direction"], body.user_type),
+                             "direction": s["direction"], "length_m": s["length_m"]}
+                            for s in dist_result["segments"]
+                        ]
+                        candidate_routes.append({
+                            "kind":          "distance",
+                            "coordinates":   dist_coords,
+                            "totalDistance": round(dist_result["total_length_m"], 1),
+                            "avgSlope":      round(dist_result["avg_slope_pct"], 2),
+                            "estimatedTimeS": estimate_route_time(
+                                dist_segs_for_time, body.user_type, dist_speed_profile
+                            ),
+                            "routeSegments": dist_result["segments"],
+                        })
+                except Exception as e:
+                    print(f"[route2] 거리경로 조회 실패 (무시): {e}")
+
+            if _personal_cache is not None and decoded is not None:
+                personal_metric = _personal_cache.get(decoded["uid"])
+                if personal_metric is not None:
+                    try:
+                        personal_result = _cch.find_route_with_metric(
+                            origin, dest, personal_metric,
+                            label="맞춤 경로", kind="personal",
+                        )
+                        # 이미 나온 경로(①type, ②distance)와 노드열이 같으면 중복
+                        # 후보로 넣지 않는다 (6.3절 — 가짜 선택 데이터가 β·γ 추정을 오염시킴).
+                        already_shown = any(
+                            r is not None and personal_result["path_nodes"] == r["path_nodes"]
+                            for r in (result, dist_result)
+                        )
+                        if not already_shown:
+                            personal_coords = [
+                                [G.nodes[n]["lon"], G.nodes[n]["lat"]]
+                                for n in personal_result["path_nodes"]
+                            ]
+                            personal_speed_profile: dict = {}
+                            try:
+                                personal_speed_profile = get_user_speed_profile(db, decoded["uid"])
+                            except Exception:
+                                pass
+                            personal_segs_for_time = [
+                                {"zone": classify_zone(s["slope_pct"], s["direction"], body.user_type),
+                                 "direction": s["direction"], "length_m": s["length_m"]}
+                                for s in personal_result["segments"]
+                            ]
+                            candidate_routes.append({
+                                "kind":          "personal",
+                                "coordinates":   personal_coords,
+                                "totalDistance": round(personal_result["total_length_m"], 1),
+                                "avgSlope":      round(personal_result["avg_slope_pct"], 2),
+                                "estimatedTimeS": estimate_route_time(
+                                    personal_segs_for_time, body.user_type, personal_speed_profile
+                                ),
+                                "routeSegments": personal_result["segments"],
+                            })
+                    except Exception as e:
+                        print(f"[route3] 맞춤경로 조회 실패 (무시): {e}")
+
+            response["candidateRoutes"] = candidate_routes
 
         return response
 

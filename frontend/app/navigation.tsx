@@ -59,6 +59,15 @@ export default function NavigationPage() {
         return;
       }
 
+      // ⑭ 구간 평가 화면 (routeAfterRating → 경사 뚜렷한 구간 있을 때만)
+      if (screenName === "SegmentFeedback") {
+        router.replace({
+          pathname: "/segment-feedback",
+          params: screenParams,
+        });
+        return;
+      }
+
       router.push("/");
     },
 

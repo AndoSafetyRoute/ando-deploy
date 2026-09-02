@@ -13,6 +13,7 @@ import { C, ZONE_COLORS } from '../../constants/colors';
 import { formatMinutes } from '../../utils/storage';
 import RouteMapView from './RouteMapView';
 import { useDraggableSheet } from './useDraggableSheet';
+import { goToRouteCompareIfEnabled } from '../../personalization/entry';
 
 const { height: H } = Dimensions.get('window');
 
@@ -472,6 +473,14 @@ export default function WalkContent({
 
   const handleStartNavigation = () => {
     if (!selectedRouteObj) return;
+
+    // ⑬ 3경로 비교 화면이 켜져 있으면(ROUTE_COMPARE_ENABLED) 그쪽으로 보내고 종료.
+    // 꺼져 있으면 false 를 돌려주므로 아래 기존 흐름 그대로 (대중교통 도보 무관).
+    if (goToRouteCompareIfEnabled(navigation, {
+      from, to, walkerType,
+      startName, startAddress, startLatitude, startLongitude,
+      endName, endAddress, endLatitude, endLongitude,
+    })) return;
 
     navigation?.navigate('Navigation', {
       routeId: selectedRouteObj.id,

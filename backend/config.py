@@ -65,3 +65,32 @@ STDDEV_THRESHOLD  = 1.0    # slope1_stddev 기준값
 BRIDGE_GAP_M      = 50.0   # 연결 성분 브리지 최대 거리(m)
 MAX_DETOUR_RATIO  = 1.3    # 최단거리 대비 허용 최대 우회 배율
 FORBIDDEN_PENALTY = 15.0   # 금지 구간 거리 대비 패널티 배율 (1e6 → 15)
+
+# ── 개인화 코스트 커브 기저함수 (ando_dev_final.md 7.1/7.3절) ─────────────────
+# c_u(g) 를 15개 3차 B-spline 기저함수로 표현.
+#
+# 도메인은 그래프에 존재하는 signed slope_pct 전체를 덮어야 한다(도메인 밖 엣지는
+# 가중치를 못 매겨 라우팅이 깨짐 — basis.py 는 그 방어로 경계값 clip).
+# 용산 5m(road_5m_slope) 실측 분포(scripts/pers_cch_probe.py):
+#   엣지 p1/p99 = ∓21.3%, |g|>25% = 1.07%, 길이가중 p99.9 = ±35.4%, min/max ±60%.
+# g_warn 최대 8.33% 초과는 어차피 FORBIDDEN_PENALTY 로 배제되므로 20%와 60%를
+# 구분할 실익이 없다 → ±25% 로 clip. 극단 ±60% 는 DEM 노이즈/교량으로 판단.
+#
+# 매듭은 균등 배치 금지: 관측이 몰리는 코어(±10%)에 조밀하게, 꼬리는 성기게.
+# (±25 균등 15개면 간격 3.3% 라 실제 학습 구간 해상도가 무너짐 — 문서 7.1절)
+BASIS_N_KNOTS = 15     # 기저함수 개수 — 문서 7.1절
+BASIS_DEGREE  = 3      # 3차(cubic) B-spline
+BASIS_G_MIN   = -25.0  # clip 하한(%) — 실측 분포 기반
+BASIS_G_MAX   = 25.0   # clip 상한(%)
+BASIS_CORE_MIN = -10.0 # 조밀 매듭 코어 구간(관측 실질 범위 −6~+7% 를 여유있게 덮음)
+BASIS_CORE_MAX = 10.0
+BASIS_KNOTS_LEFT  = 3  # [G_MIN, CORE_MIN] 구간 매듭 수 (양 끝 포함)
+BASIS_KNOTS_CORE  = 9  # [CORE_MIN, CORE_MAX] 구간 매듭 수 (양 끝 포함, ~2.5% 간격)
+BASIS_KNOTS_RIGHT = 3  # [CORE_MAX, G_MAX] 구간 매듭 수 (양 끝 포함)
+# 내부 매듭 합 = LEFT + (CORE-1) + (RIGHT-1) = N_KNOTS - DEGREE + 1 = 13 이어야 함
+
+# ── 개인화 속도 프로파일 캘리브레이션 (문서 3.9/3.10절) ───────────────────────
+# v̄_flat 은 신호 A·B 정규화의 기준이라 "틀리면 전부 틀어지는" 값(3.10절).
+# 평지(|g|<0.5%) 누적 관측 거리가 이 값에 도달하기 전엔 EMA 결과를 쓰지 않고
+# 유형 문헌 기본값으로 폴백한다(별도 캘리브레이션 화면 없이 자동 누적).
+CALIBRATION_FLAT_M = 300.0

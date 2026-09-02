@@ -40,10 +40,17 @@ import {
   submitSegment,
   completeNavigation,
   submitFeedback,
-  submitZoneObservation,
-  ZoneObservationPayload,
 } from "../api";
 import type { NavSegment, Waypoint } from "../api/routeApi";
+import { CollectSession, drainCollectQueue } from "../utils/collectQueue";
+import { SlopeBinTracker } from "../utils/slopeBinTracker";
+import {
+  SPEED_SAMPLE_MAX_GAP_S,
+  SPEED_SAMPLE_MAX_JUMP_M,
+  NEAR_STOP_SPEED_MS,
+} from "../personalization/config";
+import { routeAfterRating } from "../personalization/entry";
+import RoundtripHintBanner from "../personalization/RoundtripHintBanner";
 
 const KAKAO_JAVASCRIPT_KEY = process.env.EXPO_PUBLIC_KAKAO_JAVASCRIPT_KEY;
 
@@ -94,6 +101,9 @@ interface Props {
       endLongitude?: string;
       // 대중교통 모드 전용: 이 구간(도보) 다음에 이어질 구간 정보. walk 모드에서는 사용하지 않음.
       transitNextLeg?: string;
+      // 개인화 계측 세션 ID. 3경로 비교 화면(⑬)에서 경로 선택을 먼저 기록한 뒤
+      // 같은 세션으로 안내 계측을 이어붙이기 위해 넘긴다. 없으면 새로 생성.
+      collectSessionId?: string;
       // 상단 여정 스테퍼용 — 전체 구간 요약(JSON 배열)과 그중 지금 안내 중인 인덱스.
       journeySteps?: string;
       legIndex?: string;
@@ -751,16 +761,15 @@ export default function NavigationScreen({ navigation, route }: Props) {
   const measuredMsRef        = useRef<(number | null)[]>([]); // [i] = 구간 i 소요시간, 미측정은 null
   const gpsCallbackCountRef  = useRef<number>(0); // 세그먼트 0 시작 시각 보정용 (2번째 콜백 = 실제 이동 시작)
 
-  // ── zone 전환 추적 refs (방식 C: zone 그룹 단위 소요시간 측정) ─────────────
-  // GPS 오차 ±5~10m 에서 5m 구간별 타이밍은 불가 → zone이 바뀌는 시점을 경계로
-  // (zone_key, distance_m, elapsed_ms, gps_sample_n) 1행씩 BE에 전송.
-  // 이 데이터로 EMA 개인화 속도 프로파일을 업데이트함.
-  const zoneKeyRef       = useRef<string>("flat");       // 현재 진행 중인 zone_key
-  const zoneStartTimeRef = useRef<number>(Date.now());   // 현재 zone 시작 시각 (ms)
-  const zoneDistRef      = useRef<number>(0);            // 현재 zone 누적 거리 (m)
-  const zoneGpsNRef      = useRef<number>(0);            // 현재 zone 내 GPS 콜백 횟수
-  const zoneSlopeSumRef  = useRef<number>(0);            // 경사도 가중합 (평균 계산용)
-  const zoneDistSumRef   = useRef<number>(0);            // 경사도 가중합 분모
+  // ── 개인화 계측 (인계 §5 ⑪, ando_ml_plan_v2 §3.2 신호 A) ────────────────────
+  // zone(3단계 안전 분류) 단위로 뭉치면 경사 축 해상도가 파괴된다(§3.1). 대신
+  // 0.5% 폭 bin 이 바뀌는 시점을 경계로 관측 1행씩 만든다 — 로직은 SlopeBinTracker
+  // (순수 클래스, 단위 검증됨), 이 컴포넌트는 GPS 이벤트만 넣어준다. 전송은 배치만.
+  const collectSessionRef = useRef<CollectSession | null>(null);
+  const binTrackerRef     = useRef<SlopeBinTracker | null>(null);
+  // 신호 B(순간속도) 계산용 — 직전 GPS 픽스
+  const lastGpsPosRef   = useRef<Coordinate | null>(null);
+  const lastGpsTimeRef  = useRef<number>(0);
 
   const visitedWaypointsRef = useRef<Set<number>>(new Set());
 
@@ -830,15 +839,12 @@ export default function NavigationScreen({ navigation, route }: Props) {
       measuredMsRef.current        = Array(routeSegments.length).fill(null);
       currentSegIdxRef.current     = 0;
 
-      const firstZone = routeSegments[0]
-        ? getZoneKey(routeSegments[0].zone, routeSegments[0].direction)
-        : "flat";
-      zoneKeyRef.current       = firstZone;
-      zoneStartTimeRef.current = initTime;
-      zoneDistRef.current      = 0;
-      zoneGpsNRef.current      = 0;
-      zoneSlopeSumRef.current  = 0;
-      zoneDistSumRef.current   = 0;
+      // 개인화 계측 세션 시작. 이전 세션에서 전송 못 하고 큐에 남은 배치도 여기서 재시도.
+      drainCollectQueue().catch(() => {});
+      collectSessionRef.current = new CollectSession(route?.params?.collectSessionId);
+      binTrackerRef.current = new SlopeBinTracker(routeSegments[0]?.slope ?? 0, initTime);
+      lastGpsPosRef.current   = null;
+      lastGpsTimeRef.current  = 0;
 
       speak(
         `${to}까지 안내를 시작합니다. 총 거리 ${formatDistance(routeData?.totalDistance)}, ` +
@@ -891,9 +897,41 @@ export default function NavigationScreen({ navigation, route }: Props) {
           gpsCallbackCountRef.current += 1;
           if (gpsCallbackCountRef.current === 2 && currentSegIdxRef.current === 0) {
             segmentStartTimesRef.current[0] = now;
+            // 첫 bin 의 elapsed 도 "실제 이동 시작"에 맞춘다 — GPS 락 대기 시간이
+            // 첫 bin 속도에 섞여 들어가지 않도록(§3.2 신호 A는 distance/elapsed 기반).
+            binTrackerRef.current?.anchorStart(now);
           }
 
-          zoneGpsNRef.current += 1;
+          binTrackerRef.current?.noteGpsSample();
+
+          // 신호 B — 순간속도 원본 저장 (판정 없음, §3.2 / §3.8).
+          // 직전 픽스와의 거리/시간으로 순간속도를 구해 현재 bin에 귀속시킨다.
+          {
+            const curPos = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
+            const prevPos = lastGpsPosRef.current;
+            const prevT   = lastGpsTimeRef.current;
+            if (prevPos && prevT) {
+              const d  = haversineDistance(prevPos, curPos);
+              const dt = (now - prevT) / 1000;
+              if (dt > 0 && dt < SPEED_SAMPLE_MAX_GAP_S && d < SPEED_SAMPLE_MAX_JUMP_M) {
+                const v = d / dt;
+                collectSessionRef.current?.addSpeedSample({
+                  route_id:       serverRouteIdRef.current ?? undefined,
+                  slope_bin:      binTrackerRef.current?.currentBin ?? 0,
+                  sub_distance_m: d,
+                  speed_ms:       v,
+                });
+                if (v < NEAR_STOP_SPEED_MS) binTrackerRef.current?.noteStop(dt * 1000); // stop_ms 누적
+              } else if (dt >= SPEED_SAMPLE_MAX_GAP_S || d >= SPEED_SAMPLE_MAX_JUMP_M) {
+                // GPS 점프/장시간 공백 — 이 표본만이 아니라 진행 중이던 bin 관측
+                // 전체를 버린다 (점프 앞뒤로 거리·시간 오염, Q&A #5).
+                binTrackerRef.current?.invalidateCurrent(now);
+                if (__DEV__) console.warn(`[collect] GPS 점프/공백으로 bin 무효화 (dt=${dt.toFixed(1)}s d=${d.toFixed(0)}m)`);
+              }
+            }
+            lastGpsPosRef.current  = curPos;
+            lastGpsTimeRef.current = now;
+          }
 
           let curIdx = currentSegIdxRef.current;
           while (curIdx < routeSegments.length) {
@@ -920,48 +958,18 @@ export default function NavigationScreen({ navigation, route }: Props) {
               }).catch(() => {});
             }
 
-            const segZoneKey = getZoneKey(seg.zone, seg.direction);
-            const segDist    = seg.length ?? 5;
-            zoneDistRef.current     += segDist;
-            zoneSlopeSumRef.current += Math.abs(seg.slope ?? 0) * segDist;
-            zoneDistSumRef.current  += segDist;
-
-            const nextSeg     = curIdx + 1 < routeSegments.length ? routeSegments[curIdx + 1] : null;
-            const nextZoneKey = nextSeg ? getZoneKey(nextSeg.zone, nextSeg.direction) : null;
-            const isZoneEnd   = nextZoneKey !== zoneKeyRef.current || nextSeg === null;
-
-            if (isZoneEnd && rid !== null) {
-              const obs: ZoneObservationPayload = {
-                zone_key:      zoneKeyRef.current,
-                zone:          seg.zone,
-                direction:     seg.direction,
-                slope_pct_avg: zoneDistSumRef.current > 0
-                  ? zoneSlopeSumRef.current / zoneDistSumRef.current : 0,
-                distance_m:    zoneDistRef.current,
-                elapsed_ms:    now - zoneStartTimeRef.current,
-                gps_sample_n:  zoneGpsNRef.current,
-              };
-              getAuthToken().then((token) => {
-                if (!token) return;
-                submitZoneObservation(rid, obs, token);
-              }).catch(() => {});
-
-              announceZoneEntry(nextZoneKey);
-
-              // zone 초기화 (다음 zone 시작)
-              zoneKeyRef.current       = nextZoneKey ?? "flat";
-              zoneStartTimeRef.current = now;
-              zoneDistRef.current      = 0;
-              zoneGpsNRef.current      = 0;
-              zoneSlopeSumRef.current  = 0;
-              zoneDistSumRef.current   = 0;
-            } else if (segZoneKey !== zoneKeyRef.current) {
-              zoneKeyRef.current       = segZoneKey;
-              zoneStartTimeRef.current = now;
-              zoneDistRef.current      = segDist;
-              zoneGpsNRef.current      = 1;
-              zoneSlopeSumRef.current  = Math.abs(seg.slope ?? 0) * segDist;
-              zoneDistSumRef.current   = segDist;
+            const nextSeg = curIdx + 1 < routeSegments.length ? routeSegments[curIdx + 1] : null;
+            // 신호 A — 이 구간을 현재 bin 에 누적하고, bin 경계면 관측 1행을 돌려받는다.
+            const obs = binTrackerRef.current?.completeSegment(
+              seg.length ?? 5,
+              nextSeg ? (nextSeg.slope ?? 0) : null,
+              now,
+              serverRouteIdRef.current,
+            );
+            if (obs) {
+              collectSessionRef.current?.addSlopeObservation(obs);
+              // 안전 음성 안내는 zone 기준 유지 (self-dedupe)
+              announceZoneEntry(nextSeg ? getZoneKey(nextSeg.zone, nextSeg.direction) : null);
             }
 
             curIdx += 1;
@@ -1025,6 +1033,16 @@ export default function NavigationScreen({ navigation, route }: Props) {
       subscriptionRef.current = null;
       Speech.stop();
       stopAlightReminder();
+      // 종료 버튼을 거치지 않고 화면이 사라지는 경우(대중교통 다음 leg로 자동 전환 등)에도
+      // 진행 중이던 bin + 버퍼를 마지막으로 확정해 배치로 내보낸다.
+      const cs = collectSessionRef.current;
+      if (cs) {
+        const obs = binTrackerRef.current?.finalize(Date.now(), serverRouteIdRef.current);
+        if (obs) cs.addSlopeObservation(obs);
+        void cs.flush({ final: true });
+        collectSessionRef.current = null;
+        binTrackerRef.current = null;
+      }
     };
   }, []);
 
@@ -1070,6 +1088,17 @@ export default function NavigationScreen({ navigation, route }: Props) {
 
           const now = Date.now();
           const totalDurationMs = now - startTimeRef.current;
+
+          // 개인화 계측 — 진행 중이던 마지막 bin(부분 통과)을 관측 1행으로 확정하고
+          // 세션 종료 플러시. 개별 POST 없이 /collect/batch 로만 나간다(인계 §5 ⑫).
+          const cs = collectSessionRef.current;
+          if (cs) {
+            const obs = binTrackerRef.current?.finalize(now, serverRouteIdRef.current);
+            if (obs) cs.addSlopeObservation(obs);
+            cs.flush({ final: true }).catch(() => {});
+            collectSessionRef.current = null;
+            binTrackerRef.current = null;
+          }
 
           const curIdx = currentSegIdxRef.current;
           if (curIdx < routeSegments.length && measuredMsRef.current[curIdx] === null) {
@@ -1151,12 +1180,20 @@ export default function NavigationScreen({ navigation, route }: Props) {
       console.log("[FE] 만족도 서버 저장 실패:", e);
     }
     setShowRating(false);
-    navigation?.navigate("RouteDetail", { routeId: savedRouteId });
+    routeAfterRating(navigation, {
+      serverRouteId: serverRouteIdRef.current,
+      routeSegments,
+      nextRouteId: savedRouteId,
+    });
   };
 
   const handleRatingSkip = () => {
     setShowRating(false);
-    navigation?.navigate("RouteDetail", { routeId: savedRouteId });
+    routeAfterRating(navigation, {
+      serverRouteId: serverRouteIdRef.current,
+      routeSegments,
+      nextRouteId: savedRouteId,
+    });
   };
 
   // SafeArea 적용 — endBtn / summaryOverlay 하단
@@ -1240,6 +1277,9 @@ export default function NavigationScreen({ navigation, route }: Props) {
           <Text style={[ss.voiceIcon, showSlopeMarkers && ss.slopeIconActive]}>%</Text>
         </TouchableOpacity>
       </View>
+
+      {/* ⑮ 왕복·방향 교대 안내 — ROUNDTRIP_HINT_ENABLED 가 false 면 null 렌더 */}
+      <RoundtripHintBanner from={from} to={finalDestinationName ?? to} />
 
       {journeySteps.length > 0 && (
         <View style={[ss.journeyStepper, { bottom: bottomPad + 62 }]}>

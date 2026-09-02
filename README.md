@@ -36,6 +36,24 @@ git에 커밋하지 않았습니다:
 - 프론트: `.env`, `google-services.json`
 - 백엔드: `.env`, `firebase-key.json`, `data/` 아래 경사도 그래프 원본 데이터
 
+## 개인 맞춤 경로 — 데이터 수집 (이번 버전 / release_v2)
+
+경사 비용 곡선 `c_u(g)` 개인화를 위한 **신호 A~D 수집 파이프라인**이 들어갔습니다.
+아직 학습(⑨ θ 적합)은 없고, **데이터를 모으는 코드만** 완성된 상태입니다.
+설계 근거: `ando_ml_plan_v2.md`, `ando_cch_personalization.md`, `ando_personalization_be_handoff.md`.
+
+- **백엔드**: `POST /collect/batch`(신호 A~D 배치, `(uid,session_id,seq)` 멱등),
+  `POST /route?candidates=compare`(경로 비교용 후보 배열), 신규 테이블 8종,
+  `/collect/batch` 평지 관측으로 `v̄_flat` EMA 갱신 + 캘리브레이션 게이트(평지 누적 300m),
+  개인화 basis(비균등 매듭)·개인 metric 캐시(⑤⑥⑧). CCH가 도는 환경에서 end-to-end 확인됨.
+- **프론트**: GPS 콜백에서 0.5% 경사 bin 전환 계측(⑪), 배치 전송 큐·오프라인·멱등(⑫),
+  구간 평가(⑭)·왕복 방향교대(⑮) 화면 — 활성. 3경로 비교(⑬)는 배선만 하고
+  `src/personalization/config.ts`의 `ROUTE_COMPARE_ENABLED=false`로 잠가둠
+  (파일럿 3세션 로그 전수검증 통과 후 플립).
+
+미포함(별도 작업): ⑨ θ 배치 학습 스크립트, 9.2절 실측 #4(우회 초과 빈도 — 운영 로그 필요),
+후보별 `navigation_segments`(비교→안내 전환 시 음성/지도색).
+
 ## 알려진 제한사항
 
 - **서울역 인근 도보 경로 우회 문제**: 서울역 인근에서 출발/도착하는 경로가 실제 거리보다 훨씬

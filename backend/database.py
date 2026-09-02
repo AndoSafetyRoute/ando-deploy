@@ -1,7 +1,12 @@
+import json
 import os
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
-from routing.speed import validate_observation, ema_update, get_default_speed, ZONE_KEYS
+from routing.speed import (
+    validate_observation, ema_update, get_default_speed, get_zone_key, ZONE_KEYS,
+)
+from routing.cost import classify_zone
+from config import FLAT_THRESHOLD, CALIBRATION_FLAT_M
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
@@ -243,8 +248,130 @@ def init_db():
                 zone_key     TEXT NOT NULL,
                 speed_ms     FLOAT NOT NULL,
                 sample_count INT NOT NULL DEFAULT 0,
+                cumulative_distance_m FLOAT NOT NULL DEFAULT 0,
                 updated_at   TIMESTAMPTZ DEFAULT NOW(),
                 PRIMARY KEY (uid, zone_key)
+            )
+        """))
+        # 기존 배포에 이미 테이블이 있으면 컬럼만 추가 (캘리브레이션 게이트용, 문서 3.9절)
+        conn.execute(text(
+            "ALTER TABLE user_speed_profile "
+            "ADD COLUMN IF NOT EXISTS cumulative_distance_m FLOAT NOT NULL DEFAULT 0"
+        ))
+
+        # ── 개인 맞춤 경로 추천 (ando_dev_final.md 3.7절) ──────────────────────
+        # 신호 A: 경사 bin별 통과 관측
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS trip_slope_observations (
+                id             SERIAL PRIMARY KEY,
+                uid            TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+                route_id       INT  REFERENCES routes(id) ON DELETE CASCADE,
+                session_id     TEXT NOT NULL,
+                slope_bin      FLOAT NOT NULL,
+                distance_m     FLOAT NOT NULL,
+                elapsed_ms     INT   NOT NULL,
+                stop_ms        INT   NOT NULL DEFAULT 0,
+                gps_sample_n   INT   NOT NULL,
+                observed_at    TIMESTAMPTZ DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_tso_uid_bin
+            ON trip_slope_observations (uid, slope_bin)
+        """))
+
+        # 신호 B: 순간속도 원본 (판정값 저장 금지 — 3.8절 원칙 1)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS speed_samples (
+                id             SERIAL PRIMARY KEY,
+                uid            TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+                route_id       INT  REFERENCES routes(id) ON DELETE CASCADE,
+                session_id     TEXT NOT NULL,
+                slope_bin      FLOAT NOT NULL,
+                sub_distance_m FLOAT NOT NULL,
+                speed_ms       FLOAT NOT NULL,
+                observed_at    TIMESTAMPTZ DEFAULT NOW()
+            )
+        """))
+
+        # 신호 C: 경로 선택 (후보 개수 가변 1~3)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS route_choice_log (
+                id             SERIAL PRIMARY KEY,
+                uid            TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+                session_id     TEXT NOT NULL,
+                candidates     JSONB NOT NULL,
+                n_shown        SMALLINT NOT NULL,
+                chosen_kind    TEXT,
+                decided_at     TIMESTAMPTZ DEFAULT NOW()
+            )
+        """))
+
+        # 신호 D: 구간 주관 평가
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS segment_feedback (
+                id             SERIAL PRIMARY KEY,
+                uid            TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+                route_id       INT  REFERENCES routes(id) ON DELETE CASCADE,
+                slope_mean     FLOAT NOT NULL,
+                length_m       FLOAT NOT NULL,
+                verdict        SMALLINT NOT NULL,
+                created_at     TIMESTAMPTZ DEFAULT NOW()
+            )
+        """))
+
+        # 경사도 측정 검증
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS slope_validation (
+                id             SERIAL PRIMARY KEY,
+                lat            FLOAT NOT NULL,
+                lon            FLOAT NOT NULL,
+                dem_slope_pct  FLOAT NOT NULL,
+                measured_pct   FLOAT NOT NULL,
+                note           TEXT,
+                measured_at    TIMESTAMPTZ DEFAULT NOW()
+            )
+        """))
+
+        # 학습 결과 (배치가 쓰고, 요청 경로는 읽기만)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS user_slope_curve (
+                uid          TEXT PRIMARY KEY REFERENCES users(uid) ON DELETE CASCADE,
+                theta        JSONB NOT NULL,
+                cost_grid    JSONB NOT NULL,
+                beta_gamma   FLOAT NOT NULL,
+                valid_min    FLOAT NOT NULL,
+                valid_max    FLOAT NOT NULL,
+                n_sessions   INT   NOT NULL,
+                model_ver    TEXT  NOT NULL,
+                fitted_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
+
+        # 공유 파라미터 (전원 공통, 단일 행)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS model_params (
+                id           SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+                b_slowdown   FLOAT NOT NULL DEFAULT 0.5,
+                s_subjective FLOAT NOT NULL DEFAULT 0.5,
+                lambda2      FLOAT NOT NULL DEFAULT 100.0,
+                updated_at   TIMESTAMPTZ DEFAULT NOW()
+            )
+        """))
+
+        conn.execute(text(
+            "ALTER TABLE routes ADD COLUMN IF NOT EXISTS route_kind TEXT"
+        ))
+
+        # /collect/batch 멱등 처리용 — (uid, session_id, seq) 중복 배치 무시
+        # (문서 3.9절 "멱등: session_id + seq로 중복 무시" 요구사항 구현)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS collect_batch_log (
+                uid         TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+                session_id  TEXT NOT NULL,
+                seq         INT  NOT NULL,
+                received_at TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (uid, session_id, seq)
             )
         """))
 
@@ -772,6 +899,60 @@ def add_navigation_segment(
     return True
 
 
+def _apply_speed_ema(
+    db: Session,
+    uid: str,
+    zone_key: str,
+    speed: float,
+    user_type: str,
+    distance_m: float,
+) -> None:
+    """
+    user_speed_profile 의 한 (uid, zone_key) 행을 EMA 로 갱신한다.
+
+    개별 zone POST(save_zone_observation)와 파일럿 배치(/collect/batch)가 **같은**
+    EMA 로직을 쓰도록 뽑아낸 공용 함수 (인계 v2 §4.5 B-2). 커밋은 호출측 책임.
+
+    cumulative_distance_m 은 캘리브레이션 게이트(문서 3.9절)용 — 이 zone 으로
+    실제 걸은 거리를 누적한다. flat 은 이 값이 CALIBRATION_FLAT_M 을 넘어야
+    get_user_speed_profile 이 EMA 결과를 내보낸다.
+    """
+    row = db.execute(text("""
+        SELECT speed_ms, sample_count FROM user_speed_profile
+        WHERE uid = :uid AND zone_key = :zone_key
+    """), {"uid": uid, "zone_key": zone_key}).fetchone()
+
+    if row:
+        new_speed = ema_update(float(row[0]), speed, int(row[1]))
+        db.execute(text("""
+            UPDATE user_speed_profile
+            SET speed_ms = :speed,
+                sample_count = sample_count + 1,
+                cumulative_distance_m = cumulative_distance_m + :dist,
+                updated_at = NOW()
+            WHERE uid = :uid AND zone_key = :zone_key
+        """), {"speed": new_speed, "dist": max(0.0, distance_m),
+               "uid": uid, "zone_key": zone_key})
+    else:
+        prior = get_default_speed(user_type, zone_key)
+        new_speed = ema_update(prior, speed, 0)
+        db.execute(text("""
+            INSERT INTO user_speed_profile
+                (uid, zone_key, speed_ms, sample_count, cumulative_distance_m)
+            VALUES (:uid, :zone_key, :speed, 1, :dist)
+        """), {"uid": uid, "zone_key": zone_key, "speed": new_speed,
+               "dist": max(0.0, distance_m)})
+
+
+def _zone_key_for_slope(slope_pct: float, user_type: str) -> str:
+    """부호 있는 경사(%) + 유형 → zone_key. 평지 임계는 config.FLAT_THRESHOLD."""
+    if abs(slope_pct) < FLAT_THRESHOLD:
+        return "flat"
+    direction = "up" if slope_pct > 0 else "down"
+    zone = classify_zone(slope_pct, direction, user_type)
+    return get_zone_key(zone, direction)
+
+
 def save_zone_observation(
     db: Session,
     route_id: int,
@@ -812,44 +993,34 @@ def save_zone_observation(
         "gps_sample_n":  gps_sample_n,
     })
 
-    row = db.execute(text("""
-        SELECT speed_ms, sample_count FROM user_speed_profile
-        WHERE uid = :uid AND zone_key = :zone_key
-    """), {"uid": uid, "zone_key": zone_key}).fetchone()
-
-    if row:
-        new_speed = ema_update(float(row[0]), speed, int(row[1]))
-        new_count = int(row[1]) + 1
-        db.execute(text("""
-            UPDATE user_speed_profile
-            SET speed_ms = :speed, sample_count = :n, updated_at = NOW()
-            WHERE uid = :uid AND zone_key = :zone_key
-        """), {"speed": new_speed, "n": new_count, "uid": uid, "zone_key": zone_key})
-    else:
-        prior = get_default_speed(user_type, zone_key)
-        new_speed = ema_update(prior, speed, 0)
-        db.execute(text("""
-            INSERT INTO user_speed_profile (uid, zone_key, speed_ms, sample_count)
-            VALUES (:uid, :zone_key, :speed, 1)
-        """), {"uid": uid, "zone_key": zone_key, "speed": new_speed})
-
+    _apply_speed_ema(db, uid, zone_key, speed, user_type, distance_m)
     db.commit()
     return True
 
 
-def get_user_speed_profile(db: Session, uid: str) -> dict[str, float]:
+def get_user_speed_profile(db: Session, uid: str, calibrated_only: bool = True) -> dict[str, float]:
     """
     유저의 zone_key별 개인화 속도 반환.
     관측이 없는 zone_key는 포함하지 않음 (호출측에서 fallback 처리).
+
+    calibrated_only=True(기본, 소요시간 추정용): flat 은 누적 평지 관측 거리가
+    CALIBRATION_FLAT_M 미만이면 제외한다(문서 3.9/3.10절 — 덜 채워진 v̄_flat 을
+    정규화 기준으로 쓰지 않게). 배치 학습(⑨)은 False 로 원본을 그대로 읽는다.
     """
     if not engine:
         return {}
 
     rows = db.execute(text("""
-        SELECT zone_key, speed_ms FROM user_speed_profile WHERE uid = :uid
+        SELECT zone_key, speed_ms, cumulative_distance_m
+        FROM user_speed_profile WHERE uid = :uid
     """), {"uid": uid}).fetchall()
 
-    return {row[0]: float(row[1]) for row in rows}
+    out: dict[str, float] = {}
+    for zone_key, speed_ms, cum_m in rows:
+        if calibrated_only and zone_key == "flat" and float(cum_m or 0.0) < CALIBRATION_FLAT_M:
+            continue
+        out[zone_key] = float(speed_ms)
+    return out
 
 
 def get_user_sample_counts(db: Session, uid: str) -> dict[str, int]:
@@ -862,6 +1033,137 @@ def get_user_sample_counts(db: Session, uid: str) -> dict[str, int]:
     """), {"uid": uid}).fetchall()
 
     return {row[0]: int(row[1]) for row in rows}
+
+
+def save_collect_batch(
+    db: Session,
+    uid: str,
+    session_id: str,
+    seq: int,
+    slope_observations: list,
+    speed_samples_in: list,
+    route_choice: dict | None,
+    segment_feedback_in: list,
+) -> dict:
+    """
+    ando_dev_final.md 3.9절 — 개인 맞춤 경로 추천 신호 4종을 한 번에 저장.
+
+    멱등: (uid, session_id, seq)가 이미 처리됐으면 재삽입하지 않고 바로 반환한다
+    (FE가 네트워크 실패로 같은 배치를 재전송해도 중복 저장되지 않음).
+    """
+    if not engine:
+        return {"ok": False, "reason": "DB 미설정"}
+
+    dup = db.execute(text("""
+        INSERT INTO collect_batch_log (uid, session_id, seq)
+        VALUES (:uid, :session_id, :seq)
+        ON CONFLICT (uid, session_id, seq) DO NOTHING
+        RETURNING uid
+    """), {"uid": uid, "session_id": session_id, "seq": seq}).fetchone()
+
+    if dup is None:
+        db.commit()
+        return {"ok": True, "duplicate": True}
+
+    for obs in slope_observations:
+        db.execute(text("""
+            INSERT INTO trip_slope_observations
+                (uid, route_id, session_id, slope_bin, distance_m,
+                 elapsed_ms, stop_ms, gps_sample_n)
+            VALUES
+                (:uid, :route_id, :session_id, :slope_bin, :distance_m,
+                 :elapsed_ms, :stop_ms, :gps_sample_n)
+        """), {
+            "uid":          uid,
+            "route_id":     obs.get("route_id"),
+            "session_id":   session_id,
+            "slope_bin":    obs["slope_bin"],
+            "distance_m":   obs["distance_m"],
+            "elapsed_ms":   obs["elapsed_ms"],
+            "stop_ms":      obs.get("stop_ms", 0),
+            "gps_sample_n": obs["gps_sample_n"],
+        })
+
+    # ── user_speed_profile EMA 갱신 (인계 v2 §4.5 B-2 + Q&A #4) ────────────────
+    # FE 가 개별 POST /navigation/:id/zone 를 없앤 뒤로, v̄_flat 을 포함한 zone
+    # 속도 EMA 를 갱신할 경로가 여기밖에 없다. bin 관측을 zone_key 로 매핑해
+    # save_zone_observation 과 동일한 _apply_speed_ema 로 갱신한다.
+    #   - flat 은 v̄_flat (신호 A·B 정규화 기준, 3.10절) — 캘리브레이션 게이트 적용
+    #   - flat 외 6개 zone_key 는 소요시간 추정 폴백 + 논문 비교군 (Q&A #4:
+    #     "라우팅 선택에서만 빼고 수집·소요시간·비교군으로는 유지")
+    # 학습용 원본은 trip_slope_observations 에 그대로 있으니 여기서 버려도 무방.
+    speed_ema_applied = 0
+    if slope_observations:
+        _ut_row = db.execute(
+            text("SELECT user_type FROM users WHERE uid = :uid"), {"uid": uid}
+        ).fetchone()
+        user_type = _ut_row[0] if _ut_row else "elderly"
+        for obs in slope_observations:
+            speed = validate_observation(
+                obs["distance_m"], obs["elapsed_ms"], obs["gps_sample_n"],
+                obs.get("stop_ms", 0),
+            )
+            if speed is None:
+                continue
+            zk = _zone_key_for_slope(float(obs["slope_bin"]), user_type)
+            _apply_speed_ema(db, uid, zk, speed, user_type, float(obs["distance_m"]))
+            speed_ema_applied += 1
+
+    for s in speed_samples_in:
+        db.execute(text("""
+            INSERT INTO speed_samples
+                (uid, route_id, session_id, slope_bin, sub_distance_m, speed_ms)
+            VALUES
+                (:uid, :route_id, :session_id, :slope_bin, :sub_distance_m, :speed_ms)
+        """), {
+            "uid":            uid,
+            "route_id":       s.get("route_id"),
+            "session_id":     session_id,
+            "slope_bin":      s["slope_bin"],
+            "sub_distance_m": s["sub_distance_m"],
+            "speed_ms":       s["speed_ms"],
+        })
+
+    if route_choice is not None:
+        db.execute(text("""
+            INSERT INTO route_choice_log
+                (uid, session_id, candidates, n_shown, chosen_kind)
+            VALUES
+                (:uid, :session_id, CAST(:candidates AS JSONB), :n_shown, :chosen_kind)
+        """), {
+            "uid":         uid,
+            "session_id":  session_id,
+            "candidates":  json.dumps(route_choice["candidates"]),
+            "n_shown":     route_choice["n_shown"],
+            "chosen_kind": route_choice.get("chosen_kind"),
+        })
+
+    for f in segment_feedback_in:
+        db.execute(text("""
+            INSERT INTO segment_feedback
+                (uid, route_id, slope_mean, length_m, verdict)
+            VALUES
+                (:uid, :route_id, :slope_mean, :length_m, :verdict)
+        """), {
+            "uid":        uid,
+            "route_id":   f.get("route_id"),
+            "slope_mean": f["slope_mean"],
+            "length_m":   f["length_m"],
+            "verdict":    f["verdict"],
+        })
+
+    db.commit()
+    return {
+        "ok": True,
+        "duplicate": False,
+        "saved": {
+            "slope_observations": len(slope_observations),
+            "speed_samples":      len(speed_samples_in),
+            "route_choice":       route_choice is not None,
+            "segment_feedback":   len(segment_feedback_in),
+            "speed_ema_applied":  speed_ema_applied,
+        },
+    }
 
 
 def complete_navigation(
