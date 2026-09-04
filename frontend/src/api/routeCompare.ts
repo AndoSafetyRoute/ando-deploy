@@ -8,7 +8,7 @@
 // 항상 채우고, 로그인 사용자의 개인 metric 캐시가 차면 personal 까지 3장이 된다.
 // 동일 노드열은 스킵하므로 실제 길이는 1~3 로 변한다 → FE 는 배열을 그대로 순회한다.
 
-import { BASE_URL } from "../api";
+import { BASE_URL, getAuthToken } from "../api";
 import type { CandidateRoute } from "../utils/routeChoiceModel";
 import {
   ROUTE_PATH,
@@ -33,10 +33,16 @@ export async function requestRouteCandidates(params: {
 }): Promise<RouteCompareResponse> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30_000);
+  // 토큰을 실어야 BE 가 로그인 사용자로 인식해 personal(맞춤) 후보를 채운다.
+  // 없으면(_optional_verified → decoded=None) type/distance 만 나온다.
+  const token = await getAuthToken().catch(() => null);
   try {
     const res = await fetch(`${BASE_URL}${ROUTE_PATH}`, {
       method:  "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
       body: JSON.stringify({
         origin_lat: Number(params.startLatitude),
         origin_lon: Number(params.startLongitude),

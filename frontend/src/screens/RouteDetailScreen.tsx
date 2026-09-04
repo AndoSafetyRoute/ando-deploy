@@ -10,6 +10,7 @@ import {
   Alert,
 } from "react-native";
 import { router, useFocusEffect, useLocalSearchParams } from "expo-router";
+import { goHome } from "../utils/navigation";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 
@@ -202,7 +203,7 @@ function Header({ onDelete }: { onDelete?: () => void }) {
         )}
         <TouchableOpacity
           style={styles.headerIconButton}
-          onPress={() => router.replace("/")}
+          onPress={goHome}
         >
           <Ionicons name="home-outline" size={26} color={NAVY} />
         </TouchableOpacity>

@@ -13,6 +13,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons, Feather, MaterialCommunityIcons } from "@expo/vector-icons";
 import { WebView } from "react-native-webview";
 import { router } from "expo-router";
+import { goHome } from "../src/utils/navigation";
 import { createClient } from "@supabase/supabase-js";
 import * as Location from "expo-location";
 
@@ -420,7 +421,7 @@ export default function HomeScreen() {
       <View style={styles.bottomNav}>
         <TouchableOpacity
           style={[styles.navButton, styles.activeNavButton]}
-          onPress={() => router.replace("/")}
+          onPress={goHome}
         >
           <Ionicons name="home" size={30} color="#FFFFFF" />
         </TouchableOpacity>

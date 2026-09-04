@@ -1,13 +1,16 @@
 // 3경로 비교 화면 (⑬) — ando_ml_plan_v2 §6, 인계 §5
 //
-// 규칙(문서에서 못박음):
-//   - 라벨 절대 금지. "경로 A / B / C" 중립 표기만. kind(type/distance/personal)는
-//     화면에 절대 노출하지 않는다(§6.5). 표시 순서는 매번 무작위(shownPos 기록).
+// 2026-09 제품 결정 (routeChoiceModel.ts 상단 주석 참고):
+//   - 표시 순서 고정: 거리 우선 → 유형별 추천 → 사용자 맞춤형 (CANDIDATE_ORDER).
+//     라벨도 설명적으로 노출한다(예전엔 "경로 A/B/C" 중립 + 매번 무작위 순서였다).
+//   - 사용자 맞춤형(personal)이 아직 없으면(⑨ 배치 학습 전엔 항상 그렇다) 카드를
+//     생략하지 않고 **비활성 카드 + "아직 준비중입니다"** 로 자리를 지킨다 — 위치가
+//     고정이라 "그 자리엔 언젠가 맞춤 경로가 온다"를 사용자가 학습할 수 있게.
 //   - 선택 결과는 개별 POST 없이 CollectSession → /collect/batch route_choice 로만.
 //   - 선택 후 안내로 넘어갈 때 collectSessionId 를 함께 넘겨 같은 세션으로 계측을 이어붙인다.
 //
-// ⚠️ 현재 백엔드는 candidateRoutes 에 1개(kind:"type")만 채운다 → 화면엔 "경로 A" 1장만
-//    뜬다("비교 없음", chosen_kind=null). distance/personal 이 붙으면 자동으로 2~3장이 된다.
+// ⚠️ 현재 백엔드는 candidateRoutes 에 1~2개(type, CCH 있으면 distance)만 채운다 →
+//    "사용자 맞춤형" 자리는 항상 비활성 표시된다. ⑨ 배치가 채워지면 자동으로 활성화된다.
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { View, Text, StyleSheet, TouchableOpacity, ActivityIndicator, ScrollView } from "react-native";
@@ -18,9 +21,11 @@ import { requestRouteCandidates } from "../../api/routeCompare";
 import {
   buildComparison,
   buildRouteChoicePayload,
+  CANDIDATE_LABELS,
   type ShownCandidate,
 } from "../../utils/routeChoiceModel";
 import { CollectSession } from "../../utils/collectQueue";
+import { getCollectConsent } from "../../personalization/collectConsent";
 
 type Props = {
   navigation: any;
@@ -41,8 +46,9 @@ type Props = {
   };
 };
 
-// 위치/순서 편향을 피하려 의미 없는 중립 팔레트 (좋음/나쁨 연상 없는 색).
-const LANE_COLORS = ["#7C6FF7", "#2FB5A8", "#E8833A"];
+// 순서가 고정(거리 우선/유형별/맞춤형)이라 색도 그 순서에 고정 대응된다.
+// 앱 공용 토큰(C)에서 그대로 가져와 다른 화면과 색感이 어긋나지 않게 한다.
+const LANE_COLORS = [C.primary, C.success, C.warn];
 
 function fmtDist(m: number) {
   return m >= 1000 ? `${(m / 1000).toFixed(1)}km` : `${Math.round(m)}m`;
@@ -62,12 +68,18 @@ export default function RouteCompareScreen({ navigation, route }: Props) {
   const [selectedPos, setSelectedPos] = useState<number | null>(null);
 
   // 화면 진입 시 계측 세션을 연다 — 선택 로그와 이후 안내 계측이 같은 session_id 를 공유한다.
+  // 동의 전엔 세션 자체를 안 만든다(이하 collectRef.current?. 호출은 전부 안전하게 no-op) —
+  // 예전엔 동의 여부와 무관하게 항상 세션을 만들어 route_choice 를 그대로 보냈었다.
   const collectRef = useRef<CollectSession | null>(null);
-  if (collectRef.current === null) collectRef.current = new CollectSession();
 
   useEffect(() => {
     let alive = true;
     (async () => {
+      try {
+        const consent = await getCollectConsent();
+        if (alive && consent === "granted") collectRef.current = new CollectSession();
+      } catch { /* 동의 확인 실패 시 수집 안 함(보수적 기본값) */ }
+
       try {
         const res = await requestRouteCandidates({
           startLatitude:  p.startLatitude ?? "",
@@ -93,6 +105,11 @@ export default function RouteCompareScreen({ navigation, route }: Props) {
       collectRef.current = null;
     };
   }, []);
+
+  const hasPersonal = useMemo(
+    () => shown.some((s) => s.mergedKinds.includes("personal")),
+    [shown],
+  );
 
   const mapRoutes: MapRoute[] = useMemo(
     () =>
@@ -133,6 +150,8 @@ export default function RouteCompareScreen({ navigation, route }: Props) {
       routeData: JSON.stringify({
         coordinates: chosen.route.coordinates,
         routeSegments: chosen.route.routeSegments,
+        navigation_segments: chosen.route.navigation_segments ?? [],
+        waypoints: chosen.route.waypoints ?? [],
         totalDistance: chosen.route.totalDistance,
         avgSlope: chosen.route.avgSlope,
         estimatedTimeS: chosen.route.estimatedTimeS,
@@ -186,7 +205,7 @@ export default function RouteCompareScreen({ navigation, route }: Props) {
       <Text style={ss.hint}>
         {single
           ? "지금은 비교할 다른 경로가 없어 한 가지만 안내됩니다."
-          : "걷기 편해 보이는 경로를 하나 고르세요. 순서는 매번 무작위입니다."}
+          : "걷기 편해 보이는 경로를 하나 고르세요."}
       </Text>
 
       <ScrollView style={ss.list} contentContainerStyle={{ paddingBottom: 8 }}>
@@ -210,6 +229,19 @@ export default function RouteCompareScreen({ navigation, route }: Props) {
             </TouchableOpacity>
           );
         })}
+
+        {/* 사용자 맞춤형 후보가 아직 없으면(⑨ 배치 학습 전엔 항상) 자리를 비우지 않고
+            비활성 카드로 고정 순서 세 번째 자리를 지킨다 — 선택 불가, 로그에도 안 남는다. */}
+        {!hasPersonal && (
+          <View style={[ss.card, ss.cardDisabled]}>
+            <View style={[ss.dot, { backgroundColor: C.textMute }]} />
+            <View style={{ flex: 1 }}>
+              <Text style={[ss.cardLabel, ss.cardLabelDisabled]}>{CANDIDATE_LABELS.personal}</Text>
+              <Text style={ss.cardMeta}>아직 준비중입니다 — 데이터가 더 모이면 제공돼요.</Text>
+            </View>
+            <Text style={ss.lockIcon}>🔒</Text>
+          </View>
+        )}
       </ScrollView>
 
       <TouchableOpacity
@@ -242,9 +274,12 @@ const ss = StyleSheet.create({
   list: { flexGrow: 0, paddingHorizontal: 12, marginTop: 4 },
   card: { flexDirection: "row", alignItems: "center", gap: 12, backgroundColor: C.white, borderRadius: 12, padding: 14, marginTop: 8, borderWidth: 1.5, borderColor: "transparent" },
   cardOn: { borderColor: C.primary, backgroundColor: C.primaryBg },
+  cardDisabled: { backgroundColor: C.bg, opacity: 0.75 },
   dot: { width: 12, height: 12, borderRadius: 6 },
   cardLabel: { fontSize: 15, fontWeight: "700", color: C.text },
+  cardLabelDisabled: { color: C.textMute },
   cardMeta: { fontSize: 12.5, color: C.textSub, marginTop: 3 },
+  lockIcon: { fontSize: 15, marginLeft: 4 },
   radio: { width: 20, height: 20, borderRadius: 10, borderWidth: 2, borderColor: C.border, alignItems: "center", justifyContent: "center" },
   radioOn: { borderColor: C.primary },
   radioInner: { width: 10, height: 10, borderRadius: 5, backgroundColor: C.primary },

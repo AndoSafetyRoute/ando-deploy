@@ -76,6 +76,10 @@ ZONE_SPEED_DEFAULTS: dict[str, dict[str, float]] = {
 }
 
 _EMA_MIN_ALPHA = 0.05   # 누적 20+회부터 신규 관측 5%만 반영 (안정화)
+# 첫 관측(n=0)의 alpha 상한. 1/(n+1)=1.0 이면 관측 1건이 유형 기본값을 완전히
+# 덮어써, 희귀 zone 에서 GPS 노이즈 1건이 프로파일을 오염시킨다. 첫 관측은
+# prior 50% + 관측 50% 로만 반영한다 (data-collection-plan §1.4, 이슈 P2).
+_EMA_START_ALPHA_CAP = 0.5
 _SPEED_MIN    = 0.05    # m/s 하한 (완전 정지 제외)
 _SPEED_MAX    = 2.50    # m/s 상한 (뛰는 속도 초과 제외)
 _MIN_ELAPSED_S = 3.0    # 너무 빠른 통과 제외 (GPS 점프 방어)
@@ -121,9 +125,11 @@ def ema_update(current: float, observed: float, n: int) -> float:
     """
     Exponential Moving Average 업데이트.
     n: 업데이트 전 누적 관측 횟수.
-    alpha는 n 증가에 따라 감소, 최소 _EMA_MIN_ALPHA.
+    alpha는 n 증가에 따라 감소, [_EMA_MIN_ALPHA, _EMA_START_ALPHA_CAP] 로 clamp.
+    (첫 관측도 prior 를 절반은 남긴다 — §1.4)
     """
-    alpha = max(1.0 / (n + 1), _EMA_MIN_ALPHA)
+    alpha = min(1.0 / (n + 1), _EMA_START_ALPHA_CAP)
+    alpha = max(alpha, _EMA_MIN_ALPHA)
     return round(alpha * observed + (1 - alpha) * current, 4)
 
 

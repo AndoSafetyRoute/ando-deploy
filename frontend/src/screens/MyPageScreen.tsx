@@ -9,6 +9,7 @@ import {
   ActivityIndicator,
 } from "react-native";
 import { router, useFocusEffect } from "expo-router";
+import { goHome } from "../utils/navigation";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 
@@ -25,8 +26,10 @@ import {
   getAuthToken,
   getUserRoutes,
   getUserStats,
+  getPersonalizationStatus,
   submitFeedback,
   UserStats,
+  PersonalizationStatus,
 } from "../api";
 
 const NAVY = "#1B0F4A";
@@ -249,6 +252,7 @@ function RouteCard({
 export default function MyPageScreen() {
   const [routes, setRoutes] = useState<RouteRecord[]>([]);
   const [stats, setStats] = useState<UserStats | null>(null);
+  const [personalization, setPersonalization] = useState<PersonalizationStatus | null>(null);
   const [loading, setLoading] = useState(true);
 
   useFocusEffect(
@@ -272,12 +276,15 @@ export default function MyPageScreen() {
 
           if (!token || !active) return;
 
-          const [rawRoutes, serverStats] = await Promise.all([
+          const [rawRoutes, serverStats, pStatus] = await Promise.all([
             getUserRoutes(token).catch(() => [] as any[]),
             getUserStats(token),
+            getPersonalizationStatus(token).catch(() => null),
           ]);
 
           if (!active) return;
+
+          setPersonalization(pStatus);
 
           if (rawRoutes.length > 0) {
             const mapped: RouteRecord[] = rawRoutes.map((r: any) => ({
@@ -386,7 +393,7 @@ export default function MyPageScreen() {
 
         <TouchableOpacity
           style={styles.headerIconButton}
-          onPress={() => router.replace("/")}
+          onPress={goHome}
         >
           <Ionicons name="home-outline" size={26} color={NAVY} />
         </TouchableOpacity>
@@ -440,6 +447,46 @@ export default function MyPageScreen() {
               <StatChip label="저장 경로" value={`${routes.length}개`} />
             </View>
           </View>
+
+          {personalization && personalization.total_samples > 0 && (
+            <View style={styles.section}>
+              <View style={styles.sectionHeader}>
+                <Text style={styles.sectionTitle}>개인화 학습</Text>
+                <Text style={styles.sectionDesc}>
+                  {personalization.calibrated ? "맞춤 적용 중" : "학습 중"}
+                </Text>
+              </View>
+
+              <View style={styles.slopeCard}>
+                <Text style={{ fontSize: 13, color: TEXT_GRAY, marginBottom: 8, lineHeight: 19 }}>
+                  {personalization.calibrated
+                    ? "평지 속도 학습이 끝나 소요시간이 내 걸음에 맞춰집니다."
+                    : `평지를 ${Math.round(personalization.flat_progress_m)} / ${Math.round(
+                        personalization.flat_target_m,
+                      )}m 걸으면 소요시간이 내 걸음에 맞춰집니다.`}
+                </Text>
+                <View style={{ height: 8, borderRadius: 4, backgroundColor: BORDER_GRAY, overflow: "hidden" }}>
+                  <View
+                    style={{
+                      height: 8,
+                      borderRadius: 4,
+                      backgroundColor: NAVY,
+                      width: `${Math.min(
+                        100,
+                        Math.round(
+                          (100 * personalization.flat_progress_m) /
+                            Math.max(1, personalization.flat_target_m),
+                        ),
+                      )}%`,
+                    }}
+                  />
+                </View>
+                <Text style={{ fontSize: 12, color: TEXT_GRAY, marginTop: 10 }}>
+                  수집 세션 {personalization.session_count}회 · 구간 관측 {personalization.total_samples}건
+                </Text>
+              </View>
+            </View>
+          )}
 
           <View style={styles.section}>
             <View style={styles.sectionHeader}>

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   View,
   Text,
@@ -8,6 +8,7 @@ import {
   Platform,
   Alert,
   Linking,
+  AppState,
 } from "react-native";
 import { WebView } from "react-native-webview";
 import * as Location from "expo-location";
@@ -51,6 +52,8 @@ import {
 } from "../personalization/config";
 import { routeAfterRating } from "../personalization/entry";
 import RoundtripHintBanner from "../personalization/RoundtripHintBanner";
+import { getCollectConsent, setCollectConsent } from "../personalization/collectConsent";
+import CollectConsentModal from "../personalization/CollectConsentModal";
 
 const KAKAO_JAVASCRIPT_KEY = process.env.EXPO_PUBLIC_KAKAO_JAVASCRIPT_KEY;
 
@@ -770,6 +773,32 @@ export default function NavigationScreen({ navigation, route }: Props) {
   // 신호 B(순간속도) 계산용 — 직전 GPS 픽스
   const lastGpsPosRef   = useRef<Coordinate | null>(null);
   const lastGpsTimeRef  = useRef<number>(0);
+  // 앱이 백그라운드로 나간 시각 — 복귀 시 공백이 크면 진행 중이던 bin 을 버린다
+  const bgAtRef         = useRef<number>(0);
+
+  // 개인화 데이터 수집 동의 모달 (이슈 #1). unknown 이고 도보 안내일 때만 뜬다.
+  const [consentPrompt, setConsentPrompt] = useState(false);
+
+  /**
+   * 개인화 계측 세션을 실제로 시작한다 — 동의(granted)한 경우에만 호출된다.
+   * 세션 객체 + bin 트래커 생성 + 경로 형상 스냅샷(route_profile) 1회 적재.
+   */
+  const beginCollection = useCallback((initTime: number) => {
+    if (collectSessionRef.current) return;              // 중복 방지
+    collectSessionRef.current = new CollectSession(route?.params?.collectSessionId);
+    binTrackerRef.current = new SlopeBinTracker(routeSegments[0]?.slope ?? 0, initTime);
+    try {
+      collectSessionRef.current.setRouteProfile({
+        route_id: serverRouteIdRef.current,
+        total_length_m: Number(routeData?.totalDistance) || undefined,
+        segments: routeSegments.map((s: any) => ({
+          slope: Number(s.slope ?? s.slope_pct ?? 0),
+          length_m: Number(s.length ?? s.length_m ?? 5),
+        })),
+        coordinates: (coordinates ?? []).map((c: any) => [c.longitude, c.latitude]) as [number, number][],
+      });
+    } catch { /* 스냅샷 실패는 수집 자체를 막지 않는다 */ }
+  }, [route?.params?.collectSessionId, routeSegments, routeData, coordinates]);
 
   const visitedWaypointsRef = useRef<Set<number>>(new Set());
 
@@ -839,12 +868,21 @@ export default function NavigationScreen({ navigation, route }: Props) {
       measuredMsRef.current        = Array(routeSegments.length).fill(null);
       currentSegIdxRef.current     = 0;
 
-      // 개인화 계측 세션 시작. 이전 세션에서 전송 못 하고 큐에 남은 배치도 여기서 재시도.
+      // 이전 세션에서 전송 못 하고 큐에 남은 배치는 동의 여부와 무관하게 재시도한다
+      // (그 배치들은 당시 동의 상태에서 쌓인 것).
       drainCollectQueue().catch(() => {});
-      collectSessionRef.current = new CollectSession(route?.params?.collectSessionId);
-      binTrackerRef.current = new SlopeBinTracker(routeSegments[0]?.slope ?? 0, initTime);
       lastGpsPosRef.current   = null;
       lastGpsTimeRef.current  = 0;
+
+      // 개인화 계측은 명시적 동의가 있을 때만 시작한다 (이슈 #1).
+      //   granted  → 바로 시작
+      //   unknown  → 도보 안내면 모달을 띄우고, 동의 시 beginCollection 호출
+      //   denied   → 세션을 만들지 않음(모든 collectSessionRef?. 호출이 no-op)
+      getCollectConsent().then((consent) => {
+        if (!mounted) return;
+        if (consent === "granted") beginCollection(initTime);
+        else if (consent === "unknown" && (mode ?? "walk") === "walk") setConsentPrompt(true);
+      }).catch(() => {});
 
       speak(
         `${to}까지 안내를 시작합니다. 총 거리 ${formatDistance(routeData?.totalDistance)}, ` +
@@ -890,6 +928,12 @@ export default function NavigationScreen({ navigation, route }: Props) {
 
           setCurrentLocation({ latitude: loc.coords.latitude, longitude: loc.coords.longitude });
 
+          // GPS 콜백을 받았다는 것 자체가 "이 구간엔 GPS 커버리지가 있었다"는 신호다.
+          // accuracy 필터(위치 신뢰도) 앞에서 세므로, 정확도 낮은 픽스도 gps_sample_n
+          // 에는 반영된다 — validate_observation 의 _MIN_GPS_N 은 터널/무신호 관측을
+          // 걸러내려는 것이지 정밀도 필터가 아님 (이슈 §1-B).
+          binTrackerRef.current?.noteGpsSample();
+
           if (loc.coords.accuracy && loc.coords.accuracy > 20) return;
 
           const now = Date.now();
@@ -901,8 +945,6 @@ export default function NavigationScreen({ navigation, route }: Props) {
             // 첫 bin 속도에 섞여 들어가지 않도록(§3.2 신호 A는 distance/elapsed 기반).
             binTrackerRef.current?.anchorStart(now);
           }
-
-          binTrackerRef.current?.noteGpsSample();
 
           // 신호 B — 순간속도 원본 저장 (판정 없음, §3.2 / §3.8).
           // 직전 픽스와의 거리/시간으로 순간속도를 구해 현재 bin에 귀속시킨다.
@@ -1026,9 +1068,29 @@ export default function NavigationScreen({ navigation, route }: Props) {
     }
 
     startLocationWatch();
+
+    // 앱이 백그라운드로 나갔다 돌아오면, 그동안 GPS 픽스가 없어 진행 중이던 bin 의
+    // elapsed_ms 에 "화면 꺼둔 시간"이 통째로 섞인다. 공백이 SPEED_SAMPLE_MAX_GAP_S
+    // 를 넘으면 그 bin 을 버리고(다음 경계부터 다시), 직전 픽스도 리셋한다 (이슈 S3).
+    const appStateSub = AppState.addEventListener("change", (state) => {
+      if (state === "background" || state === "inactive") {
+        bgAtRef.current = Date.now();
+      } else if (state === "active" && bgAtRef.current > 0) {
+        const gapS = (Date.now() - bgAtRef.current) / 1000;
+        bgAtRef.current = 0;
+        if (gapS >= SPEED_SAMPLE_MAX_GAP_S) {
+          binTrackerRef.current?.invalidateCurrent(Date.now());
+          lastGpsPosRef.current = null;
+          lastGpsTimeRef.current = 0;
+          if (__DEV__) console.warn(`[collect] 백그라운드 복귀 공백 ${gapS.toFixed(0)}s — 진행 중 bin 무효화`);
+        }
+      }
+    });
+
     return () => {
       mounted = false;
       if (gpsWatchdog) clearTimeout(gpsWatchdog);
+      appStateSub.remove();
       subscriptionRef.current?.remove();
       subscriptionRef.current = null;
       Speech.stop();
@@ -1278,8 +1340,22 @@ export default function NavigationScreen({ navigation, route }: Props) {
         </TouchableOpacity>
       </View>
 
-      {/* ⑮ 왕복·방향 교대 안내 — ROUNDTRIP_HINT_ENABLED 가 false 면 null 렌더 */}
-      <RoundtripHintBanner from={from} to={finalDestinationName ?? to} />
+      {/* ⑮ 왕복·방향 교대 안내 — 순수 도보 개인화 세션에서만. 대중교통 도보
+          leg(mode="transit")에서는 "도착지→출발지" 문구가 무의미하고
+          @ando/roundtrip_seq 카운터도 leg마다 증가해버린다 (이슈 R1). */}
+      {mode === "walk" && (
+        <RoundtripHintBanner from={from} to={finalDestinationName ?? to} />
+      )}
+
+      {/* 개인화 데이터 수집 동의 (이슈 #1) — 결정 전 1회, 도보 안내에서만 */}
+      <CollectConsentModal
+        visible={consentPrompt}
+        onDecide={(granted) => {
+          setConsentPrompt(false);
+          void setCollectConsent(granted);
+          if (granted) beginCollection(Date.now());
+        }}
+      />
 
       {journeySteps.length > 0 && (
         <View style={[ss.journeyStepper, { bottom: bottomPad + 62 }]}>

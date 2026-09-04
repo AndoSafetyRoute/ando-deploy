@@ -146,6 +146,28 @@ export async function getUserStats(idToken: string): Promise<UserStats | null> {
   }
 }
 
+export type PersonalizationStatus = {
+  calibrated:      boolean;
+  flat_progress_m: number;
+  flat_target_m:   number;
+  zone_samples:    Record<string, number>;
+  total_samples:   number;
+  session_count:   number;
+};
+
+/** 개인화 학습 현황 (캘리브레이션 진행률 + zone별 관측 수). 이슈 #4·#9 */
+export async function getPersonalizationStatus(idToken: string): Promise<PersonalizationStatus | null> {
+  try {
+    const res = await fetch(`${BASE_URL}/user/personalization-status`, {
+      headers: { Authorization: `Bearer ${idToken}` },
+    });
+    if (!res.ok) return null;
+    return res.json();
+  } catch {
+    return null;
+  }
+}
+
 /** 설정에서 이동 유형 변경 시 서버에도 반영 */
 export async function updateUserTypeOnServer(apiType: string, idToken: string): Promise<void> {
   await fetch(`${BASE_URL}/user/type`, {

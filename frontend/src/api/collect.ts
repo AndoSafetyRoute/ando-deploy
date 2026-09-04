@@ -50,6 +50,16 @@ export type SegmentFeedback = {
   verdict:     -1 | 0 | 1;        // -1 불편 / 0 보통 / +1 편함
 };
 
+// ── 경로 형상 스냅샷 (세션당 1회) ────────────────────────────────────────────
+// /navigation/start 가 실패해 route_id 가 없어도 "그 세션이 어떤 경로였나"를
+// 잃지 않도록, 세션 첫 배치에만 실어 보낸다. BE 는 session_route_profile 에 UPSERT.
+export type RouteProfile = {
+  route_id?:       number | null;
+  total_length_m?: number;
+  segments:        { slope: number; length_m: number }[];   // 부호 있는 경사(%)
+  coordinates?:    [number, number][];                      // [[lng,lat], ...] (선택)
+};
+
 // ── 배치 요청 본문 ───────────────────────────────────────────────────────────
 export type CollectBatch = {
   session_id:           string;
@@ -58,6 +68,7 @@ export type CollectBatch = {
   speed_samples?:       SpeedSample[];
   route_choice?:        RouteChoice | null;
   segment_feedback?:    SegmentFeedback[];
+  route_profile?:       RouteProfile | null;
 };
 
 export type CollectBatchResponse =

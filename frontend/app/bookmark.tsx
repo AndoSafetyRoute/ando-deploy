@@ -5,6 +5,7 @@ import {
 } from "react-native";
 import { Ionicons, Feather, MaterialCommunityIcons } from "@expo/vector-icons";
 import { router } from "expo-router";
+import { goHome } from "../src/utils/navigation";
 import { WebView } from "react-native-webview";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import {
@@ -312,7 +313,7 @@ export default function BookmarkScreen() {
           <Ionicons name="chevron-back" size={26} color={NAVY} />
         </TouchableOpacity>
         <Text style={styles.headerTitle}>즐겨찾기</Text>
-        <TouchableOpacity style={styles.headerIconBtn} onPress={() => router.replace("/")}>
+        <TouchableOpacity style={styles.headerIconBtn} onPress={goHome}>
           <Ionicons name="home-outline" size={24} color={NAVY} />
         </TouchableOpacity>
       </View>
@@ -419,13 +420,13 @@ export default function BookmarkScreen() {
 
       {/* 하단 네비게이션 */}
       <View style={[styles.bottomNav, { bottom: 14 + insets.bottom }]}>
-        <TouchableOpacity style={styles.navButton} onPress={() => router.replace("/")}>
+        <TouchableOpacity style={styles.navButton} onPress={goHome}>
           <Ionicons name="home-outline" size={30} color={NAVY} />
         </TouchableOpacity>
         <TouchableOpacity style={[styles.navButton, styles.activeNavButton]}>
           <Feather name="bookmark" size={29} color="#FFFFFF" />
         </TouchableOpacity>
-        <TouchableOpacity style={styles.navButton} onPress={() => router.replace("/")}>
+        <TouchableOpacity style={styles.navButton} onPress={goHome}>
           <MaterialCommunityIcons name="crosshairs-gps" size={32} color={NAVY} />
         </TouchableOpacity>
         <TouchableOpacity style={styles.navButton} onPress={() => router.push("/settings")}>

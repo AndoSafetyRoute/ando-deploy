@@ -394,8 +394,9 @@ const s = StyleSheet.create({
     shadowOffset: { width: 0, height: 2 },
   },
   mapControlBtn: {
-    width: 40,
-    height: 40,
+    // 44dp — 야외 보행 중 터치 오차를 감안한 접근성 최소 타겟 크기.
+    width: 44,
+    height: 44,
     justifyContent: 'center',
     alignItems: 'center',
     borderBottomWidth: 1,

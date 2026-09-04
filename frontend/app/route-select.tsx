@@ -12,6 +12,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { router, useLocalSearchParams } from "expo-router";
+import { goHome } from "../src/utils/navigation";
 import { requestRoute } from "../src/api/routeApi";
 import { getUserType, toApiUserType } from "../src/utils/storage";
 import { isWithinSlopeDataCoverage, SLOPE_DATA_WARNING } from "../src/utils/coverage";
@@ -152,7 +153,7 @@ export default function RouteSelectScreen() {
 
         <TouchableOpacity
           style={styles.headerIconButton}
-          onPress={() => router.replace("/")}
+          onPress={goHome}
         >
           <Ionicons name="close" size={28} color={NAVY} />
         </TouchableOpacity>
@@ -299,7 +300,7 @@ export default function RouteSelectScreen() {
         <TouchableOpacity
           style={styles.homeButton}
           activeOpacity={0.85}
-          onPress={() => router.replace("/")}
+          onPress={goHome}
         >
           <Text style={styles.homeButtonText}>홈으로 돌아가기</Text>
         </TouchableOpacity>

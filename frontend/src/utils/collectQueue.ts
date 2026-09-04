@@ -21,6 +21,7 @@ import {
   type SpeedSample,
   type RouteChoice,
   type SegmentFeedback,
+  type RouteProfile,
 } from "../api/collect";
 
 // RN 환경에선 네이티브 AsyncStorage, 그 외(단위 검증 등)에선 인메모리 대체.
@@ -72,8 +73,28 @@ async function loadPending(): Promise<PendingBatch[]> {
   }
 }
 
+// 오프라인이 길어져 큐 상한을 넘으면 오래된 배치부터 버린다 — 무통보 데이터
+// 손실이므로 최소한 로그는 남긴다(이슈 #8). 파일럿 중 이 경고가 보이면
+// MAX_PENDING_BATCHES 를 올리거나 참가자 네트워크 환경을 점검해야 한다.
+let droppedBatchCount = 0;
+export function getDroppedBatchCount(): number { return droppedBatchCount; }
+
 async function savePending(list: PendingBatch[]): Promise<void> {
   try {
+    if (list.length > MAX_PENDING_BATCHES) {
+      const dropped = list.slice(0, list.length - MAX_PENDING_BATCHES);
+      droppedBatchCount += dropped.length;
+      const rows = dropped.reduce(
+        (s, b) =>
+          s + (b.slope_observations?.length ?? 0) + (b.speed_samples?.length ?? 0) +
+          (b.segment_feedback?.length ?? 0) + (b.route_choice ? 1 : 0),
+        0,
+      );
+      console.warn(
+        `[collect] 큐 상한(${MAX_PENDING_BATCHES}) 초과 — 오래된 배치 ${dropped.length}개(약 ${rows}행) 폐기. ` +
+        `누적 폐기 ${droppedBatchCount}개.`,
+      );
+    }
     const trimmed = list.slice(-MAX_PENDING_BATCHES);
     await AsyncStorage.setItem(PENDING_KEY, JSON.stringify(trimmed));
   } catch {
@@ -150,6 +171,8 @@ export class CollectSession {
   private speed: SpeedSample[] = [];
   private choice: RouteChoice | null = null;
   private seg: SegmentFeedback[] = [];
+  // 세션당 1회. 첫 flush 에 실려 나가고 그 뒤 null 로 비운다(BE 는 UPSERT).
+  private routeProfile: RouteProfile | null = null;
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private closed = false;
@@ -186,6 +209,12 @@ export class CollectSession {
     this.maybeFlushBySize();
   }
 
+  /** 경로 형상 스냅샷 (세션당 1회). 다음 flush 에 실려 나가고 그 뒤 비워진다. */
+  setRouteProfile(p: RouteProfile): void {
+    if (this.closed) return;
+    this.routeProfile = p;
+  }
+
   addSegmentFeedback(f: SegmentFeedback): void {
     if (this.closed) return;
     this.seg.push(f);
@@ -199,7 +228,7 @@ export class CollectSession {
   async flush(opts?: { final?: boolean; idToken?: string }): Promise<void> {
     const final = opts?.final ?? false;
 
-    if (this.bufferedRows() > 0) {
+    if (this.bufferedRows() > 0 || this.routeProfile) {
       const batch: PendingBatch = {
         session_id:         this.sessionId,
         seq:                this.seq++,
@@ -207,12 +236,14 @@ export class CollectSession {
         speed_samples:      this.speed,
         route_choice:       this.choice,
         segment_feedback:   this.seg,
+        route_profile:      this.routeProfile,
       };
       // 버퍼를 먼저 비운다 — 전송 실패해도 배치는 큐에 남으므로 유실 없음
       this.slope = [];
       this.speed = [];
       this.choice = null;
       this.seg = [];
+      this.routeProfile = null;
       if (IS_DEV) {
         const bins = batch.slope_observations?.map((o) => o.slope_bin) ?? [];
         const dist = batch.slope_observations?.reduce((s, o) => s + o.distance_m, 0) ?? 0;

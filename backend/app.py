@@ -1,6 +1,11 @@
 """
 app.py — Ando 접근성 경로 탐색 FastAPI 서버
-실행: uvicorn app:app --reload --port 5000
+실행: uvicorn app:app --reload --host 0.0.0.0 --port 5000
+
+--host 를 안 쓰면 uvicorn 기본값 127.0.0.1 로 떠서 이 PC 자신만 접속 가능하다 —
+에뮬레이터(10.0.2.2)도, 실기기(LAN IP)도, 배포 서버도 전부 접속이 안 되는
+"로그인은 성공하는데 그 다음 백엔드 호출이 전부 실패하는" 원인이 된다.
+0.0.0.0 으로 띄워야 같은 네트워크의 다른 기기에서 접속할 수 있다.
 """
 from contextlib import asynccontextmanager
 
@@ -24,7 +29,7 @@ from database import (
     get_search_history, save_search_history,
     start_navigation, add_navigation_segment, complete_navigation,
     save_zone_observation, get_user_speed_profile, save_collect_batch,
-    delete_user_account,
+    delete_user_account, get_personalization_status,
 )
 from routing.speed import get_zone_key, estimate_route_time, get_default_speed
 from routing.segments import build_navigation_segments, extract_waypoints
@@ -44,6 +49,93 @@ _subway_db: SubwayFacilityDB | None = None
 # 그래프(수십만 노드)에서 이걸 매 /route 요청마다 다시 계산하면 요청당 유의미한
 # 지연이 생긴다. 그래프는 서버 실행 중 바뀌지 않으므로 1회만 계산해 재사용한다.
 _waypoints_set: set | None = None
+
+
+def _nav_segs_and_waypoints(path_nodes: list, user_type: str) -> tuple[list, list]:
+    """
+    path_nodes → (navigation_segments 응답 dict 리스트, waypoints 응답 dict 리스트).
+
+    메인("type") 경로만 이걸 계산하고 compare 후보(distance/personal)는 안 붙여주고
+    있었다 — 그 상태로 distance/personal 을 골라 안내를 시작하면 navigation_segments
+    가 없어 지도 zone 색칠이 구식 getSegmentColor 폴백(3%/8% 고정 임계)으로 떨어지고
+    회전 음성안내(waypoints)가 아예 안 나오는 문제가 있었다 (⑬ 활성화 전 발견).
+    이 함수로 뽑아내 compare 후보들에도 동일하게 계산해 붙인다.
+    """
+    node_to_path_idx: dict = {}
+    for i, n in enumerate(path_nodes):
+        if n not in node_to_path_idx:
+            node_to_path_idx[n] = i
+
+    nav_segs = build_navigation_segments(G, path_nodes, user_type, waypoints_set=_waypoints_set)
+    nav_time = estimate_nav_time(nav_segs, user_type)
+
+    nav_segs_json = [
+        {
+            "segment_id":        s.segment_id,
+            "length_m":          round(s.length_m, 1),
+            "slope_mean":        s.slope_mean,
+            "slope_max":         s.slope_max,
+            "slope_stddev":      s.slope_stddev,
+            "zone":              s.zone,
+            "estimated_seconds": (nav_time["segments"][i]["estimated_seconds"]
+                                  if nav_time.get("segments") and i < len(nav_time["segments"])
+                                  else 0.0),
+            "coord_start_idx":   node_to_path_idx.get(s.start_node, 0),
+            "coord_end_idx":     node_to_path_idx.get(s.end_node, 0),
+            "start_coords":      [round(G.nodes[s.start_node]["lon"], 7),
+                                  round(G.nodes[s.start_node]["lat"], 7)],
+            "end_coords":        [round(G.nodes[s.end_node]["lon"], 7),
+                                  round(G.nodes[s.end_node]["lat"], 7)],
+        }
+        for i, s in enumerate(nav_segs)
+    ]
+
+    waypoints: list = []
+    for i, seg in enumerate(nav_segs[:-1]):
+        wp = G.nodes[seg.end_node]
+        prev_nd_key = (seg.intermediate_nodes[-1] if seg.intermediate_nodes else seg.start_node)
+        prev_nd = G.nodes[prev_nd_key]
+        cur_bearing = calculate_bearing(prev_nd["lon"], prev_nd["lat"], wp["lon"], wp["lat"])
+
+        next_seg = nav_segs[i + 1]
+        next_nd_key = (next_seg.intermediate_nodes[0] if next_seg.intermediate_nodes else next_seg.end_node)
+        next_nd = G.nodes[next_nd_key]
+        next_bearing = calculate_bearing(wp["lon"], wp["lat"], next_nd["lon"], next_nd["lat"])
+
+        turn = get_turn_direction(cur_bearing, next_bearing)
+        waypoints.append({
+            "lat":              wp["lat"],
+            "lon":              wp["lon"],
+            "turn_direction":   turn,
+            "guidance_text":    generate_guidance_text(turn, next_seg),
+            "distance_to_next": round(next_seg.length_m, 1),
+        })
+
+    return nav_segs_json, waypoints
+
+
+def _candidate_segs(raw_segments: list, user_type: str) -> list:
+    """
+    CCH 결과의 원본 segment(slope_pct / length_m / direction …)를 FE 가 바로 쓰는
+    형식으로 정규화한다. FE(SlopeBinTracker, routeChoiceModel.slopeProfile)는
+    `slope` / `length` 를 읽으므로 이 별칭이 없으면 `seg.length ?? 5` 로 5m 로
+    떨어진다 (data-collection-plan §3, 이슈 §1-A). type 후보의 `segs` 와 같은 shape.
+    """
+    out = []
+    for s in raw_segments:
+        slope_pct = s.get("slope_pct", s.get("slope", 0.0))
+        length_m  = s.get("length_m", s.get("length", 0.0))
+        direction = s.get("direction", "flat")
+        out.append({
+            "name":      s.get("name", ""),
+            "direction": direction,
+            "slope_pct": round(slope_pct, 2),
+            "length_m":  round(length_m, 1),
+            "slope":     round(slope_pct, 2),
+            "length":    round(length_m, 1),
+            "zone":      classify_zone(slope_pct, direction, user_type),
+        })
+    return out
 
 
 @asynccontextmanager
@@ -557,6 +649,19 @@ class SegmentFeedbackPayload(BaseModel):
     verdict:    int             # -1 불편 / 0 보통 / +1 편함
 
 
+class RouteProfileSegPayload(BaseModel):
+    slope:    float                 # 부호 있는 경사(%)
+    length_m: float
+
+
+class RouteProfilePayload(BaseModel):
+    # 세션 첫 배치에만 실려 온다. route_id 가 NULL 이어도 경로 형상을 잃지 않게 저장.
+    route_id:       int | None = None
+    total_length_m: float | None = None
+    segments:       list[RouteProfileSegPayload] = []
+    coordinates:    list[list[float]] | None = None   # [[lng,lat], ...] (선택)
+
+
 class CollectBatchRequest(BaseModel):
     session_id:          str
     seq:                 int
@@ -564,6 +669,7 @@ class CollectBatchRequest(BaseModel):
     speed_samples:       list[SpeedSamplePayload] = []
     route_choice:        RouteChoicePayload | None = None
     segment_feedback:    list[SegmentFeedbackPayload] = []
+    route_profile:       RouteProfilePayload | None = None
 
 
 @app.post("/collect/batch")
@@ -585,8 +691,18 @@ def api_collect_batch(
         speed_samples_in=[s.model_dump() for s in body.speed_samples],
         route_choice=body.route_choice.model_dump() if body.route_choice else None,
         segment_feedback_in=[f.model_dump() for f in body.segment_feedback],
+        route_profile=body.route_profile.model_dump() if body.route_profile else None,
     )
     return result
+
+
+@app.get("/user/personalization-status")
+def api_personalization_status(
+    db: Session = Depends(get_db),
+    decoded: dict = Depends(_verified),
+):
+    """개인화 학습 현황 (캘리브레이션 진행률 + zone별 관측 수). FE 마이페이지/안내 배지용."""
+    return get_personalization_status(db, decoded["uid"])
 
 
 # ── 요청 모델 ─────────────────────────────────────────────────────────────────
@@ -829,6 +945,11 @@ def api_route(
                     "avgSlope":      avg_slope_pct,
                     "estimatedTimeS": estimated_time_s,
                     "routeSegments": segs,
+                    # "type" 은 메인 경로라 이미 위에서 계산해 둔 nav_segs/waypoints 를
+                    # 그대로 붙인다(재계산 안 함) — light 모드였으면(드묾: compare 는
+                    # 보통 light 없이 호출) waypoints 가 비어 있을 수 있음.
+                    "navigation_segments": response["navigation_segments"],
+                    "waypoints":     response["waypoints"],
                 },
             ]
 
@@ -854,6 +975,9 @@ def api_route(
                              "direction": s["direction"], "length_m": s["length_m"]}
                             for s in dist_result["segments"]
                         ]
+                        dist_nav_segs, dist_waypoints = _nav_segs_and_waypoints(
+                            dist_result["path_nodes"], body.user_type
+                        )
                         candidate_routes.append({
                             "kind":          "distance",
                             "coordinates":   dist_coords,
@@ -862,7 +986,9 @@ def api_route(
                             "estimatedTimeS": estimate_route_time(
                                 dist_segs_for_time, body.user_type, dist_speed_profile
                             ),
-                            "routeSegments": dist_result["segments"],
+                            "routeSegments": _candidate_segs(dist_result["segments"], body.user_type),
+                            "navigation_segments": dist_nav_segs,
+                            "waypoints":     dist_waypoints,
                         })
                 except Exception as e:
                     print(f"[route2] 거리경로 조회 실패 (무시): {e}")
@@ -896,6 +1022,9 @@ def api_route(
                                  "direction": s["direction"], "length_m": s["length_m"]}
                                 for s in personal_result["segments"]
                             ]
+                            personal_nav_segs, personal_waypoints = _nav_segs_and_waypoints(
+                                personal_result["path_nodes"], body.user_type
+                            )
                             candidate_routes.append({
                                 "kind":          "personal",
                                 "coordinates":   personal_coords,
@@ -904,7 +1033,9 @@ def api_route(
                                 "estimatedTimeS": estimate_route_time(
                                     personal_segs_for_time, body.user_type, personal_speed_profile
                                 ),
-                                "routeSegments": personal_result["segments"],
+                                "routeSegments": _candidate_segs(personal_result["segments"], body.user_type),
+                                "navigation_segments": personal_nav_segs,
+                                "waypoints":     personal_waypoints,
                             })
                     except Exception as e:
                         print(f"[route3] 맞춤경로 조회 실패 (무시): {e}")

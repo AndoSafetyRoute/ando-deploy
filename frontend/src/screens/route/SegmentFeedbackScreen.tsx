@@ -8,15 +8,37 @@
 // 평가할 구간이 없으면(완만한 경로) 화면 없이 곧장 다음으로 넘어간다.
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { View, Text, StyleSheet, TouchableOpacity } from "react-native";
+import { View, Text, StyleSheet, TouchableOpacity, Modal } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { C } from "../../constants/colors";
 import { CollectSession } from "../../utils/collectQueue";
+import { getCollectConsent } from "../../personalization/collectConsent";
+import RouteMapView, { type MapRoute } from "./RouteMapView";
 import {
   pickFeedbackSegments,
   VERDICT,
   type VerdictLabel,
 } from "../../utils/segmentFeedbackModel";
+
+type RawSeg = {
+  start?: { latitude?: number; longitude?: number };
+  end?:   { latitude?: number; longitude?: number };
+};
+
+/** routeSegments(start/end 좌표 있는 원본)에서 전체 경로 좌표열을 뽑는다. */
+function toCoordList(segs: RawSeg[]): { latitude: number; longitude: number }[] {
+  const out: { latitude: number; longitude: number }[] = [];
+  segs.forEach((s, i) => {
+    const st = s.start, en = s.end;
+    if (i === 0 && st && Number.isFinite(st.latitude) && Number.isFinite(st.longitude)) {
+      out.push({ latitude: st.latitude!, longitude: st.longitude! });
+    }
+    if (en && Number.isFinite(en.latitude) && Number.isFinite(en.longitude)) {
+      out.push({ latitude: en.latitude!, longitude: en.longitude! });
+    }
+  });
+  return out;
+}
 
 type Props = {
   navigation: any;
@@ -54,9 +76,21 @@ export default function SegmentFeedbackScreen({ navigation, route }: Props) {
   const targets = useMemo(() => pickFeedbackSegments(segsRaw), [segsRaw]);
   const serverRouteId = p.serverRouteId ? Number(p.serverRouteId) : null;
 
+  // "지도로 확인하기" — 걸은 경로 전체(회색) 위에 평가 대상 구간만 강조색으로.
+  const allCoords = useMemo(() => toCoordList(segsRaw), [segsRaw]);
+  const hasMap = allCoords.length >= 2;
+  const [mapTargetIdx, setMapTargetIdx] = useState<number | null>(null);
+
   const [answers, setAnswers] = useState<Record<number, VerdictLabel>>({});
+  // 동의 전엔 세션을 안 만든다 — 아래 collectRef.current?. 호출들은 null 이어도 안전.
   const collectRef = useRef<CollectSession | null>(null);
-  if (collectRef.current === null) collectRef.current = new CollectSession();
+  useEffect(() => {
+    let alive = true;
+    getCollectConsent().then((c) => {
+      if (alive && c === "granted") collectRef.current = new CollectSession();
+    }).catch(() => {});
+    return () => { alive = false; };
+  }, []);
 
   const goNext = () => {
     void collectRef.current?.flush({ final: true });
@@ -73,6 +107,29 @@ export default function SegmentFeedbackScreen({ navigation, route }: Props) {
   if (targets.length === 0) return <View style={[ss.screen, { paddingTop: insets.top }]} />;
 
   const allAnswered = targets.every((_, i) => answers[i] != null);
+
+  /** target(startIdx~endIdx) 구간의 좌표열만 뽑아 지도 강조색 구간으로 만든다. */
+  const highlightFor = (t: { startIdx: number; endIdx: number }) =>
+    toCoordList(segsRaw.slice(t.startIdx, t.endIdx + 1) as RawSeg[]);
+
+  const mapModalRoutes: MapRoute[] | null =
+    mapTargetIdx === null
+      ? null
+      : [
+          {
+            id: "walked",
+            color: "#C7C7D1",
+            coordinates: allCoords,
+            segments: [
+              {
+                coordinates: highlightFor(targets[mapTargetIdx]),
+                color: C.primary,
+                slopeMean: targets[mapTargetIdx].slope_mean,
+                zone: targets[mapTargetIdx].slope_mean === 0 ? "flat" : "warning",
+              },
+            ],
+          },
+        ];
 
   const submit = () => {
     const cs = collectRef.current;
@@ -100,6 +157,16 @@ export default function SegmentFeedbackScreen({ navigation, route }: Props) {
         {targets.map((t, i) => (
           <View key={i} style={ss.card}>
             <Text style={ss.segTitle}>{fmtSlope(t.slope_mean)} · {fmtLen(t.length_m)}</Text>
+            {hasMap && (
+              <TouchableOpacity
+                style={ss.mapLinkBtn}
+                activeOpacity={0.7}
+                onPress={() => setMapTargetIdx(i)}
+                hitSlop={{ top: 4, bottom: 8, left: 8, right: 8 }}
+              >
+                <Text style={ss.mapLinkText}>🗺 지도로 확인하기</Text>
+              </TouchableOpacity>
+            )}
             <View style={ss.choiceRow}>
               {CHOICES.map((c) => {
                 const on = answers[i] === c.key;
@@ -128,6 +195,37 @@ export default function SegmentFeedbackScreen({ navigation, route }: Props) {
           <Text style={ss.skip}>건너뛰기</Text>
         </TouchableOpacity>
       </View>
+
+      {/* 지도로 확인하기 — 전체 경로(회색) 위에 이 구간(강조색)만 표시. 눌렀을 때만
+          마운트해 WebView 비용을 평소엔 안 물게 한다. */}
+      <Modal
+        visible={mapTargetIdx !== null}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setMapTargetIdx(null)}
+      >
+        <View style={ss.mapModalBackdrop}>
+          <View style={[ss.mapModalCard, { marginBottom: insets.bottom + 16 }]}>
+            <View style={ss.mapModalHeader}>
+              <Text style={ss.mapModalTitle}>
+                {mapTargetIdx !== null ? fmtSlope(targets[mapTargetIdx].slope_mean) : ""} 구간
+              </Text>
+              <TouchableOpacity onPress={() => setMapTargetIdx(null)} hitSlop={10}>
+                <Text style={ss.mapModalClose}>닫기</Text>
+              </TouchableOpacity>
+            </View>
+            <View style={ss.mapModalBox}>
+              {mapModalRoutes && (
+                <RouteMapView
+                  routes={mapModalRoutes}
+                  selectedRouteId="walked"
+                  showSlopeMarkers
+                />
+              )}
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -137,7 +235,9 @@ const ss = StyleSheet.create({
   title: { fontSize: 19, fontWeight: "800", color: C.text, textAlign: "center" },
   sub: { fontSize: 13, color: C.textSub, textAlign: "center", marginTop: 8, lineHeight: 19 },
   card: { backgroundColor: C.white, borderRadius: 16, padding: 18 },
-  segTitle: { fontSize: 15, fontWeight: "700", color: C.text, textAlign: "center", marginBottom: 14 },
+  segTitle: { fontSize: 15, fontWeight: "700", color: C.text, textAlign: "center", marginBottom: 2 },
+  mapLinkBtn: { alignSelf: "center", marginBottom: 12, paddingVertical: 4, paddingHorizontal: 8 },
+  mapLinkText: { fontSize: 12.5, fontWeight: "700", color: C.primaryDark },
   choiceRow: { flexDirection: "row", gap: 10 },
   choice: { flex: 1, alignItems: "center", paddingVertical: 14, borderRadius: 12, borderWidth: 1.5, borderColor: C.border, backgroundColor: C.white },
   choiceOn: { borderColor: C.primary, backgroundColor: C.primaryBg },
@@ -148,4 +248,14 @@ const ss = StyleSheet.create({
   ctaOff: { backgroundColor: C.primaryLight },
   ctaText: { color: C.white, fontSize: 15, fontWeight: "700" },
   skip: { textAlign: "center", color: C.textMute, fontSize: 13, paddingVertical: 6 },
+
+  mapModalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.45)", justifyContent: "flex-end" },
+  mapModalCard: { backgroundColor: C.white, borderRadius: 20, marginHorizontal: 12, overflow: "hidden" },
+  mapModalHeader: {
+    flexDirection: "row", alignItems: "center", justifyContent: "space-between",
+    paddingHorizontal: 16, paddingVertical: 12,
+  },
+  mapModalTitle: { fontSize: 15, fontWeight: "700", color: C.text },
+  mapModalClose: { fontSize: 13, fontWeight: "700", color: C.textSub },
+  mapModalBox: { height: 320, backgroundColor: C.bg },
 });

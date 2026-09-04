@@ -10,6 +10,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons, Feather } from "@expo/vector-icons";
 import { WebView } from "react-native-webview";
 import { router, useLocalSearchParams } from "expo-router";
+import { goHome } from "../src/utils/navigation";
 
 const NAVY = "#1B0F4A";
 const LIGHT_GRAY = "#F1F2F6";
@@ -158,7 +159,7 @@ export default function PlaceInfoScreen() {
 
         <TouchableOpacity
           style={styles.headerIconButton}
-          onPress={() => router.replace("/")}
+          onPress={goHome}
         >
           <Ionicons name="close" size={28} color={NAVY} />
         </TouchableOpacity>

@@ -28,6 +28,13 @@ SessionLocal = sessionmaker(bind=engine) if engine else None
 
 
 def get_db() -> Session:
+    # DATABASE_URL 미설정이면 SessionLocal 자체가 None 이라 SessionLocal() 호출이
+    # "TypeError: 'NoneType' object is not callable" 로 죽으면서 원인을 알 수 없는
+    # 500 이 났었다(로그인 등 DB 의존 엔드포인트 전부). 여기서 먼저 걸러 명확한
+    # 503 으로 바꾼다 — 실서버는 DATABASE_URL 이 설정돼 있어 평소엔 영향 없음.
+    if not SessionLocal:
+        from fastapi import HTTPException
+        raise HTTPException(503, "DB 미설정 (DATABASE_URL 환경변수 확인 필요)")
     db = SessionLocal()
     try:
         yield db
@@ -261,12 +268,17 @@ def init_db():
 
         # ── 개인 맞춤 경로 추천 (ando_dev_final.md 3.7절) ──────────────────────
         # 신호 A: 경사 bin별 통과 관측
+        # user_type: 관측이 일어난 세션의 유형을 박아 둔다(배치 처리 시점의 users.user_type
+        # 복사). 파일럿 중 사용자가 유형을 바꿔도 과거 관측의 귀속이 깨지지 않게 —
+        # 학습은 users.user_type(현재값)이 아니라 이 컬럼으로 그룹핑한다.
+        # (docs/personalization-data-collection-plan.md §1.2)
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS trip_slope_observations (
                 id             SERIAL PRIMARY KEY,
                 uid            TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
                 route_id       INT  REFERENCES routes(id) ON DELETE CASCADE,
                 session_id     TEXT NOT NULL,
+                user_type      TEXT,
                 slope_bin      FLOAT NOT NULL,
                 distance_m     FLOAT NOT NULL,
                 elapsed_ms     INT   NOT NULL,
@@ -275,6 +287,10 @@ def init_db():
                 observed_at    TIMESTAMPTZ DEFAULT NOW()
             )
         """))
+        # 기존 배포에 테이블이 이미 있으면 컬럼만 추가 (§1.2)
+        conn.execute(text(
+            "ALTER TABLE trip_slope_observations ADD COLUMN IF NOT EXISTS user_type TEXT"
+        ))
         conn.execute(text("""
             CREATE INDEX IF NOT EXISTS idx_tso_uid_bin
             ON trip_slope_observations (uid, slope_bin)
@@ -319,6 +335,37 @@ def init_db():
                 created_at     TIMESTAMPTZ DEFAULT NOW()
             )
         """))
+        # verdict 는 -1(불편)/0(보통)/+1(편함) 만 허용 — FE 신뢰에만 의존하지 않도록
+        # DB 레벨에서 못박는다 (docs/personalization-data-collection-plan.md, 이슈 #6).
+        conn.execute(text("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'chk_verdict' AND conrelid = 'segment_feedback'::regclass
+                ) THEN
+                    ALTER TABLE segment_feedback
+                        ADD CONSTRAINT chk_verdict CHECK (verdict IN (-1, 0, 1));
+                END IF;
+            END $$
+        """))
+
+        # session_route_profile — route_id 가 NULL 인(=/navigation/start 실패) 세션도
+        # "어떤 경로였나"를 잃지 않도록, FE 가 세션 첫 배치에 실어 보내는 경로 형상을
+        # (uid, session_id) 로 UPSERT 저장한다. route_id 가 있어도 교차 검증용으로 함께
+        # 저장한다. (docs/personalization-data-collection-plan.md §1.3)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS session_route_profile (
+                uid            TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+                session_id     TEXT NOT NULL,
+                route_id       INT  REFERENCES routes(id) ON DELETE SET NULL,
+                user_type      TEXT,
+                total_length_m FLOAT,
+                segments       JSONB NOT NULL,
+                coordinates    JSONB,
+                captured_at    TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (uid, session_id)
+            )
+        """))
 
         # 경사도 측정 검증
         conn.execute(text("""
@@ -334,12 +381,15 @@ def init_db():
         """))
 
         # 학습 결과 (배치가 쓰고, 요청 경로는 읽기만)
+        # v_flat_used: 이 학습 실행이 신호 A·B 정규화에 고정해 쓴 v̄_flat 값.
+        # 곡선의 재현성을 위해 반드시 함께 기록한다 (§1.1 정책 2·3).
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS user_slope_curve (
                 uid          TEXT PRIMARY KEY REFERENCES users(uid) ON DELETE CASCADE,
                 theta        JSONB NOT NULL,
                 cost_grid    JSONB NOT NULL,
                 beta_gamma   FLOAT NOT NULL,
+                v_flat_used  FLOAT,
                 valid_min    FLOAT NOT NULL,
                 valid_max    FLOAT NOT NULL,
                 n_sessions   INT   NOT NULL,
@@ -347,6 +397,9 @@ def init_db():
                 fitted_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """))
+        conn.execute(text(
+            "ALTER TABLE user_slope_curve ADD COLUMN IF NOT EXISTS v_flat_used FLOAT"
+        ))
 
         # 공유 파라미터 (전원 공통, 단일 행)
         conn.execute(text("""
@@ -1035,6 +1088,52 @@ def get_user_sample_counts(db: Session, uid: str) -> dict[str, int]:
     return {row[0]: int(row[1]) for row in rows}
 
 
+def get_personalization_status(db: Session, uid: str) -> dict:
+    """
+    개인화 학습 현황 — FE 마이페이지/안내 시작 배지용 (이슈 #4·#9).
+
+    calibrated: v̄_flat 캘리브레이션(평지 누적 CALIBRATION_FLAT_M) 완료 여부.
+    flat_progress_m / flat_target_m: 진행률 표시용.
+    zone_samples: zone_key 별 누적 관측 횟수.
+    session_count: 지금까지 수집된 개인화 세션 수(distinct session_id).
+    """
+    empty = {
+        "calibrated":      False,
+        "flat_progress_m": 0.0,
+        "flat_target_m":   CALIBRATION_FLAT_M,
+        "zone_samples":    {},
+        "total_samples":   0,
+        "session_count":   0,
+    }
+    if not engine:
+        return empty
+
+    prof = db.execute(text("""
+        SELECT zone_key, sample_count, cumulative_distance_m
+        FROM user_speed_profile WHERE uid = :uid
+    """), {"uid": uid}).fetchall()
+
+    zone_samples = {r[0]: int(r[1] or 0) for r in prof}
+    flat_cum = next((float(r[2] or 0.0) for r in prof if r[0] == "flat"), 0.0)
+
+    try:
+        sess = db.execute(text(
+            "SELECT COUNT(DISTINCT session_id) FROM trip_slope_observations WHERE uid = :uid"
+        ), {"uid": uid}).fetchone()
+        session_count = int(sess[0] or 0) if sess else 0
+    except Exception:
+        session_count = 0
+
+    return {
+        "calibrated":      flat_cum >= CALIBRATION_FLAT_M,
+        "flat_progress_m": round(min(flat_cum, CALIBRATION_FLAT_M), 1),
+        "flat_target_m":   CALIBRATION_FLAT_M,
+        "zone_samples":    zone_samples,
+        "total_samples":   sum(zone_samples.values()),
+        "session_count":   session_count,
+    }
+
+
 def save_collect_batch(
     db: Session,
     uid: str,
@@ -1044,12 +1143,17 @@ def save_collect_batch(
     speed_samples_in: list,
     route_choice: dict | None,
     segment_feedback_in: list,
+    route_profile: dict | None = None,
 ) -> dict:
     """
     ando_dev_final.md 3.9절 — 개인 맞춤 경로 추천 신호 4종을 한 번에 저장.
 
     멱등: (uid, session_id, seq)가 이미 처리됐으면 재삽입하지 않고 바로 반환한다
     (FE가 네트워크 실패로 같은 배치를 재전송해도 중복 저장되지 않음).
+
+    route_profile: {segments:[{slope,length_m}], total_length_m, coordinates?, route_id?}
+      세션 첫 배치에만 실려 온다. session_route_profile 에 UPSERT — route_id 가 NULL 인
+      세션도 경로 형상을 잃지 않도록 (docs/personalization-data-collection-plan.md §1.3).
     """
     if not engine:
         return {"ok": False, "reason": "DB 미설정"}
@@ -1065,18 +1169,53 @@ def save_collect_batch(
         db.commit()
         return {"ok": True, "duplicate": True}
 
+    # 관측 시점 유형 — 이 배치의 모든 trip_slope_observations 행에 박아 넣는다 (§1.2).
+    _ut_row = db.execute(
+        text("SELECT user_type FROM users WHERE uid = :uid"), {"uid": uid}
+    ).fetchone()
+    user_type = _ut_row[0] if _ut_row and _ut_row[0] else "elderly"
+
+    # 경로 형상 스냅샷 (세션 첫 배치에만 옴) — UPSERT
+    profile_saved = False
+    if route_profile and route_profile.get("segments"):
+        db.execute(text("""
+            INSERT INTO session_route_profile
+                (uid, session_id, route_id, user_type, total_length_m, segments, coordinates)
+            VALUES
+                (:uid, :session_id, :route_id, :user_type, :total_length_m,
+                 CAST(:segments AS JSONB), CAST(:coordinates AS JSONB))
+            ON CONFLICT (uid, session_id) DO UPDATE SET
+                route_id       = COALESCE(EXCLUDED.route_id, session_route_profile.route_id),
+                user_type      = EXCLUDED.user_type,
+                total_length_m = EXCLUDED.total_length_m,
+                segments       = EXCLUDED.segments,
+                coordinates    = EXCLUDED.coordinates,
+                captured_at    = NOW()
+        """), {
+            "uid":            uid,
+            "session_id":     session_id,
+            "route_id":       route_profile.get("route_id"),
+            "user_type":      user_type,
+            "total_length_m": route_profile.get("total_length_m"),
+            "segments":       json.dumps(route_profile["segments"]),
+            "coordinates":    json.dumps(route_profile.get("coordinates"))
+                              if route_profile.get("coordinates") is not None else None,
+        })
+        profile_saved = True
+
     for obs in slope_observations:
         db.execute(text("""
             INSERT INTO trip_slope_observations
-                (uid, route_id, session_id, slope_bin, distance_m,
+                (uid, route_id, session_id, user_type, slope_bin, distance_m,
                  elapsed_ms, stop_ms, gps_sample_n)
             VALUES
-                (:uid, :route_id, :session_id, :slope_bin, :distance_m,
+                (:uid, :route_id, :session_id, :user_type, :slope_bin, :distance_m,
                  :elapsed_ms, :stop_ms, :gps_sample_n)
         """), {
             "uid":          uid,
             "route_id":     obs.get("route_id"),
             "session_id":   session_id,
+            "user_type":    user_type,
             "slope_bin":    obs["slope_bin"],
             "distance_m":   obs["distance_m"],
             "elapsed_ms":   obs["elapsed_ms"],
@@ -1094,10 +1233,6 @@ def save_collect_batch(
     # 학습용 원본은 trip_slope_observations 에 그대로 있으니 여기서 버려도 무방.
     speed_ema_applied = 0
     if slope_observations:
-        _ut_row = db.execute(
-            text("SELECT user_type FROM users WHERE uid = :uid"), {"uid": uid}
-        ).fetchone()
-        user_type = _ut_row[0] if _ut_row else "elderly"
         for obs in slope_observations:
             speed = validate_observation(
                 obs["distance_m"], obs["elapsed_ms"], obs["gps_sample_n"],
@@ -1162,6 +1297,7 @@ def save_collect_batch(
             "route_choice":       route_choice is not None,
             "segment_feedback":   len(segment_feedback_in),
             "speed_ema_applied":  speed_ema_applied,
+            "route_profile":      profile_saved,
         },
     }
 

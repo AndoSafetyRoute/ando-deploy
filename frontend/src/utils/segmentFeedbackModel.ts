@@ -8,6 +8,8 @@ export type RouteSeg = { slope?: number; slope_pct?: number; length?: number; le
 export type FeedbackSegment = {
   slope_mean: number;   // 길이가중 평균 경사 (%)
   length_m:   number;
+  startIdx:   number;   // routeSegments 배열 내 이 그룹의 시작 인덱스 (지도 하이라이트용)
+  endIdx:     number;   // 끝 인덱스(포함)
   // route_id 는 화면에서 serverRouteId 로 채운다 (여기선 다루지 않음)
 };
 
@@ -20,8 +22,8 @@ type Opts = {
 
 /** 연속 구간을 0.5% bin 이 같은 것끼리 묶어 길이가중 평균 경사 그룹으로. */
 function groupByBin(segs: RouteSeg[]) {
-  const groups: { startIdx: number; slopeMean: number; lengthM: number }[] = [];
-  let cur: { startIdx: number; wSlope: number; lengthM: number; bin: number } | null = null;
+  const groups: { startIdx: number; endIdx: number; slopeMean: number; lengthM: number }[] = [];
+  let cur: { startIdx: number; endIdx: number; wSlope: number; lengthM: number; bin: number } | null = null;
   segs.forEach((s, i) => {
     const slope = Number(s.slope ?? s.slope_pct ?? 0);
     const len = Number(s.length ?? s.length_m ?? 0);
@@ -30,12 +32,13 @@ function groupByBin(segs: RouteSeg[]) {
     if (cur && cur.bin === b) {
       cur.wSlope += slope * len;
       cur.lengthM += len;
+      cur.endIdx = i;
     } else {
-      if (cur) groups.push({ startIdx: cur.startIdx, slopeMean: cur.wSlope / cur.lengthM, lengthM: cur.lengthM });
-      cur = { startIdx: i, wSlope: slope * len, lengthM: len, bin: b };
+      if (cur) groups.push({ startIdx: cur.startIdx, endIdx: cur.endIdx, slopeMean: cur.wSlope / cur.lengthM, lengthM: cur.lengthM });
+      cur = { startIdx: i, endIdx: i, wSlope: slope * len, lengthM: len, bin: b };
     }
   });
-  if (cur) groups.push({ startIdx: cur.startIdx, slopeMean: cur.wSlope / cur.lengthM, lengthM: cur.lengthM });
+  if (cur) groups.push({ startIdx: cur.startIdx, endIdx: cur.endIdx, slopeMean: cur.wSlope / cur.lengthM, lengthM: cur.lengthM });
   return groups;
 }
 
@@ -64,6 +67,8 @@ export function pickFeedbackSegments(segs: RouteSeg[], opts: Opts = {}): Feedbac
     .map((g) => ({
       slope_mean: Math.round(g.slopeMean * 10) / 10,
       length_m:   Math.round(g.lengthM * 10) / 10,
+      startIdx:   g.startIdx,
+      endIdx:     g.endIdx,
     }));
 }
 

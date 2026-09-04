@@ -11,6 +11,7 @@ import {
 } from "react-native";
 import { Ionicons, Feather, MaterialCommunityIcons } from "@expo/vector-icons";
 import { router } from "expo-router";
+import { goHome } from "../src/utils/navigation";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import {
   saveUserType, getUserType, toApiUserType, clearLocalUserData,
@@ -144,7 +145,7 @@ export default function SettingScreen() {
 
         <TouchableOpacity
           style={styles.headerIconButton}
-          onPress={() => router.replace("/")}
+          onPress={goHome}
         >
           <Ionicons name="home-outline" size={26} color={NAVY} />
         </TouchableOpacity>
@@ -231,6 +232,18 @@ export default function SettingScreen() {
           <TouchableOpacity
             style={styles.menuButton}
             activeOpacity={0.85}
+            onPress={() => router.push("/personalization-settings")}
+          >
+            <View style={styles.menuLeft}>
+              <Ionicons name="analytics-outline" size={23} color={NAVY} />
+              <Text style={styles.menuText}>개인화 설정</Text>
+            </View>
+            <MaterialCommunityIcons name="chevron-right" size={25} color="#B8B8B8" />
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.menuButton}
+            activeOpacity={0.85}
             onPress={() => router.push("/mypage")}
           >
             <View style={styles.menuLeft}>
@@ -292,7 +305,7 @@ export default function SettingScreen() {
       <View style={[styles.bottomNav, { bottom: 14 + insets.bottom }]}>
         <TouchableOpacity
           style={styles.navButton}
-          onPress={() => router.replace("/")}
+          onPress={goHome}
         >
           <Ionicons name="home-outline" size={30} color={NAVY} />
         </TouchableOpacity>
@@ -306,7 +319,7 @@ export default function SettingScreen() {
 
         <TouchableOpacity
           style={styles.navButton}
-          onPress={() => router.replace("/")}
+          onPress={goHome}
         >
           <MaterialCommunityIcons name="crosshairs-gps" size={32} color={NAVY} />
         </TouchableOpacity>
