@@ -21,7 +21,7 @@ import time
 import numpy as np
 from scipy.spatial import KDTree
 
-from config import MAX_DETOUR_RATIO, FORBIDDEN_PENALTY, BASE_DIR
+from config import MAX_DETOUR_RATIO, FORBIDDEN_PENALTY, BASE_DIR, COVERAGE_SNAP_MAX_M
 from routing.cost import USER_TYPES, slope_cost
 from routing.pathfinder import recalculate_path_slopes
 from routing.basis import precompute_basis_weights, save_basis_weights, load_basis_weights
@@ -91,10 +91,27 @@ class CCHEngine:
     # ── 내부 헬퍼 ────────────────────────────────────────────────────────────
 
     def _nearest_id(self, lon: float, lat: float) -> int:
-        """WGS84 좌표 → 최근접 CCH 노드 ID (KDTree)."""
+        """
+        WGS84 좌표 → 최근접 CCH 노드 ID (KDTree).
+
+        routing/pathfinder.py의 NetworkX find_route()에만 스냅거리 검증을
+        넣었었는데, CCH가 활성화된 환경(그래프 20만 노드 초과 — 서울 전역
+        GEOJSON_PATH 배포 시 항상 이 경로)에서는 find_route/find_distance_route/
+        find_route_with_metric 전부 이 함수 하나로 노드를 찾기 때문에 그 검증을
+        안 거쳤다. 실제로 그래프 범위 밖 좌표(예: 부산)를 넣어도 에러 없이
+        수백 km 떨어진 "그나마 가장 가까운" 노드로 조용히 스냅되는 걸
+        기동 후 실제 호출로 확인함 — NetworkX 전용 수정으로는 CCH 배포에서
+        무의미했던 것. KDTree.query가 이미 미터 단위 거리를 반환하므로
+        여기서 한 번만 검증하면 세 함수 모두 보호된다.
+        """
         x = lon * self._lon_to_m
         y = lat * self._lat_to_m
-        _, idx = self.tree.query([x, y])
+        dist_m, idx = self.tree.query([x, y])
+        if dist_m > COVERAGE_SNAP_MAX_M:
+            raise ValueError(
+                f"서비스 커버리지 밖입니다 (좌표 스냅 거리 {dist_m:.0f}m, "
+                f"허용 {COVERAGE_SNAP_MAX_M:.0f}m)"
+            )
         return int(idx)
 
     def _path_dist_m(self, path_nodes: list) -> float:

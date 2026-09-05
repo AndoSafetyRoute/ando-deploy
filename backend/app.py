@@ -776,6 +776,13 @@ def api_route(
         if _cch is not None and body.mode == "accessibility":
             try:
                 result = _cch.find_route(origin, dest, body.user_type)
+            except ValueError:
+                # 커버리지 밖(스냅거리 초과) 등 CCH가 이미 명확히 판정한 거부는
+                # NetworkX로 다시 시도해도 같은 결론이다 — 다만 NetworkX는
+                # 그래프 전체(수십만~백만 노드)를 순회하는 무차별 탐색이라
+                # 이 경로에서 재시도하면 그 자체로 요청 하나가 몇 초씩 걸린다.
+                # 재시도 없이 그대로 올려 위 except ValueError(400)로 보낸다.
+                raise
             except Exception as e:
                 print(f"[CCH] 쿼리 실패 → NetworkX fallback: {e}")
                 result = find_route(G, origin, dest, body.user_type,
