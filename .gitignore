@@ -23,6 +23,9 @@ backend/**/__pycache__/
 # 그래프 원본/캐시 — 용량 커서 git에 포함 안 함 (backend/README.md 참고)
 backend/data/*
 !backend/data/.gitkeep
+# 저상버스 보유율(OA-22229) — 정부 공개데이터 XLSX, 18KB라 용량 문제 없어 커밋함.
+# 없어도 서버는 뜨지만(폴백) 저상버스 정보 없이 동작.
+!backend/data/저상버스_노선별_보유율.xlsx
 
 # ── OS / editor ─────────────────────────────────────────────────────────────
 .DS_Store

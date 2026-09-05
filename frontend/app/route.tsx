@@ -36,7 +36,11 @@ export default function RoutePage() {
 
     navigate: (screenName: string, screenParams?: Record<string, any>) => {
       if (screenName === "Navigation") {
-        router.push({
+        // push를 쓰면 search→place-info→route-select→route가 스택에 그대로
+        // 남아있어서, 안내를 마치고 뒤로가기를 홈까지 4~5번 눌러야 하는 문제가
+        // 있었다(route-compare.tsx의 같은 어댑터는 이미 replace를 쓰고 있음 —
+        // 도보/대중교통/자동차 단일경로 흐름만 여기 남아있던 불일치).
+        router.replace({
           pathname: "/navigation",
           params: screenParams,
         });
@@ -51,7 +55,7 @@ export default function RoutePage() {
         return;
       }
 
-      router.push("/");
+      router.replace("/");
     },
   };
 

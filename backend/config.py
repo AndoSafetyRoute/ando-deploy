@@ -19,12 +19,6 @@ GEOJSON_PATH = os.environ.get(
     os.path.join(BASE_DIR, "data", "road_5m_slope.geojson"),
 )
 
-# 서울 전체 경로 (환경변수 없이 직접 참조할 때)
-GEOJSON_SEOUL_PATH = os.environ.get(
-    "GEOJSON_SEOUL_PATH",
-    os.path.join(BASE_DIR, "data", "road_10m_slope_seoul.geojson"),
-)
-
 # ── 지하철 편의시설 공공 API (서울 열린데이터광장) ────────────────────────────
 # 각 키는 발급 내역에서 API 이름 확인 후 매핑
 # OA-22740 : 교통약자이용정보 엘리베이터 현황  (5분 실시간)
@@ -65,6 +59,17 @@ STDDEV_THRESHOLD  = 1.0    # slope1_stddev 기준값
 BRIDGE_GAP_M      = 50.0   # 연결 성분 브리지 최대 거리(m)
 MAX_DETOUR_RATIO  = 1.3    # 최단거리 대비 허용 최대 우회 배율
 FORBIDDEN_PENALTY = 15.0   # 금지 구간 거리 대비 패널티 배율 (1e6 → 15)
+
+# GEOJSON_PATH가 좁은 범위(예: 용산구 5m 그래프)인데 그 범위 밖 좌표가 들어오면,
+# nearest_node/best_origin_node는 거리 검증 없이 "그래프 안에서 그나마 가장 가까운
+# 아무 노드"를 반환한다 — 그 노드가 실제 좌표와 몇 km 떨어져 있어도 그냥 통과된다.
+# 대중교통 탭의 정류장 접근 도보 구간(requestWalkLeg → /route/safe)이 서비스
+# 범위 밖 좌표로 호출되면, 이 잘못 스냅된 두 지점 사이 거리 위에 경사 페널티까지
+# 얹혀 "몇 시간"짜리 소요시간으로 부풀려지는 사고가 있었다. find_route()가 origin/
+# dest 스냅 거리(od/dd)를 이 값 초과로 계산하면 ValueError를 던져 400으로 응답한다
+# — FE(TransitContent.tsx computeWalkLegUncached)는 이미 요청 실패 시 직선거리
+# 기반 추정으로 폴백하므로 이 값만 넘겨도 안전망이 된다.
+COVERAGE_SNAP_MAX_M = 500.0
 
 # ── 개인화 코스트 커브 기저함수 (ando_dev_final.md 7.1/7.3절) ─────────────────
 # c_u(g) 를 15개 3차 B-spline 기저함수로 표현.

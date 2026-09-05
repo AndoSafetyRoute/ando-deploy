@@ -4,18 +4,20 @@ import {
   Text,
   TouchableOpacity,
   StyleSheet,
+  SafeAreaView,
   Platform,
   Alert,
   ActivityIndicator,
   ScrollView,
+  Linking,
 } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { router, useLocalSearchParams } from "expo-router";
-import { goHome } from "../src/utils/navigation";
+import * as Location from "expo-location";
 import { requestRoute } from "../src/api/routeApi";
 import { getUserType, toApiUserType } from "../src/utils/storage";
 import { isWithinSlopeDataCoverage, SLOPE_DATA_WARNING } from "../src/utils/coverage";
+import { goHome } from "../src/utils/navigation";
 
 const NAVY = "#1B0F4A";
 const LIGHT_GRAY = "#F1F2F6";
@@ -23,14 +25,34 @@ const BORDER_GRAY = "#E4E5EA";
 const TEXT_GRAY = "#666666";
 const BUTTON_GRAY = "#9D9696";
 
+const KAKAO_REST_API_KEY = process.env.EXPO_PUBLIC_KAKAO_REST_API_KEY;
+
 function getParam(value: string | string[] | undefined, fallback = "") {
   if (Array.isArray(value)) return value[0] ?? fallback;
   return value ?? fallback;
 }
 
+// 좌표 → 주소 문자열. 실패해도 좌표 자체는 이미 있으니 "현재 위치"로 표시만
+// 하고 계속 진행한다(주소 못 붙여도 출발지로 쓰는 데는 지장 없음).
+async function reverseGeocode(lat: number, lon: number): Promise<string | null> {
+  try {
+    const res = await fetch(
+      `https://dapi.kakao.com/v2/local/geo/coord2address.json?x=${lon}&y=${lat}`,
+      { headers: { Authorization: `KakaoAK ${KAKAO_REST_API_KEY}` } },
+    );
+    if (!res.ok) return null;
+    const json = await res.json();
+    const doc = json.documents?.[0];
+    return doc?.road_address?.address_name || doc?.address?.address_name || null;
+  } catch {
+    return null;
+  }
+}
+
 export default function RouteSelectScreen() {
   const params = useLocalSearchParams();
   const [loading, setLoading] = useState(false);
+  const [locating, setLocating] = useState(false);
 
   const startName = getParam(params.startName);
   const startAddress = getParam(params.startAddress);
@@ -67,6 +89,70 @@ export default function RouteSelectScreen() {
         endLongitude,
       },
     });
+  };
+
+  // "현재 위치" 버튼 — 검색 화면으로 안 보내고 바로 GPS를 찍어 출발지로 채운다.
+  const useCurrentLocationAsStart = async () => {
+    try {
+      setLocating(true);
+
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== "granted") {
+        Alert.alert("위치 권한 필요", "현재 위치를 출발지로 쓰려면 위치 권한을 허용해주세요.");
+        return;
+      }
+
+      const providerStatus = await Location.getProviderStatusAsync();
+      if (!providerStatus.locationServicesEnabled) {
+        Alert.alert(
+          "위치 서비스 꺼짐",
+          "설정에서 위치 서비스를 켜주세요.",
+          [
+            { text: "설정 열기", onPress: () => Linking.openSettings() },
+            { text: "취소", style: "cancel" },
+          ]
+        );
+        return;
+      }
+
+      let coords: { latitude: number; longitude: number } | null = null;
+      try {
+        const loc: any = await Promise.race([
+          Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 5000)),
+        ]);
+        coords = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
+      } catch {
+        const last = await Location.getLastKnownPositionAsync({});
+        if (last) coords = { latitude: last.coords.latitude, longitude: last.coords.longitude };
+      }
+
+      if (!coords) {
+        Alert.alert("위치를 가져올 수 없습니다", "실외로 이동한 후 다시 시도해주세요.");
+        return;
+      }
+
+      const address = await reverseGeocode(coords.latitude, coords.longitude);
+
+      router.replace({
+        pathname: "/route-select",
+        params: {
+          startName: "현재 위치",
+          startAddress: address ?? "",
+          startLatitude: String(coords.latitude),
+          startLongitude: String(coords.longitude),
+
+          endName,
+          endAddress,
+          endLatitude,
+          endLongitude,
+        },
+      });
+    } catch (err: any) {
+      Alert.alert("위치를 가져올 수 없습니다", err?.message ?? "잠시 후 다시 시도해주세요.");
+    } finally {
+      setLocating(false);
+    }
   };
 
   const moveToSearchForEnd = () => {
@@ -215,14 +301,28 @@ export default function RouteSelectScreen() {
             )}
           </View>
 
-          <TouchableOpacity
-            style={styles.smallButton}
-            onPress={moveToSearchForStart}
-          >
-            <Text style={styles.smallButtonText}>
-              {hasStart ? "변경" : "입력"}
-            </Text>
-          </TouchableOpacity>
+          <View style={styles.startButtonGroup}>
+            <TouchableOpacity
+              style={[styles.smallButton, styles.currentLocationButton]}
+              onPress={useCurrentLocationAsStart}
+              disabled={locating}
+            >
+              {locating ? (
+                <ActivityIndicator size="small" color={NAVY} />
+              ) : (
+                <Ionicons name="locate" size={18} color={NAVY} />
+              )}
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.smallButton}
+              onPress={moveToSearchForStart}
+            >
+              <Text style={styles.smallButtonText}>
+                {hasStart ? "변경" : "입력"}
+              </Text>
+            </TouchableOpacity>
+          </View>
         </View>
 
         <View style={styles.verticalLine} />
@@ -477,6 +577,17 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: "700",
     color: NAVY,
+  },
+
+  startButtonGroup: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+
+  currentLocationButton: {
+    paddingHorizontal: 0,
+    width: 36,
+    marginLeft: 8,
   },
 
   optionCard: {

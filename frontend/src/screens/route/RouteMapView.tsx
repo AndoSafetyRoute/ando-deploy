@@ -71,9 +71,9 @@ function makeRouteMapHtml({ routes, selectedRouteId, startLabel, endLabel, width
     <html>
       <head>
         <meta charset="utf-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
         <style>
-          html, body { margin: 0; padding: 0; width: ${width}px; height: ${height}px; overflow: hidden; }
+          html, body { margin: 0; padding: 0; width: ${width}px; height: ${height}px; overflow: hidden; touch-action: none; }
           /* %/fixed 기반 크기는 임베드된 WebView가 자체적으로 재는 뷰포트 크기와
              어긋나는 경우가 있어(특히 목록/탭 전환 직후, 필터바처럼 위에 다른
              UI가 있는 화면에서) RN이 onLayout으로 실측한 픽셀 값을 그대로 박아넣는다. */

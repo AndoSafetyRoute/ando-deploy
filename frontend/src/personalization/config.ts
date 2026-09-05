@@ -11,11 +11,15 @@
 /**
  * ⑬ 3경로 비교 화면을 도보 경로 흐름에 넣는다.
  * BE(ando-BE/gdy/personalization-v2)가 candidateRoutes 에 type+distance 2장을
- * 항상 채우므로 코드는 준비됐다. 다만 이 플래그는 **파일럿 3세션 로그 전수 검증
- * (⑪⑫ 관문) + 라이브 BE end-to-end 확인 후** true 로 바꾼다 (인계 §관문).
- * false 인 동안 도보 흐름은 지금과 100% 동일하다.
+ * 항상 채우므로 코드는 준비됐다.
+ *
+ * ⚠️ 원래 이 플래그는 파일럿 3세션 로그 전수 검증(⑪⑫ 관문) + 라이브 BE
+ * end-to-end 확인 후에 켜기로 문서에 정해뒀었는데, "경로가 하나만 뜬다"는
+ * 리포트에 대응해 그 검증 없이 먼저 켠다(2026-09-03, JuYeong). 금요일 일괄
+ * 재배포 전에 그 검증(특히 실제 기기에서 2~3경로가 정상적으로 뜨는지)을
+ * 반드시 해보고, 문제 있으면 이 값을 다시 false로 되돌릴 것.
  */
-export const ROUTE_COMPARE_ENABLED = false;
+export const ROUTE_COMPARE_ENABLED = true;
 
 /** ⑭ 안내 종료(만족도 입력) 후 구간 평가 화면을 띄운다. BE 무관 — 활성. */
 export const SEGMENT_FEEDBACK_ENABLED = true;

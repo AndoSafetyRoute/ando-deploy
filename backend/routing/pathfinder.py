@@ -3,7 +3,7 @@
 """
 import networkx as nx
 
-from config import MAX_DETOUR_RATIO, FLAT_THRESHOLD
+from config import MAX_DETOUR_RATIO, FLAT_THRESHOLD, COVERAGE_SNAP_MAX_M
 from routing.cost import USER_TYPES, slope_cost, slope_score
 from routing.graph import haversine
 from routing.search import nearest_node, best_origin_node
@@ -110,6 +110,15 @@ def find_route(
                    G.nodes[origin_node]["lon"], G.nodes[origin_node]["lat"])
 
     print(f"[경로 탐색] 출발: {origin_node} ({od:.1f}m)  도착: {dest_node} ({dd:.1f}m)")
+
+    # 좌표가 현재 로드된 그래프 범위 밖이면(예: 용산구 전용 그래프에 강남역 좌표)
+    # od/dd가 몇 km씩 튄다 — 검증 없이 그대로 진행하면 엉뚱한 두 지점 사이 경로가
+    # 계산되고, 그 위에 경사 페널티까지 얹혀 소요시간이 "몇 시간"으로 부풀려진다.
+    if od > COVERAGE_SNAP_MAX_M or dd > COVERAGE_SNAP_MAX_M:
+        raise ValueError(
+            f"서비스 커버리지 밖입니다 (출발 스냅 {od:.0f}m / 도착 스냅 {dd:.0f}m, "
+            f"허용 {COVERAGE_SNAP_MAX_M:.0f}m)"
+        )
 
     try:
         shortest_nodes = nx.dijkstra_path(G, origin_node, dest_node, weight="weight")
