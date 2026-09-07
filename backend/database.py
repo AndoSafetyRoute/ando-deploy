@@ -1440,7 +1440,19 @@ SLOW_SEG_MIN_DIST_M = 25.0   # 묶은 구간이 이보다 짧으면 제외 (pick
 SLOW_SEG_MAX_RANKED = 10     # 상위 몇 구간까지 물어볼지 (사용자 사양: 10순위, 1~9면 전부)
 SLOW_SEG_SPEED_MIN  = 0.05   # m/s — 거리/시간 이 범위 밖이면 GPS 점프/정지 이상치
 SLOW_SEG_SPEED_MAX  = 2.50   # (routing/speed.py _SPEED_MIN/_MAX 와 동일)
-SLOW_SEG_BIN_PCT    = 1.0    # 연속 엣지를 한 구간으로 묶는 경사 bin 폭(%p)
+SLOW_SEG_SLOPE_TOL  = 2.0    # 엣지 경사가 진행중 구간 평균에서 이 %p 이상 벗어나면 새 구간
+                             # (고정 bin 경계 대신 평균 기준 허용오차 — 6.1/5.9 나
+                             #  -5.2/-5.5 같은 인접 유사 경사가 경계에서 갈라지지 않게)
+
+
+def _same_slope_band(slope: float, cur: dict) -> bool:
+    """엣지 slope 가 진행중 구간(cur)과 같은 밴드인지 — 같은 오르막/내리막 부호 +
+    길이가중 평균 경사에서 SLOW_SEG_SLOPE_TOL 이내."""
+    d = cur["distance_m"]
+    cur_mean = (cur["_wslope"] / d) if d else 0.0
+    if (slope >= 0) != (cur_mean >= 0):
+        return False
+    return abs(slope - cur_mean) <= SLOW_SEG_SLOPE_TOL
 
 _SLOW_SEG_SELECT = """
     SELECT rank, seg_index, seg_index_end, distance_m, slope_pct, direction, zone,
@@ -1454,7 +1466,7 @@ _SLOW_SEG_SELECT = """
 def _route_segment_groups(db: Session, route_id: int) -> list[dict]:
     """
     navigation_segments 원본(엣지 단위) → 사람이 인지하는 "구간" 묶음.
-    연속(seg_index 가 1씩 증가) + measured=TRUE + 같은 경사 bin(±SLOW_SEG_BIN_PCT) 이면 한 구간.
+    연속(seg_index 가 1씩 증가) + measured=TRUE + 같은 경사 밴드(_same_slope_band) 이면 한 구간.
     각 구간: seg_index(첫 엣지), seg_index_end(끝 엣지), distance_m·elapsed_ms 합,
              slope_pct(길이가중 평균), pace_s_per_m, direction/zone/name(대표값).
     """
@@ -1475,8 +1487,7 @@ def _route_segment_groups(db: Session, route_id: int) -> list[dict]:
         if not (bool(measured) and slope is not None and dist > 0):
             cur = None
             continue
-        b = int(round(slope / SLOW_SEG_BIN_PCT))
-        if cur is not None and si == cur["_next"] and b == cur["_bin"]:
+        if cur is not None and si == cur["_next"] and _same_slope_band(slope, cur):
             cur["seg_index_end"] = si
             cur["distance_m"]   += dist
             cur["elapsed_ms"]   += elapsed
@@ -1488,7 +1499,7 @@ def _route_segment_groups(db: Session, route_id: int) -> list[dict]:
             cur = {
                 "seg_index": si, "seg_index_end": si,
                 "distance_m": dist, "elapsed_ms": elapsed,
-                "_wslope": slope * dist, "_bin": b, "_next": si + 1,
+                "_wslope": slope * dist, "_next": si + 1,
                 "direction": direction, "zone": zone, "name": name or "",
             }
             groups.append(cur)
@@ -1497,7 +1508,7 @@ def _route_segment_groups(db: Session, route_id: int) -> list[dict]:
         d = g["distance_m"]
         g["slope_pct"]    = round(g["_wslope"] / d, 3) if d else 0.0
         g["pace_s_per_m"] = round((g["elapsed_ms"] / 1000.0) / d, 4) if d else 0.0
-        for k in ("_wslope", "_bin", "_next"):
+        for k in ("_wslope", "_next"):
             g.pop(k, None)
     return groups
 
