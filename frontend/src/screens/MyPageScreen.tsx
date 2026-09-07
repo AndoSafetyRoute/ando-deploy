@@ -17,7 +17,6 @@ import { C } from "../constants/colors";
 import {
   getRoutes,
   saveRoutes,
-  updateSatisfaction,
   formatDuration,
   getSlopeEffort,
   RouteRecord,
@@ -27,7 +26,6 @@ import {
   getUserRoutes,
   getUserStats,
   getPersonalizationStatus,
-  submitFeedback,
   UserStats,
   PersonalizationStatus,
 } from "../api";
@@ -146,10 +144,8 @@ function SlopeBar({
 
 function RouteCard({
   record,
-  onRate,
 }: {
   record: RouteRecord;
-  onRate: (id: string, rating: number, serverRouteId?: number) => void;
 }) {
   const info = MODE_INFO[record.mode] ?? MODE_INFO.walk;
   const date = new Date(record.date);
@@ -160,8 +156,6 @@ function RouteCard({
 
   const durationText =
     record.totalDurationMs > 0 ? formatDuration(record.totalDurationMs) : null;
-
-  const serverRouteId = (record as any).serverRouteId as number | undefined;
 
   return (
     <TouchableOpacity
@@ -210,37 +204,6 @@ function RouteCard({
               {record.to || "도착지"}
             </Text>
           </View>
-        </View>
-
-        <View style={styles.ratingRow}>
-          <Text style={styles.ratingLabel}>만족도</Text>
-
-          <View style={styles.starsRow}>
-            {[1, 2, 3, 4, 5].map((n) => (
-              <TouchableOpacity
-                key={n}
-                onPress={() => onRate(record.id, n, serverRouteId)}
-                hitSlop={{ top: 6, bottom: 6, left: 4, right: 4 }}
-              >
-                <Text
-                  style={[
-                    styles.star,
-                    n <= (record.satisfaction ?? 0) && styles.starFilled,
-                  ]}
-                >
-                  ★
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-
-          <View style={{ flex: 1 }} />
-
-          {record.satisfaction != null ? (
-            <Text style={styles.ratingNum}>{record.satisfaction}.0</Text>
-          ) : (
-            <Text style={styles.noRating}>미평가</Text>
-          )}
         </View>
       </View>
 
@@ -294,7 +257,6 @@ export default function MyPageScreen() {
               mode: r.mode ?? "walk",
               segments: r.segments ?? [],
               totalDurationMs: r.totalDurationMs ?? 0,
-              satisfaction: r.satisfaction ?? null,
             }));
 
             setRoutes(mapped);
@@ -312,26 +274,6 @@ export default function MyPageScreen() {
       };
     }, [])
   );
-
-  const handleRate = async (
-    id: string,
-    rating: number,
-    serverRouteId?: number
-  ) => {
-    setRoutes((prev) =>
-      prev.map((r) => (r.id === id ? { ...r, satisfaction: rating } : r))
-    );
-
-    await updateSatisfaction(id, rating);
-
-    if (serverRouteId) {
-      const token = await getAuthToken();
-
-      if (token) {
-        submitFeedback(serverRouteId, rating, token).catch(() => {});
-      }
-    }
-  };
 
   const slopeMs: Record<"easy" | "normal" | "hard", number> = {
     easy: 0,
@@ -376,7 +318,6 @@ export default function MyPageScreen() {
   const durStr = durH > 0 ? `${durH}h ${durM}m` : `${durM}m`;
 
   const avgSlope = stats?.avg_slope_pct ?? 0;
-  const avgSat = stats?.avg_satisfaction ?? null;
 
   return (
     <SafeAreaView style={styles.screen}>
@@ -418,7 +359,7 @@ export default function MyPageScreen() {
             <View style={{ flex: 1 }}>
               <Text style={styles.profileTitle}>나의 이동 기록</Text>
               <Text style={styles.profileDesc}>
-                이용한 경로와 만족도를 한눈에 확인할 수 있어요.
+                이용한 경로와 이동 통계를 한눈에 확인할 수 있어요.
               </Text>
             </View>
           </View>
@@ -440,10 +381,6 @@ export default function MyPageScreen() {
 
             <View style={styles.statsGrid}>
               <StatChip label="평균 경사" value={`${avgSlope.toFixed(2)}%`} />
-              <StatChip
-                label="만족도"
-                value={avgSat != null ? `${avgSat.toFixed(1)}점` : "—"}
-              />
               <StatChip label="저장 경로" value={`${routes.length}개`} />
             </View>
           </View>
@@ -512,7 +449,6 @@ export default function MyPageScreen() {
           <View style={styles.section}>
             <View style={styles.sectionHeader}>
               <Text style={styles.sectionTitle}>지난 경로</Text>
-              <Text style={styles.sectionDesc}>만족도를 남겨주세요</Text>
             </View>
 
             {routes.length === 0 ? (
@@ -525,11 +461,7 @@ export default function MyPageScreen() {
               </View>
             ) : (
               routes.map((record) => (
-                <RouteCard
-                  key={record.id}
-                  record={record}
-                  onRate={handleRate}
-                />
+                <RouteCard key={record.id} record={record} />
               ))
             )}
           </View>

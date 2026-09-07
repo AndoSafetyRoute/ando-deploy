@@ -1,13 +1,13 @@
 import React from "react";
 import { router, useLocalSearchParams } from "expo-router";
-import SegmentFeedbackScreen from "../src/screens/route/SegmentFeedbackScreen";
+import SlowSegmentFeedbackScreen from "../src/screens/route/SlowSegmentFeedbackScreen";
 
 function getParam(value: string | string[] | undefined, fallback = "") {
   if (Array.isArray(value)) return value[0] ?? fallback;
   return value ?? fallback;
 }
 
-export default function SegmentFeedbackPage() {
+export default function SlowSegmentFeedbackPage() {
   const params = useLocalSearchParams();
   const forwarded: Record<string, string> = {};
   Object.entries(params).forEach(([k, v]) => { forwarded[k] = getParam(v); });
@@ -25,6 +25,6 @@ export default function SegmentFeedbackPage() {
   };
 
   return (
-    <SegmentFeedbackScreen navigation={navigationAdapter} route={{ params: forwarded }} />
+    <SlowSegmentFeedbackScreen navigation={navigationAdapter} route={{ params: forwarded }} />
   );
 }

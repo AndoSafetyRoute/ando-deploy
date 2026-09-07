@@ -59,10 +59,11 @@ export default function NavigationPage() {
         return;
       }
 
-      // ⑭ 구간 평가 화면 (routeAfterRating → 경사 뚜렷한 구간 있을 때만)
-      if (screenName === "SegmentFeedback") {
+      // 신호 D — pace 상위 구간 게이트형 평가 (routeAfterRating → 플래그 ON + route_id 있을 때).
+      // 물어볼 구간이 없으면 화면이 스스로 통과한다.
+      if (screenName === "SlowSegmentFeedback") {
         router.replace({
-          pathname: "/segment-feedback",
+          pathname: "/slow-segment-feedback",
           params: screenParams,
         });
         return;

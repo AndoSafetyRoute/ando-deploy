@@ -131,7 +131,6 @@ export interface UserStats {
   total_distance_m: number;
   total_duration_ms: number;
   avg_slope_pct: number;
-  avg_satisfaction: number | null;
 }
 
 export async function getUserStats(idToken: string): Promise<UserStats | null> {
@@ -246,20 +245,6 @@ export async function saveSearchHistory(payload: SearchHistoryPayload, idToken: 
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
     body:    JSON.stringify(payload),
   }).catch(() => {});
-}
-
-/** 만족도 저장/수정 — 안내 직후 팝업과 마이페이지 상세 모두에서 호출 */
-export async function submitFeedback(
-  serverRouteId: number,
-  rating: number,
-  idToken: string,
-): Promise<void> {
-  const res = await fetch(`${BASE_URL}/routes/${serverRouteId}/feedback`, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
-    body:    JSON.stringify({ rating }),
-  });
-  if (!res.ok) throw new Error('만족도 서버 저장 실패');
 }
 
 // ── 내비게이션 세션 API (방식 B) ──────────────────────────────────────────────

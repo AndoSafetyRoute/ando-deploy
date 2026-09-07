@@ -21,11 +21,27 @@
  */
 export const ROUTE_COMPARE_ENABLED = true;
 
-/** ⑭ 안내 종료(만족도 입력) 후 구간 평가 화면을 띄운다. BE 무관 — 활성. */
-export const SEGMENT_FEEDBACK_ENABLED = true;
-
 /** ⑮ 안내 시작 시 왕복·방향 교대 안내 배너를 띄운다. BE 무관 — 활성. */
 export const ROUNDTRIP_HINT_ENABLED = true;
+
+/**
+ * 신호 D — 안내 종료(별점) 후, BE 가 미리 계산해 둔 "1m당 소요시간(pace) 상위
+ * min(10, 유효구간수)" 구간에 대해 구간마다:
+ *   Q1 "소요시간 상위 구간이에요. 불편했나요?" 예/아니오
+ *   Q1=예 → Q2 "힘듦 정도 1~10점"
+ * 을 묻는 `SlowSegmentFeedbackScreen`. 기존 구간평가 화면(편함/보통/불편함)을 **대체**한다.
+ * 저장은 수집 동의와 무관한 독립 엔드포인트(별점처럼 always-on).
+ *
+ * ⚠️ BE(ando-BE-pers) 엔드포인트 배포 전까지 false. 화면·API·라우팅 배선은
+ * 전부 준비돼 있어 이 값만 켜면 붙는다.
+ */
+export const SLOW_SEGMENT_FEEDBACK_ENABLED = false;
+
+// 신호 D 엔드포인트 (BE: ando-BE-pers · 독립 · Bearer 필수 · 소유자 검증). 계약 잠금.
+export const SLOW_SEGMENTS_PATH = (routeId: number | string) =>
+  `/navigation/${routeId}/slow-segments`;
+export const SEGMENT_HARDSHIP_FEEDBACK_PATH = (routeId: number | string) =>
+  `/navigation/${routeId}/segment-hardship-feedback`;
 
 // ── 백엔드 계약 (인계 §3.1 / ando-BE app.py) ────────────────────────────────
 // 실제 응답/스펙과 이름이 다르면 여기 상수만 고치면 나머지 코드가 따라간다.

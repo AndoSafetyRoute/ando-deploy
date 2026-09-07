@@ -7,10 +7,9 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
   ROUTE_COMPARE_ENABLED,
-  SEGMENT_FEEDBACK_ENABLED,
+  SLOW_SEGMENT_FEEDBACK_ENABLED,
   ROUNDTRIP_HINT_ENABLED,
 } from "./config";
-import { pickFeedbackSegments } from "../utils/segmentFeedbackModel";
 import { directionForSession, type WalkDirection } from "../utils/roundtripHint";
 
 type Nav = { navigate: (screen: string, params?: Record<string, any>) => void };
@@ -30,22 +29,26 @@ export function goToRouteCompareIfEnabled(
 }
 
 /**
- * ⑭ — 만족도 입력(또는 건너뛰기) 뒤에 호출. 평가할 경사 구간이 있으면 구간 평가
- * 화면으로, 없으면(또는 플래그 off) 곧장 RouteDetail 로.
- * PENDING_WIRE(nav-segfeedback): NavigationScreen.handleRatingSubmit / handleRatingSkip 의
- *   `navigation.navigate("RouteDetail", …)` 자리.
+ * 신호 D — 만족도 입력(또는 건너뛰기) 뒤에 호출. 플래그가 켜져 있고 route_id 가
+ * 있으면 `SlowSegmentFeedbackScreen`(pace 상위 구간 게이트형 평가)으로, 아니면
+ * 곧장 RouteDetail 로. 물어볼 구간 유무(eligible)는 화면이 마운트 시 GET 으로 판정해
+ * 없으면 스스로 통과하므로 여기선 확인하지 않는다.
+ *
+ * PENDING_WIRE(nav-segfeedback): NavigationScreen.handleRatingSubmit / handleRatingSkip.
+ * 호출부는 신규 화면 진입 전 `await syncToServer()`(= completeNavigation) 해야 한다
+ * (BE 가 완료 시점에 랭킹을 계산하므로).
  */
 export function routeAfterRating(
   navigation: Nav | undefined,
-  args: { serverRouteId: number | null; routeSegments: any[]; nextRouteId: string },
+  args: { serverRouteId: number | null; routeSegments: any[]; nextRouteId: string; sessionId?: string | null },
 ): void {
   if (!navigation) return;
-  const hasSteep = SEGMENT_FEEDBACK_ENABLED && pickFeedbackSegments(args.routeSegments ?? []).length > 0;
-  if (hasSteep) {
-    navigation.navigate("SegmentFeedback", {
+  if (SLOW_SEGMENT_FEEDBACK_ENABLED && args.serverRouteId != null) {
+    navigation.navigate("SlowSegmentFeedback", {
       routeSegments: JSON.stringify(args.routeSegments ?? []),
-      serverRouteId: args.serverRouteId != null ? String(args.serverRouteId) : "",
+      serverRouteId: String(args.serverRouteId),
       nextRouteId:   args.nextRouteId,
+      sessionId:     args.sessionId ?? "",
     });
   } else {
     navigation.navigate("RouteDetail", { routeId: args.nextRouteId });

@@ -133,7 +133,6 @@ export interface RouteRecord {
   date:            string;        // ISO string
   totalDurationMs: number;        // 전체 소요 시간 (ms)
   segments:        SegmentTime[];
-  satisfaction:    number | null; // 1~5 별점, 미입력 시 null
   serverRouteId?:  number;        // 서버 동기화 완료 후 설정
 }
 
@@ -175,12 +174,6 @@ export async function getRoutes(): Promise<RouteRecord[]> {
   } catch {
     return [];
   }
-}
-
-export async function updateSatisfaction(id: string, satisfaction: number): Promise<void> {
-  const routes  = await getRoutes();
-  const updated = routes.map(r => r.id === id ? { ...r, satisfaction } : r);
-  await AsyncStorage.setItem(ROUTES_KEY, JSON.stringify(updated));
 }
 
 export async function updateSegments(id: string, segments: SegmentTime[], totalDurationMs: number): Promise<void> {

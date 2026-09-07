@@ -24,10 +24,8 @@ let Speech: {
 };
 try { Speech = require("expo-speech"); } catch {}
 import { C, ZONE_COLORS } from "../constants/colors";
-import SatisfactionModal from "../components/SatisfactionModal";
 import {
   saveRoute,
-  updateSatisfaction,
   updateServerRouteId,
   generateId,
   RouteRecord,
@@ -40,7 +38,6 @@ import {
   startNavigation,
   submitSegment,
   completeNavigation,
-  submitFeedback,
 } from "../api";
 import type { NavSegment, Waypoint } from "../api/routeApi";
 import { CollectSession, drainCollectQueue } from "../utils/collectQueue";
@@ -710,7 +707,6 @@ export default function NavigationScreen({ navigation, route }: Props) {
 
   const [currentLocation, setCurrentLocation] = useState<Coordinate | null>(null);
   const [locationError,   setLocationError]   = useState("");
-  const [showRating,      setShowRating]       = useState(false);
   const [savedRouteId,    setSavedRouteId]     = useState("");
   const [guidance, setGuidance] = useState<{ turn: string; text: string } | null>(null);
   // 안내 종료 여부 — true가 되면 지도(WebView)를 즉시 언마운트해
@@ -759,6 +755,11 @@ export default function NavigationScreen({ navigation, route }: Props) {
   // BE 전송: 구간 완료 시마다 submitSegment() 실시간 전송 + 종료 시 일괄 전송
   const startTimeRef         = useRef<number>(Date.now());
   const serverRouteIdRef     = useRef<number | null>(null);
+  // 종료 시 백그라운드 서버 동기화(completeNavigation 포함) 프로미스. 평가 화면
+  // 전환 전에 await 한다 — BE 가 완료 시점에 신호 D 랭킹을 계산하므로.
+  const syncPromiseRef       = useRef<Promise<void> | null>(null);
+  // collectSessionRef 가 null 로 비워진 뒤에도 살아있는 수집 세션 id (신호 D POST 용).
+  const collectSessionIdRef  = useRef<string | null>(null);
   const segmentStartTimesRef = useRef<number[]>([]); // [i] = 구간 i 시작 시각 (ms)
   const currentSegIdxRef     = useRef<number>(0);    // 현재 진행 중인 구간 인덱스
   const measuredMsRef        = useRef<(number | null)[]>([]); // [i] = 구간 i 소요시간, 미측정은 null
@@ -786,6 +787,9 @@ export default function NavigationScreen({ navigation, route }: Props) {
   const beginCollection = useCallback((initTime: number) => {
     if (collectSessionRef.current) return;              // 중복 방지
     collectSessionRef.current = new CollectSession(route?.params?.collectSessionId);
+    // 세션이 안내 종료 시 null 로 비워진 뒤에도 구간평가(신호 D) POST 가 session_id 를
+    // 실을 수 있도록 문자열만 따로 보존한다 (신호 A/B 와 조인용).
+    collectSessionIdRef.current = collectSessionRef.current.sessionId;
     binTrackerRef.current = new SlopeBinTracker(routeSegments[0]?.slope ?? 0, initTime);
     try {
       collectSessionRef.current.setRouteProfile({
@@ -1198,9 +1202,9 @@ export default function NavigationScreen({ navigation, route }: Props) {
           setSavedRouteId(newId);
           const record: RouteRecord = {
             id: newId, from, to, mode: (mode as any) ?? "walk", walkerType,
-            date: new Date().toISOString(), totalDurationMs, segments, satisfaction: null,
+            date: new Date().toISOString(), totalDurationMs, segments,
           };
-          // 로컬 저장만 대기 (평가 팝업에서 savedRouteId를 바로 참조하므로 필요) —
+          // 로컬 저장만 대기 (구간평가 화면에서 savedRouteId를 바로 참조하므로 필요) —
           // AsyncStorage 로컬 쓰기는 네트워크와 달리 빠르다.
           await saveRoute(record);
 
@@ -1225,36 +1229,23 @@ export default function NavigationScreen({ navigation, route }: Props) {
           // watchPositionAsync 콜백 참고) — "안내 종료"는 어떤 구간에서
           // 누르든 항상 여정 전체를 끝내고 평가 화면으로 이동한다.
           stopAlightReminder();
-          setShowRating(true);
-          syncToServer();
+          syncPromiseRef.current = syncToServer();
+          void proceedAfterNavigation();
         },
       },
     ]);
   };
 
-  const handleRatingSubmit = async (stars: number) => {
-    if (savedRouteId) await updateSatisfaction(savedRouteId, stars);
-    try {
-      const token = await getAuthToken();
-      const rid   = serverRouteIdRef.current;
-      if (token && rid !== null) await submitFeedback(rid, stars, token);
-    } catch (e) {
-      console.log("[FE] 만족도 서버 저장 실패:", e);
-    }
-    setShowRating(false);
+  // 안내 종료 → (전체 경로 만족도 별점 없이) 곧장 구간평가 화면으로.
+  // BE 가 completeNavigation 시점에 신호 D 랭킹을 계산하므로 화면 전환 전에
+  // 서버 동기화(syncPromiseRef)를 기다린다. 실패해도 진행 — 화면이 GET 재시도한다.
+  const proceedAfterNavigation = async () => {
+    try { await syncPromiseRef.current; } catch { /* 진행 */ }
     routeAfterRating(navigation, {
       serverRouteId: serverRouteIdRef.current,
       routeSegments,
       nextRouteId: savedRouteId,
-    });
-  };
-
-  const handleRatingSkip = () => {
-    setShowRating(false);
-    routeAfterRating(navigation, {
-      serverRouteId: serverRouteIdRef.current,
-      routeSegments,
-      nextRouteId: savedRouteId,
+      sessionId: collectSessionIdRef.current ?? collectSessionRef.current?.sessionId,
     });
   };
 
@@ -1447,14 +1438,6 @@ export default function NavigationScreen({ navigation, route }: Props) {
       >
         <Text style={ss.endBtnText}>안내 종료</Text>
       </TouchableOpacity>
-
-      <SatisfactionModal
-        visible={showRating}
-        routeFrom={from}
-        routeTo={to}
-        onSubmit={handleRatingSubmit}
-        onSkip={handleRatingSkip}
-      />
     </View>
   );
 }

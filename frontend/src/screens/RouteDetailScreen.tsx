@@ -17,14 +17,13 @@ import { Ionicons } from "@expo/vector-icons";
 import { C } from "../constants/colors";
 import {
   getRoutes,
-  updateSatisfaction,
   deleteRoute,
   formatDuration,
   getSlopeEffort,
   RouteRecord,
   SegmentTime,
 } from "../utils/storage";
-import { getAuthToken, submitFeedback, deleteUserRoute } from "../api";
+import { getAuthToken, deleteUserRoute } from "../api";
 
 const NAVY = "#1B0F4A";
 const WHITE = "#FFFFFF";
@@ -151,38 +150,6 @@ function SegmentRow({ seg, index }: { seg: SegmentTime; index: number }) {
   );
 }
 
-function EditableStars({
-  value,
-  onChange,
-}: {
-  value: number | null;
-  onChange: (n: number) => void;
-}) {
-  const [local, setLocal] = useState(value ?? 0);
-
-  const handlePress = (n: number) => {
-    setLocal(n);
-    onChange(n);
-  };
-
-  return (
-    <View style={styles.starsRow}>
-      {[1, 2, 3, 4, 5].map((n) => (
-        <TouchableOpacity
-          key={n}
-          onPress={() => handlePress(n)}
-          activeOpacity={0.75}
-          hitSlop={{ top: 6, bottom: 6, left: 4, right: 4 }}
-        >
-          <Text style={[styles.starEdit, n <= local && styles.starEditFilled]}>
-            ★
-          </Text>
-        </TouchableOpacity>
-      ))}
-    </View>
-  );
-}
-
 function Header({ onDelete }: { onDelete?: () => void }) {
   return (
     <View style={styles.header}>
@@ -241,27 +208,6 @@ export default function RouteDetailScreen() {
         active = false;
       };
     }, [routeId])
-  );
-
-  const handleStarChange = useCallback(
-    async (stars: number) => {
-      if (!routeId) return;
-
-      await updateSatisfaction(routeId, stars);
-      setRecord((prev) => (prev ? { ...prev, satisfaction: stars } : prev));
-
-      try {
-        const token = await getAuthToken();
-        const serverRouteId = (record as any)?.serverRouteId;
-
-        if (token && serverRouteId) {
-          await submitFeedback(serverRouteId, stars, token);
-        }
-      } catch (error) {
-        console.log("[FE] 만족도 서버 저장 실패:", error);
-      }
-    },
-    [routeId, record]
   );
 
   const handleDelete = useCallback(() => {
@@ -426,22 +372,6 @@ export default function RouteDetailScreen() {
               </View>
             </View>
           </View>
-        </View>
-
-        <View style={styles.ratingCard}>
-          <Text style={styles.cardTitle}>만족도 평가</Text>
-          <Text style={styles.cardDesc}>이 경로에 대한 별점을 남겨주세요.</Text>
-
-          <EditableStars
-            value={record.satisfaction}
-            onChange={handleStarChange}
-          />
-
-          {record.satisfaction !== null && (
-            <Text style={styles.ratingConfirm}>
-              ★ {record.satisfaction}점 저장됨
-            </Text>
-          )}
         </View>
 
         <View style={styles.effortSummaryCard}>
