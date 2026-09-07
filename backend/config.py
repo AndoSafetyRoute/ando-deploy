@@ -71,6 +71,20 @@ FORBIDDEN_PENALTY = 15.0   # 금지 구간 거리 대비 패널티 배율 (1e6 �
 # 기반 추정으로 폴백하므로 이 값만 넘겨도 안전망이 된다.
 COVERAGE_SNAP_MAX_M = 500.0
 
+
+class CoverageError(ValueError):
+    """
+    출발/도착 좌표가 현재 로드된 라우팅 그래프(서울 전역 GeoJSON) 범위 밖이라
+    경로를 계산할 수 없음. 경사도가 이 GeoJSON 하나에 함께 구워져 있어서
+    "거리 우선만" 같은 부분 응답도 불가능하다 — 그래프 자체가 없는 지역이라
+    거리 경로도 못 만든다.
+
+    ValueError 를 상속하므로 기존 `except ValueError` 는 그대로 잡아주고,
+    app.py 의 /route 핸들러는 이걸 먼저 잡아 사용자 친화적 코드로 응답한다
+    (FE 는 이 코드를 보고 스크리한 에러 팝업 대신 안내 문구를 띄운다).
+    """
+    code = "out_of_service_area"
+
 # ── 개인화 코스트 커브 기저함수 (ando_dev_final.md 7.1/7.3절) ─────────────────
 # c_u(g) 를 15개 3차 B-spline 기저함수로 표현.
 #

@@ -34,7 +34,6 @@ type ServerRoute = {
   shortestDistance?: number | null;
   detourRatio?: number | null;
   algorithmAlpha?: number | null;
-  crossings?: number;
 };
 
 type WalkRoute = {
@@ -45,7 +44,6 @@ type WalkRoute = {
   time: number;
   distance: string;
   steps: number;
-  crossings: number;
   badges: string[];
   desc: string;
   warning?: string;
@@ -251,7 +249,6 @@ function convertServerRoute(route: ServerRoute): WalkRoute {
     time,
     distance,
     steps,
-    crossings: Number(route.crossings ?? 0),
     badges: makeBadges(route),
     desc: makeDescription(route),
     warning:
@@ -381,7 +378,6 @@ const RouteCard = ({
                   : '걸음 정보 없음'
               }
             />
-            <StatPill icon="🚦" value={`횡단보도 ${route.crossings}회`} />
           </View>
         </View>
 

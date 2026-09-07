@@ -7,6 +7,8 @@ app.py — Ando 접근성 경로 탐색 FastAPI 서버
 "로그인은 성공하는데 그 다음 백엔드 호출이 전부 실패하는" 원인이 된다.
 0.0.0.0 으로 띄워야 같은 네트워크의 다른 기기에서 접속할 수 있다.
 """
+import os
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Depends, Header
@@ -15,7 +17,7 @@ from sqlalchemy import text
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from config import GEOJSON_PATH
+from config import GEOJSON_PATH, CoverageError
 from routing import build_graph, find_route, USER_TYPES, classify_zone, precompute_edge_costs
 from routing.search import build_spatial_index
 from routing.cch_engine import build_cch_engine, CCHEngine
@@ -49,6 +51,36 @@ _subway_db: SubwayFacilityDB | None = None
 # 그래프(수십만 노드)에서 이걸 매 /route 요청마다 다시 계산하면 요청당 유의미한
 # 지연이 생긴다. 그래프는 서버 실행 중 바뀌지 않으므로 1회만 계산해 재사용한다.
 _waypoints_set: set | None = None
+
+
+class _Prof:
+    """
+    2-2 탐색시간 프로파일링 — /route 요청 1건의 구간별 소요시간(ms)을 모아
+    마지막에 한 줄(`[PROFILE] …`)로 출력한다. 실배포 서버 로그에서
+    `grep '\\[PROFILE\\]'` 로 구간별 병목을 수집하는 용도.
+
+    항상 켜져 있지만 요청당 딱 한 줄이라 로그 부담이 거의 없다. 완전히 끄려면
+    환경변수 ROUTE_PROFILE=0.
+    """
+    _ENABLED = os.environ.get("ROUTE_PROFILE", "1") not in ("0", "false", "False")
+
+    def __init__(self, tag: str):
+        self.tag = tag
+        self.t0 = self.last = time.perf_counter()
+        self.marks: list[tuple[str, float]] = []
+
+    def mark(self, label: str) -> None:
+        now = time.perf_counter()
+        self.marks.append((label, (now - self.last) * 1000))
+        self.last = now
+
+    def done(self, **extra) -> None:
+        if not self._ENABLED:
+            return
+        total = (time.perf_counter() - self.t0) * 1000
+        parts = "  ".join(f"{k}={v:.0f}ms" for k, v in self.marks)
+        tail = "  ".join(f"{k}={v}" for k, v in extra.items())
+        print(f"[PROFILE] {self.tag}  total={total:.0f}ms  {parts}  {tail}".rstrip())
 
 
 def _nav_segs_and_waypoints(path_nodes: list, user_type: str) -> tuple[list, list]:
@@ -756,6 +788,7 @@ def api_route(
     if body.candidates not in ("single", "compare"):
         raise HTTPException(400, "candidates는 'single' 또는 'compare'여야 합니다")
 
+    prof = _Prof(f"/route mode={body.mode} candidates={body.candidates}")
     try:
         origin = (body.origin_lon, body.origin_lat)
         dest   = (body.dest_lon,   body.dest_lat)
@@ -771,6 +804,7 @@ def api_route(
                     dest = (exit_info["lon"], exit_info["lat"])
             except Exception as e:
                 print(f"[NAV] 역 출구 스냅 실패 → 원래 좌표 사용: {e}")
+        prof.mark("station_snap")
 
         # CCH 우선 (서울 전역 그래프), fallback → NetworkX
         if _cch is not None and body.mode == "accessibility":
@@ -790,6 +824,7 @@ def api_route(
         else:
             result = find_route(G, origin, dest, body.user_type,
                                 body.algorithm, mode=body.mode)
+        prof.mark("find_route")
 
         coords = [
             [G.nodes[n]["lon"], G.nodes[n]["lat"]]
@@ -834,6 +869,7 @@ def api_route(
             except Exception:
                 pass
         estimated_time_s = estimate_route_time(segs, body.user_type, speed_profile)
+        prof.mark("segs+speed_profile")
 
         # WalkContent ServerRoute 형식으로 래핑
         route_obj = {
@@ -897,6 +933,7 @@ def api_route(
                     })
         except Exception as _nav_err:
             print(f"[NAV] 네비게이션 구간 생성 실패 (무시): {_nav_err}")
+        prof.mark("nav_build(type)")
 
         response = {
             # FE WalkContent 호환 필드
@@ -999,6 +1036,7 @@ def api_route(
                         })
                 except Exception as e:
                     print(f"[route2] 거리경로 조회 실패 (무시): {e}")
+            prof.mark("distance_cand")
 
             if _personal_cache is not None and decoded is not None:
                 personal_metric = _personal_cache.get(decoded["uid"])
@@ -1046,11 +1084,28 @@ def api_route(
                             })
                     except Exception as e:
                         print(f"[route3] 맞춤경로 조회 실패 (무시): {e}")
+            prof.mark("personal_cand")
 
             response["candidateRoutes"] = candidate_routes
 
+        prof.done(
+            nodes=len(result["path_nodes"]),
+            n_cand=len(response.get("candidateRoutes", [1])),
+        )
         return response
 
+    except CoverageError as e:
+        # 서울 전역 그래프 밖 좌표(지방 등) — 경사도가 이 그래프 하나에 함께
+        # 구워져 있어 "거리 우선만" 같은 부분 응답도 불가능하다. FE 는 code 를 보고
+        # 스크리한 "경로 탐색 실패" 팝업 대신 안내 문구를 띄운다.
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "out_of_service_area",
+                "message": "현재 서울 지역만 경로 안내를 제공합니다. 서울 안의 출발지·도착지를 선택해 주세요.",
+                "debug": str(e),
+            },
+        )
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:

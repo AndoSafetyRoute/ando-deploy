@@ -3,7 +3,7 @@
 """
 import networkx as nx
 
-from config import MAX_DETOUR_RATIO, FLAT_THRESHOLD, COVERAGE_SNAP_MAX_M
+from config import MAX_DETOUR_RATIO, FLAT_THRESHOLD, COVERAGE_SNAP_MAX_M, CoverageError
 from routing.cost import USER_TYPES, slope_cost, slope_score
 from routing.graph import haversine
 from routing.search import nearest_node, best_origin_node
@@ -115,7 +115,7 @@ def find_route(
     # od/dd가 몇 km씩 튄다 — 검증 없이 그대로 진행하면 엉뚱한 두 지점 사이 경로가
     # 계산되고, 그 위에 경사 페널티까지 얹혀 소요시간이 "몇 시간"으로 부풀려진다.
     if od > COVERAGE_SNAP_MAX_M or dd > COVERAGE_SNAP_MAX_M:
-        raise ValueError(
+        raise CoverageError(
             f"서비스 커버리지 밖입니다 (출발 스냅 {od:.0f}m / 도착 스냅 {dd:.0f}m, "
             f"허용 {COVERAGE_SNAP_MAX_M:.0f}m)"
         )

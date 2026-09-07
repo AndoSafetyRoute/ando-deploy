@@ -12,10 +12,8 @@ import {
   Platform,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { Ionicons, Feather, MaterialCommunityIcons } from "@expo/vector-icons";
+import { Ionicons, Feather } from "@expo/vector-icons";
 import { router, useLocalSearchParams } from "expo-router";
-import { createClient } from "@supabase/supabase-js";
-import * as Location from "expo-location";
 import { getBookmarks, addBookmark, removeBookmark, BookmarkItem } from "../src/utils/storage";
 import { getAuthToken } from "../src/api";
 import { getSearchHistory, saveSearchHistory, SearchHistoryItem } from "../src/api";
@@ -26,30 +24,6 @@ const BORDER_GRAY = "#E4E5EA";
 const TEXT_GRAY = "#666666";
 
 const KAKAO_REST_API_KEY = process.env.EXPO_PUBLIC_KAKAO_REST_API_KEY;
-
-const supabase = createClient(
-  process.env.EXPO_PUBLIC_SUPABASE_URL!,
-  process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY!,
-);
-
-// 홈 화면과 같은 카테고리 목록 — 반경 내 전체 조회용.
-const CATEGORIES = [
-  { id: "wheelchair-charge", label: "휠체어 충전소", icon: "wheelchair-accessibility" as const },
-  { id: "cafe", label: "카페", icon: "coffee" as const },
-  { id: "restaurant", label: "음식점", icon: "silverware-fork-knife" as const },
-];
-const CATEGORY_GROUP_CODES: Record<string, string> = { cafe: "CE7", restaurant: "FD6" };
-const NEARBY_SEARCH_RADIUS_M = 1500;
-const DEFAULT_CENTER = { lat: 37.5665, lng: 126.978 }; // GPS 실패 시 폴백(서울시청)
-
-function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number) {
-  const R = 6371000;
-  const toRad = (d: number) => (d * Math.PI) / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLng = toRad(lng2 - lng1);
-  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(a));
-}
 
 type KakaoPlace = {
   id: string;
@@ -73,72 +47,6 @@ type PlaceResult = {
   latitude: number;
   longitude: number;
 };
-
-async function fetchWheelchairChargersNear(centerLat: number, centerLng: number): Promise<PlaceResult[]> {
-  const { data, error } = await supabase
-    .from("charging_stations")
-    .select("name, lat, lng, address_road");
-  if (error) throw error;
-
-  return (data ?? [])
-    .map((row: any) => ({
-      id: `charger-${row.lat}-${row.lng}`,
-      name: row.name,
-      address: row.address_road || "주소 정보 없음",
-      phone: "전화번호 정보 없음",
-      category: "휠체어 충전소",
-      placeUrl: "",
-      latitude: row.lat,
-      longitude: row.lng,
-    }))
-    .filter((p: PlaceResult) => haversineMeters(centerLat, centerLng, p.latitude, p.longitude) <= NEARBY_SEARCH_RADIUS_M);
-}
-
-async function fetchNearbyCategoryPlaces(
-  categoryGroupCode: string,
-  centerLat: number,
-  centerLng: number,
-): Promise<PlaceResult[]> {
-  if (!KAKAO_REST_API_KEY) return [];
-  const results: PlaceResult[] = [];
-
-  for (let page = 1; page <= 3; page++) {
-    const url =
-      `https://dapi.kakao.com/v2/local/search/category.json` +
-      `?category_group_code=${categoryGroupCode}` +
-      `&x=${centerLng}&y=${centerLat}` +
-      `&radius=${NEARBY_SEARCH_RADIUS_M}&sort=distance&page=${page}`;
-
-    const response = await fetch(url, { headers: { Authorization: `KakaoAK ${KAKAO_REST_API_KEY}` } });
-    if (!response.ok) break;
-
-    const json = await response.json();
-    const documents: any[] = json.documents ?? [];
-    results.push(
-      ...documents.map((doc) => ({
-        id: doc.id,
-        name: doc.place_name,
-        address: doc.road_address_name || doc.address_name || "주소 정보 없음",
-        phone: doc.phone || "전화번호 정보 없음",
-        category: doc.category_name || "",
-        placeUrl: doc.place_url || "",
-        latitude: Number(doc.y),
-        longitude: Number(doc.x),
-      }))
-    );
-
-    if (json.meta?.is_end ?? true) break;
-  }
-
-  return results;
-}
-
-function fetchPlacesForCategory(categoryId: string, centerLat: number, centerLng: number): Promise<PlaceResult[]> {
-  if (categoryId === "wheelchair-charge") return fetchWheelchairChargersNear(centerLat, centerLng);
-  const groupCode = CATEGORY_GROUP_CODES[categoryId];
-  if (groupCode) return fetchNearbyCategoryPlaces(groupCode, centerLat, centerLng);
-  return Promise.resolve([]);
-}
 
 function getParam(value: string | string[] | undefined, fallback = "") {
   if (Array.isArray(value)) return value[0] ?? fallback;
@@ -168,8 +76,6 @@ export default function SearchScreen() {
   const [bookmarkedIds, setBookmarkedIds] = useState<Set<string>>(new Set());
   const [bookmarks, setBookmarks] = useState<BookmarkItem[]>([]);
   const [history, setHistory] = useState<SearchHistoryItem[]>([]);
-  const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
-  const [categoryLoading, setCategoryLoading] = useState(false);
 
   useEffect(() => {
     getBookmarks().then(items => {
@@ -241,57 +147,6 @@ export default function SearchScreen() {
       setBookmarkedIds(prev => new Set(prev).add(item.id));
     }
   }, [bookmarkedIds]);
-
-  // 도착지 검색(mode=route-end)이면 이미 입력된 출발지 좌표를 중심으로,
-  // 그 외(출발지 검색/일반 검색)엔 현재 GPS 위치를 중심으로 반경 내 카테고리를 조회한다.
-  const resolveCategoryCenter = async (): Promise<{ lat: number; lng: number }> => {
-    if (mode === "route-end") {
-      const lat = Number(getParam(params.startLatitude));
-      const lng = Number(getParam(params.startLongitude));
-      if (Number.isFinite(lat) && Number.isFinite(lng)) return { lat, lng };
-    }
-
-    try {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== "granted") return DEFAULT_CENTER;
-
-      const loc: any = await Promise.race([
-        Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 5000)),
-      ]);
-      return { lat: loc.coords.latitude, lng: loc.coords.longitude };
-    } catch {
-      try {
-        const last = await Location.getLastKnownPositionAsync({});
-        if (last) return { lat: last.coords.latitude, lng: last.coords.longitude };
-      } catch {}
-      return DEFAULT_CENTER;
-    }
-  };
-
-  const handleSelectCategory = async (categoryId: string) => {
-    if (selectedCategory === categoryId) {
-      // 같은 칩을 다시 누르면 해제하고 검색 결과 비움
-      setSelectedCategory(null);
-      setResults([]);
-      return;
-    }
-
-    setSelectedCategory(categoryId);
-    setSearchText("");
-    setResults([]);
-    setCategoryLoading(true);
-    try {
-      const center = await resolveCategoryCenter();
-      const places = await fetchPlacesForCategory(categoryId, center.lat, center.lng);
-      setResults(places);
-    } catch (e) {
-      console.log("카테고리 검색 오류:", e);
-      Alert.alert("오류", "카테고리 장소를 불러오지 못했습니다.");
-    } finally {
-      setCategoryLoading(false);
-    }
-  };
 
   const searchPlaces = async (query: string) => {
     const trimmedQuery = query.trim();
@@ -522,7 +377,7 @@ export default function SearchScreen() {
           <TextInput
             style={styles.searchInput}
             value={searchText}
-            onChangeText={(t) => { setSearchText(t); if (selectedCategory) setSelectedCategory(null); }}
+            onChangeText={setSearchText}
             placeholder={
               mode === "route-start"
                 ? "출발지 검색"
@@ -547,7 +402,8 @@ export default function SearchScreen() {
         </TouchableOpacity>
       </View>
 
-      {/* 북마크 바로가기 — 검색창 바로 아래, 누르면 그 장소를 바로 선택 */}
+      {/* 즐겨찾기 바로가기 — 즐겨찾기 화면에서 추가한 장소를 버튼으로. 많아지면
+          옆으로 스크롤(스크롤바는 숨김). 누르면 그 장소를 바로 선택. */}
       {bookmarks.length > 0 && (
         <ScrollView
           horizontal
@@ -571,35 +427,6 @@ export default function SearchScreen() {
         </ScrollView>
       )}
 
-      {/* 카테고리로 찾기 — 도착지 검색이면 출발지 주변, 그 외엔 현재 위치 주변 */}
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        style={styles.categoryRow}
-        contentContainerStyle={styles.categoryRowContent}
-      >
-        {CATEGORIES.map((c) => {
-          const isSelected = selectedCategory === c.id;
-          return (
-            <TouchableOpacity
-              key={c.id}
-              style={[styles.categoryChip, isSelected && styles.categoryChipSelected]}
-              activeOpacity={0.8}
-              onPress={() => handleSelectCategory(c.id)}
-            >
-              <MaterialCommunityIcons
-                name={c.icon}
-                size={16}
-                color={isSelected ? "#FFFFFF" : NAVY}
-              />
-              <Text style={[styles.categoryChipText, isSelected && styles.categoryChipTextSelected]}>
-                {c.label}
-              </Text>
-            </TouchableOpacity>
-          );
-        })}
-      </ScrollView>
-
       {/* 검색어 안내 */}
       <View style={styles.summaryBox}>
         <Text style={styles.summaryTitle}>
@@ -611,23 +438,19 @@ export default function SearchScreen() {
         </Text>
 
         <Text style={styles.summaryText}>
-          {selectedCategory
-            ? `${CATEGORIES.find(c => c.id === selectedCategory)?.label} · 주변 ${(NEARBY_SEARCH_RADIUS_M / 1000).toFixed(1)}km`
-            : searchText.trim()
+          {searchText.trim()
             ? `"${searchText.trim()}"에 대한 장소`
             : "검색어를 입력해 주세요"}
         </Text>
       </View>
 
       {/* 결과 영역 */}
-      {loading || categoryLoading ? (
+      {loading ? (
         <View style={styles.loadingBox}>
           <ActivityIndicator size="large" color={NAVY} />
-          <Text style={styles.loadingText}>
-            {categoryLoading ? "주변 장소를 찾는 중..." : "장소를 검색하는 중..."}
-          </Text>
+          <Text style={styles.loadingText}>장소를 검색하는 중...</Text>
         </View>
-      ) : !searchText.trim() && !selectedCategory && history.length > 0 ? (
+      ) : !searchText.trim() && history.length > 0 ? (
         <FlatList
           data={history}
           keyExtractor={(item) => item.place_id}
@@ -863,44 +686,6 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: "700",
     color: NAVY,
-  },
-
-  categoryRow: {
-    flexGrow: 0,
-    marginTop: 10,
-  },
-
-  categoryRowContent: {
-    alignItems: "center",
-    paddingRight: 8,
-  },
-
-  categoryChip: {
-    flexDirection: "row",
-    alignItems: "center",
-    height: 36,
-    paddingHorizontal: 14,
-    borderRadius: 18,
-    marginRight: 8,
-    backgroundColor: "#FFFFFF",
-    borderWidth: 1,
-    borderColor: BORDER_GRAY,
-    gap: 6,
-  },
-
-  categoryChipSelected: {
-    backgroundColor: NAVY,
-    borderColor: NAVY,
-  },
-
-  categoryChipText: {
-    fontSize: 13,
-    fontWeight: "700",
-    color: NAVY,
-  },
-
-  categoryChipTextSelected: {
-    color: "#FFFFFF",
   },
 
   historyHeader: {

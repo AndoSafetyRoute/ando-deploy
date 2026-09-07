@@ -21,7 +21,7 @@ import time
 import numpy as np
 from scipy.spatial import KDTree
 
-from config import MAX_DETOUR_RATIO, FORBIDDEN_PENALTY, BASE_DIR, COVERAGE_SNAP_MAX_M
+from config import MAX_DETOUR_RATIO, FORBIDDEN_PENALTY, BASE_DIR, COVERAGE_SNAP_MAX_M, CoverageError
 from routing.cost import USER_TYPES, slope_cost
 from routing.pathfinder import recalculate_path_slopes
 from routing.basis import precompute_basis_weights, save_basis_weights, load_basis_weights
@@ -108,7 +108,7 @@ class CCHEngine:
         y = lat * self._lat_to_m
         dist_m, idx = self.tree.query([x, y])
         if dist_m > COVERAGE_SNAP_MAX_M:
-            raise ValueError(
+            raise CoverageError(
                 f"서비스 커버리지 밖입니다 (좌표 스냅 거리 {dist_m:.0f}m, "
                 f"허용 {COVERAGE_SNAP_MAX_M:.0f}m)"
             )

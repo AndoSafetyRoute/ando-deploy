@@ -21,7 +21,6 @@ import { requestRouteCandidates } from "../../api/routeCompare";
 import {
   buildComparison,
   buildRouteChoicePayload,
-  CANDIDATE_LABELS,
   type ShownCandidate,
 } from "../../utils/routeChoiceModel";
 import { CollectSession } from "../../utils/collectQueue";
@@ -105,11 +104,6 @@ export default function RouteCompareScreen({ navigation, route }: Props) {
       collectRef.current = null;
     };
   }, []);
-
-  const hasPersonal = useMemo(
-    () => shown.some((s) => s.mergedKinds.includes("personal")),
-    [shown],
-  );
 
   const mapRoutes: MapRoute[] = useMemo(
     () =>
@@ -230,18 +224,11 @@ export default function RouteCompareScreen({ navigation, route }: Props) {
           );
         })}
 
-        {/* 사용자 맞춤형 후보가 아직 없으면(⑨ 배치 학습 전엔 항상) 자리를 비우지 않고
-            비활성 카드로 고정 순서 세 번째 자리를 지킨다 — 선택 불가, 로그에도 안 남는다. */}
-        {!hasPersonal && (
-          <View style={[ss.card, ss.cardDisabled]}>
-            <View style={[ss.dot, { backgroundColor: C.textMute }]} />
-            <View style={{ flex: 1 }}>
-              <Text style={[ss.cardLabel, ss.cardLabelDisabled]}>{CANDIDATE_LABELS.personal}</Text>
-              <Text style={ss.cardMeta}>아직 준비중입니다 — 데이터가 더 모이면 제공돼요.</Text>
-            </View>
-            <Text style={ss.lockIcon}>🔒</Text>
-          </View>
-        )}
+        {/* 2026-09 (release_v3): 테스트 데이터 적용 전까지 제공 경로를 2종으로 축소한다
+            — ① 거리 우선, ② 유형별 경계 점수 반영. "사용자 맞춤형" 비활성 자리표시
+            카드는 이 버전에서 노출하지 않는다(⑨ 배치 학습/테스트 데이터가 들어오면
+            BE 가 personal 후보를 다시 채우고 buildComparison 이 알아서 3번째 카드를
+            만든다 — 그때 이 자리표시 UI 복원 여부를 다시 판단). */}
       </ScrollView>
 
       <TouchableOpacity

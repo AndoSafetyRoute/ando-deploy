@@ -60,6 +60,31 @@ export type RouteRequest = {
   light?: boolean;
 };
 
+// 백엔드가 구조화된 detail({code, message})로 돌려주는 거부(예: 서울 밖 좌표 →
+// out_of_service_area)를 호출부가 스크리한 "경로 탐색 실패" 팝업 대신 안내 문구로
+// 처리할 수 있게 코드를 실어 던진다.
+export class RouteApiError extends Error {
+  code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "RouteApiError";
+    this.code = code;
+  }
+}
+
+function toRouteApiError(status: number, bodyText: string): Error {
+  try {
+    const parsed = JSON.parse(bodyText);
+    const detail = parsed?.detail ?? parsed;
+    if (detail && typeof detail === "object" && detail.code) {
+      return new RouteApiError(String(detail.code), String(detail.message ?? bodyText));
+    }
+  } catch {
+    /* JSON 아님 — 아래에서 평문으로 처리 */
+  }
+  return new Error(bodyText || `HTTP ${status}`);
+}
+
 export async function requestRoute({
   startLatitude,
   startLongitude,
@@ -100,7 +125,7 @@ export async function requestRoute({
     if (!response.ok) {
       const errorText = await response.text();
       console.log("[Route] 에러 응답 본문:", errorText);
-      throw new Error(errorText);
+      throw toRouteApiError(response.status, errorText);
     }
 
     const data = await response.json();
