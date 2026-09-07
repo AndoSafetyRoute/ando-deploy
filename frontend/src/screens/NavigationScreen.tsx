@@ -168,6 +168,8 @@ function normalizeSegments(raw: any): RouteSegment[] {
       direction: seg.direction ?? "flat",
       name:      seg.name ?? "",
       zone:      seg.zone ?? undefined,
+      // 하이브리드(서울 밖) 직선 구간 — 경사 데이터 없음. slope=0 을 실측값으로 오인 방지용 표식.
+      outsideSeoul: seg.outside_seoul === true,
     }))
     .filter(
       (s: RouteSegment) =>

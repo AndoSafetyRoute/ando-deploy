@@ -34,6 +34,11 @@ type ServerRoute = {
   shortestDistance?: number | null;
   detourRatio?: number | null;
   algorithmAlpha?: number | null;
+  // 하이브리드(서울 안팎) 응답 — 서울 밖 구간은 경사 데이터 없이 직선(최단)만.
+  estimatedTimeS?: number | null;
+  hasExternalLeg?: boolean;
+  externalLengthM?: number | null;
+  routeSegments?: any[];
 };
 
 type WalkRoute = {
@@ -51,6 +56,9 @@ type WalkRoute = {
   totalDistanceM: number | null;
   avgSlope: number | null;
   detourRatio: number | null;
+  hasExternalLeg?: boolean;
+  externalLengthM?: number | null;
+  routeSegments?: any[];
 };
 
 type WalkContentProps = {
@@ -231,6 +239,29 @@ function makeDescription(route: ServerRoute) {
   return '교통약자 이동 조건을 고려한 추천 경로입니다.';
 }
 
+// 하이브리드 응답의 routeSegments 중 outside_seoul 인 것을 회색 직선 구간으로.
+function buildExternalSegments(routeSegments: any[] | undefined): import('./RouteMapView').MapRouteSegment[] {
+  if (!Array.isArray(routeSegments)) return [];
+  const out: import('./RouteMapView').MapRouteSegment[] = [];
+  let run: Coordinate[] = [];
+  const flush = () => {
+    if (run.length >= 2) out.push({ coordinates: run, color: '#9AA0AE', zone: 'flat' as any, slopeMean: 0 });
+    run = [];
+  };
+  for (const s of routeSegments) {
+    if (!s?.outside_seoul) { flush(); continue; }
+    const c = Array.isArray(s.coords) ? s.coords : null;
+    const a = c?.[0] ?? (s.start ? [s.start.longitude, s.start.latitude] : null);
+    const b = c?.[1] ?? (s.end ? [s.end.longitude, s.end.latitude] : null);
+    if (a && b && Number.isFinite(a[0]) && Number.isFinite(b[0])) {
+      if (run.length === 0) run.push({ latitude: a[1], longitude: a[0] });
+      run.push({ latitude: b[1], longitude: b[0] });
+    }
+  }
+  flush();
+  return out;
+}
+
 function convertServerRoute(route: ServerRoute): WalkRoute {
   const totalDistanceM = getNumber(route.totalDistance);
   const avgSlope = getNumber(route.avgSlope);
@@ -238,7 +269,9 @@ function convertServerRoute(route: ServerRoute): WalkRoute {
   const coordinates = normalizeCoordinates(route.coordinates);
 
   const distance = formatDistance(totalDistanceM);
-  const time = estimateTimeMinutes(totalDistanceM);
+  // 하이브리드: estimatedTimeS(서울 안 경사반영 + 밖 직선 합산) 있으면 우선.
+  const estS = getNumber((route as any).estimatedTimeS);
+  const time = estS !== null && estS > 0 ? Math.max(1, Math.round(estS / 60)) : estimateTimeMinutes(totalDistanceM);
   const steps = estimateSteps(totalDistanceM);
 
   return {
@@ -259,6 +292,9 @@ function convertServerRoute(route: ServerRoute): WalkRoute {
     totalDistanceM,
     avgSlope,
     detourRatio,
+    hasExternalLeg: !!(route as any).hasExternalLeg,
+    externalLengthM: getNumber((route as any).externalLengthM),
+    routeSegments: Array.isArray((route as any).routeSegments) ? (route as any).routeSegments : undefined,
   };
 }
 
@@ -446,6 +482,14 @@ export default function WalkContent({
     [selectedRouteObj, routeData]
   );
 
+  // 하이브리드: 서울 밖 구간은 경사 데이터가 없어 회색 직선으로만 표시.
+  const externalSegments = useMemo(
+    () => buildExternalSegments(selectedRouteObj?.routeSegments),
+    [selectedRouteObj]
+  );
+  const serviceArea = routeData?.service_area ?? null;
+  const isHybrid = routeData?.algorithm === 'hybrid' || !!serviceArea?.partial_coverage;
+
   // 매 렌더마다 새 배열을 만들면 RouteMapView의 지도가 계속 재생성되어 깜빡이고
   // 줌 상태가 초기화된다. routes가 실제로 바뀔 때만 새로 만든다.
   const mapRoutes = useMemo(
@@ -453,9 +497,11 @@ export default function WalkContent({
       id: r.id,
       color: r.color,
       coordinates: r.coordinates,
-      segments: r.id === selectedRouteId ? slopeSegments : undefined,
+      segments: r.id === selectedRouteId
+        ? [...slopeSegments, ...externalSegments]
+        : undefined,
     })),
-    [routes, selectedRouteId, slopeSegments]
+    [routes, selectedRouteId, slopeSegments, externalSegments]
   );
 
   // 전체 화면 높이(H) 기준으로 잡으면 상단 헤더/카드들 때문에 확대 시 화면 밖으로
@@ -538,6 +584,24 @@ export default function WalkContent({
             <Text style={ss.sheetExpandIcon}>{sheetExpanded ? '▼' : '▲'}</Text>
           </View>
         </View>
+
+        {isHybrid && (
+          <View style={ss.svcBanner}>
+            <Text style={ss.svcBannerIcon}>ℹ️</Text>
+            <Text style={ss.svcBannerText}>
+              {serviceArea?.origin_in_seoul === false && serviceArea?.dest_in_seoul === false
+                ? '출발·도착이 모두 서울 밖이에요. '
+                : '경로에 서울 밖 구간이 있어요. '}
+              밖 구간
+              {serviceArea?.external_length_m
+                ? ` 약 ${serviceArea.external_length_m >= 1000
+                    ? (serviceArea.external_length_m / 1000).toFixed(1) + 'km'
+                    : Math.round(serviceArea.external_length_m) + 'm'}`
+                : ''}
+              은 경사 데이터가 없어 최단(직선) 안내만 제공돼요. 소요시간은 서울 안팎을 합쳐 계산했어요.
+            </Text>
+          </View>
+        )}
 
         <ScrollView
           style={ss.sheetScroll}
@@ -784,6 +848,22 @@ const ss = StyleSheet.create({
     alignItems: 'center',
     gap: 8,
   },
+
+  svcBanner: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 6,
+    marginHorizontal: 16,
+    marginTop: 4,
+    marginBottom: 2,
+    padding: 10,
+    borderRadius: 10,
+    backgroundColor: '#FFF4E2',
+    borderWidth: 1,
+    borderColor: C.warn + '55',
+  },
+  svcBannerIcon: { fontSize: 13, lineHeight: 18 },
+  svcBannerText: { flex: 1, fontSize: 11.5, lineHeight: 17, color: '#7A5B12', fontWeight: '600' },
 
   sheetTitle: {
     fontSize: 16,
