@@ -18,6 +18,7 @@ import {
 } from '../../api/routeApi';
 import RouteMapView, { MapCoordinate } from './RouteMapView';
 import { useDraggableSheet } from './useDraggableSheet';
+import BusArrivalBadge from '../../components/BusArrivalBadge';
 
 const { height: H } = Dimensions.get('window');
 
@@ -787,6 +788,9 @@ const StepItem = ({ step, isLast }: { step: any; isLast: boolean }) => {
                   <View style={ss.nextBusDot} />
                   <Text style={ss.nextBusText}>{step.nextBus}</Text>
                 </View>
+              )}
+              {step.type === 'bus' && step.busNo && (
+                <BusArrivalBadge routeName={step.busNo} stopName={step.stops?.[0]} />
               )}
               {step.stops && (
                 <View style={ss.stopsRow}>
