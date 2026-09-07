@@ -428,6 +428,76 @@ def init_db():
             )
         """))
 
+        # ── 구간 체감 난이도 평가 (⑭' — pace = 1m당 소요시간 기준) ─────────────
+        # navigation_segments 에 "1m당 소요시간" 파생 컬럼. insert 시 자동 계산되며
+        # 분석·랭킹의 공통 정규화 단위다("소요시간 구간 단위 1m로 통일" 요구).
+        conn.execute(text("""
+            ALTER TABLE navigation_segments
+            ADD COLUMN IF NOT EXISTS pace_s_per_m DOUBLE PRECISION
+            GENERATED ALWAYS AS (
+                (elapsed_ms::float / 1000.0) / NULLIF(distance_m, 0)
+            ) STORED
+        """))
+
+        # complete_navigation 이 종료 시점에 미리 계산해 두는 pace 상위 구간 캐시.
+        # 안내가 끝나자마자 FE 가 곧바로 조회하도록 백엔드에서 선계산 (사용자 요구:
+        # "안내가 끝난 뒤 상위 10개 구간을 최대한 빨리 표출").
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS route_slow_segments (
+                route_id      INT  NOT NULL REFERENCES routes(id) ON DELETE CASCADE,
+                rank          SMALLINT NOT NULL,
+                seg_index     INT   NOT NULL,   -- 묶은 구간의 첫 엣지 인덱스
+                seg_index_end INT,              -- 묶은 구간의 끝 엣지 인덱스 (FE 지도 하이라이트 범위)
+                distance_m    FLOAT NOT NULL,
+                slope_pct     FLOAT NOT NULL,
+                direction     TEXT,
+                zone          TEXT,
+                name          TEXT,
+                elapsed_ms    BIGINT NOT NULL,
+                pace_s_per_m  FLOAT NOT NULL,
+                computed_at   TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (route_id, rank)
+            )
+        """))
+        conn.execute(text(
+            "ALTER TABLE route_slow_segments ADD COLUMN IF NOT EXISTS seg_index_end INT"
+        ))
+
+        # 구간별 체감 난이도 응답. Q1 was_uncomfortable(불편했나요 예/아니오) +
+        # Q2 hardship_score(예일 때만 1~10점). 평가 시점의 경사·소요시간 스냅샷을
+        # 함께 박아 두어 추후 누적 데이터를 분석에 쓸 수 있게 한다(사용자 요구).
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS segment_hardship_feedback (
+                id                SERIAL PRIMARY KEY,
+                uid               TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+                route_id          INT  NOT NULL REFERENCES routes(id) ON DELETE CASCADE,
+                session_id        TEXT,
+                seg_index         INT   NOT NULL,
+                seg_index_end     INT,
+                rank              SMALLINT NOT NULL,
+                pace_s_per_m      FLOAT NOT NULL,
+                elapsed_ms        BIGINT NOT NULL,
+                distance_m        FLOAT NOT NULL,
+                slope_pct         FLOAT NOT NULL,
+                zone              TEXT,
+                was_uncomfortable BOOLEAN NOT NULL,
+                hardship_score    SMALLINT,
+                answered_at       TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (route_id, seg_index),
+                CONSTRAINT chk_hardship_score
+                    CHECK (hardship_score IS NULL OR hardship_score BETWEEN 1 AND 10),
+                CONSTRAINT chk_hardship_consistency
+                    CHECK (was_uncomfortable OR hardship_score IS NULL)
+            )
+        """))
+        conn.execute(text(
+            "ALTER TABLE segment_hardship_feedback ADD COLUMN IF NOT EXISTS seg_index_end INT"
+        ))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_seg_hardship_analysis
+            ON segment_hardship_feedback (slope_pct, pace_s_per_m, was_uncomfortable)
+        """))
+
         conn.commit()
     print("[DB] 테이블 초기화 완료")
 
@@ -1347,6 +1417,10 @@ def complete_navigation(
         "avg_slope_pct":     avg_slope_pct,
         "total_duration_ms": total_duration_ms,
     })
+
+    # pace(1m당 소요시간) 상위 구간을 지금(종료 시점) 미리 계산해 캐시에 저장 —
+    # 안내 종료 직후 FE 가 /navigation/{id}/slow-segments 로 바로 읽어간다.
+    ranked = _rank_and_store_slow_segments(db, route_id)
     db.commit()
 
     return {
@@ -1354,4 +1428,250 @@ def complete_navigation(
         "total_length_m":    total_length_m,
         "avg_slope_pct":     avg_slope_pct,
         "total_duration_ms": total_duration_ms,
+        "slow_segments_ranked": ranked,
     }
+
+
+# ── 구간 체감 난이도 평가 (⑭' — 1m당 소요시간 pace 기준) ─────────────────────
+# navigation_segments 는 그래프 엣지 단위(~5~10m, 경로당 수십~수백 행)라 그대로는
+# "구간"이 아니다 — 연속 엣지를 경사 bin 으로 묶어 사람이 인지하는 구간으로 만든 뒤
+# 그 구간들을 pace 순으로 랭킹한다. 파라미터는 C등급(근거 없음) — 파일럿 후 조정.
+SLOW_SEG_MIN_DIST_M = 25.0   # 묶은 구간이 이보다 짧으면 제외 (pickFeedbackSegments 와 동일)
+SLOW_SEG_MAX_RANKED = 10     # 상위 몇 구간까지 물어볼지 (사용자 사양: 10순위, 1~9면 전부)
+SLOW_SEG_SPEED_MIN  = 0.05   # m/s — 거리/시간 이 범위 밖이면 GPS 점프/정지 이상치
+SLOW_SEG_SPEED_MAX  = 2.50   # (routing/speed.py _SPEED_MIN/_MAX 와 동일)
+SLOW_SEG_BIN_PCT    = 1.0    # 연속 엣지를 한 구간으로 묶는 경사 bin 폭(%p)
+
+_SLOW_SEG_SELECT = """
+    SELECT rank, seg_index, seg_index_end, distance_m, slope_pct, direction, zone,
+           name, elapsed_ms, pace_s_per_m
+    FROM route_slow_segments
+    WHERE route_id = :rid
+    ORDER BY rank
+"""
+
+
+def _route_segment_groups(db: Session, route_id: int) -> list[dict]:
+    """
+    navigation_segments 원본(엣지 단위) → 사람이 인지하는 "구간" 묶음.
+    연속(seg_index 가 1씩 증가) + measured=TRUE + 같은 경사 bin(±SLOW_SEG_BIN_PCT) 이면 한 구간.
+    각 구간: seg_index(첫 엣지), seg_index_end(끝 엣지), distance_m·elapsed_ms 합,
+             slope_pct(길이가중 평균), pace_s_per_m, direction/zone/name(대표값).
+    """
+    edge_rows = db.execute(text("""
+        SELECT seg_index, distance_m, slope_pct, direction, zone, name, elapsed_ms, measured
+        FROM navigation_segments
+        WHERE route_id = :rid
+        ORDER BY seg_index ASC
+    """), {"rid": route_id}).fetchall()
+
+    groups: list[dict] = []
+    cur: dict | None = None
+    for si, dist, slope, direction, zone, name, elapsed, measured in edge_rows:
+        si = int(si)
+        dist = float(dist or 0.0)
+        elapsed = int(elapsed or 0)
+        slope = None if slope is None else float(slope)
+        if not (bool(measured) and slope is not None and dist > 0):
+            cur = None
+            continue
+        b = int(round(slope / SLOW_SEG_BIN_PCT))
+        if cur is not None and si == cur["_next"] and b == cur["_bin"]:
+            cur["seg_index_end"] = si
+            cur["distance_m"]   += dist
+            cur["elapsed_ms"]   += elapsed
+            cur["_wslope"]      += slope * dist
+            cur["_next"]         = si + 1
+            if not cur["name"] and name:
+                cur["name"] = name
+        else:
+            cur = {
+                "seg_index": si, "seg_index_end": si,
+                "distance_m": dist, "elapsed_ms": elapsed,
+                "_wslope": slope * dist, "_bin": b, "_next": si + 1,
+                "direction": direction, "zone": zone, "name": name or "",
+            }
+            groups.append(cur)
+
+    for g in groups:
+        d = g["distance_m"]
+        g["slope_pct"]    = round(g["_wslope"] / d, 3) if d else 0.0
+        g["pace_s_per_m"] = round((g["elapsed_ms"] / 1000.0) / d, 4) if d else 0.0
+        for k in ("_wslope", "_bin", "_next"):
+            g.pop(k, None)
+    return groups
+
+
+def _slow_seg_eligible(g: dict) -> bool:
+    """랭킹 대상 구간인지 — 경사 있고, 충분히 길고, 속도가 현실적인지."""
+    d, e = g["distance_m"], g["elapsed_ms"]
+    if d < SLOW_SEG_MIN_DIST_M or e <= 0:
+        return False
+    if abs(g["slope_pct"]) < FLAT_THRESHOLD:
+        return False
+    spd = d / (e / 1000.0)
+    return SLOW_SEG_SPEED_MIN < spd < SLOW_SEG_SPEED_MAX
+
+
+def _rank_and_store_slow_segments(db: Session, route_id: int) -> int:
+    """
+    navigation_segments(엣지 단위) → 구간 묶음 → 1m당 소요시간(pace) 큰 순으로
+    상위 SLOW_SEG_MAX_RANKED(=10) 구간을 route_slow_segments 에 저장한다.
+    유효 구간이 10 미만이면 그 전부 (사용자 사양: "1~9구간이면 경로 구간 모두 평가").
+    정렬: pace 내림차순 → 거리 큰 순 → seg_index 오름차순. 커밋은 호출측 책임.
+    """
+    ranked = sorted(
+        (g for g in _route_segment_groups(db, route_id) if _slow_seg_eligible(g)),
+        key=lambda g: (-g["pace_s_per_m"], -g["distance_m"], g["seg_index"]),
+    )[:SLOW_SEG_MAX_RANKED]
+
+    db.execute(text("DELETE FROM route_slow_segments WHERE route_id = :rid"),
+               {"rid": route_id})
+
+    for rank, g in enumerate(ranked, start=1):
+        db.execute(text("""
+            INSERT INTO route_slow_segments
+                (route_id, rank, seg_index, seg_index_end, distance_m, slope_pct,
+                 direction, zone, name, elapsed_ms, pace_s_per_m)
+            VALUES
+                (:rid, :rank, :seg_index, :seg_index_end, :distance_m, :slope_pct,
+                 :direction, :zone, :name, :elapsed_ms, :pace)
+        """), {
+            "rid": route_id, "rank": rank,
+            "seg_index": g["seg_index"], "seg_index_end": g["seg_index_end"],
+            "distance_m": round(g["distance_m"], 1), "slope_pct": g["slope_pct"],
+            "direction": g["direction"], "zone": g["zone"],
+            "name": g["name"] or None,
+            "elapsed_ms": g["elapsed_ms"], "pace": g["pace_s_per_m"],
+        })
+    return len(ranked)
+
+
+def get_slow_segments(db: Session, route_id: int, uid: str) -> dict | None:
+    """
+    pace 상위 구간 목록 (구간 체감 난이도 평가 화면용).
+    complete_navigation 이 미리 채워 둔 route_slow_segments 를 우선 읽고, 비어 있으면
+    (구버전 경로 / 종료 커밋 경합) 그 자리에서 navigation_segments 로 계산한다.
+    소유자가 아니거나 경로가 없으면 None (호출측이 404).
+    """
+    if not engine:
+        return None
+
+    owns = db.execute(
+        text("SELECT status FROM routes WHERE id = :id AND uid = :uid"),
+        {"id": route_id, "uid": uid},
+    ).fetchone()
+    if not owns:
+        return None
+    status = owns[0]
+
+    # meta 는 엣지가 아니라 "묶은 구간" 기준으로 센다 (사용자가 말하는 "N구간").
+    groups        = _route_segment_groups(db, route_id)
+    total_groups  = len(groups)
+    sloped_groups = sum(1 for g in groups if _slow_seg_eligible(g))
+
+    rows = db.execute(text(_SLOW_SEG_SELECT), {"rid": route_id}).fetchall()
+    if not rows:
+        # 미리 계산 결과가 없으면 즉석 계산 후 저장 (폴백)
+        _rank_and_store_slow_segments(db, route_id)
+        db.commit()
+        rows = db.execute(text(_SLOW_SEG_SELECT), {"rid": route_id}).fetchall()
+
+    segments = [{
+        "rank":          int(r[0]),
+        "seg_index":     int(r[1]),
+        "seg_index_end": int(r[2]) if r[2] is not None else int(r[1]),
+        "distance_m":    round(float(r[3]), 1),
+        "slope_pct":     round(float(r[4]), 2),
+        "direction":     r[5],
+        "zone":          r[6],
+        "name":          r[7],
+        "elapsed_ms":    int(r[8]),
+        "pace_s_per_m":  round(float(r[9]), 3),
+    } for r in rows]
+
+    meta = {
+        "total_segments":  total_groups,     # 경로를 묶었을 때의 구간 수
+        "sloped_segments": sloped_groups,    # 그중 경사 있어 평가 후보인 구간 수
+        "ranked":          len(segments),    # 실제로 물어볼 구간 수 (min(10, sloped))
+    }
+
+    if not segments:
+        if status == "in_progress" and total_groups == 0:
+            reason = "route_not_completed"
+        elif total_groups == 0:
+            reason = "no_measured_segments"
+        else:
+            reason = "no_sloped_segments"      # 구간은 있으나 전부 평지/너무 짧음
+        return {"eligible": False, "reason": reason, "route_id": route_id,
+                "segments": [], "meta": meta}
+
+    return {"eligible": True, "route_id": route_id, "segments": segments, "meta": meta}
+
+
+def save_segment_hardship_feedback(
+    db: Session,
+    route_id: int,
+    uid: str,
+    session_id: str | None,
+    answers: list,
+) -> dict | None:
+    """
+    구간 체감 난이도 응답 저장 (upsert on route_id+seg_index).
+    각 answer: seg_index, rank, pace_s_per_m, elapsed_ms, distance_m, slope_pct,
+    zone, was_uncomfortable, hardship_score(예일 때만 1~10, 아니면 None).
+    소유자가 아니거나 경로가 없으면 None.
+    """
+    if not engine:
+        return None
+
+    owns = db.execute(
+        text("SELECT 1 FROM routes WHERE id = :id AND uid = :uid"),
+        {"id": route_id, "uid": uid},
+    ).fetchone()
+    if not owns:
+        return None
+
+    count = 0
+    for a in answers:
+        was_unc = bool(a["was_uncomfortable"])
+        raw_score = a.get("hardship_score")
+        score = int(raw_score) if (was_unc and raw_score is not None) else None
+        if score is not None:
+            score = max(1, min(10, score))
+
+        seg_end = a.get("seg_index_end")
+        seg_end = int(seg_end) if seg_end is not None else None
+
+        db.execute(text("""
+            INSERT INTO segment_hardship_feedback
+                (uid, route_id, session_id, seg_index, seg_index_end, rank, pace_s_per_m,
+                 elapsed_ms, distance_m, slope_pct, zone,
+                 was_uncomfortable, hardship_score)
+            VALUES
+                (:uid, :route_id, :session_id, :seg_index, :seg_end, :rank, :pace,
+                 :elapsed_ms, :distance_m, :slope_pct, :zone,
+                 :was_unc, :score)
+            ON CONFLICT (route_id, seg_index) DO UPDATE SET
+                session_id        = EXCLUDED.session_id,
+                seg_index_end     = EXCLUDED.seg_index_end,
+                rank              = EXCLUDED.rank,
+                pace_s_per_m      = EXCLUDED.pace_s_per_m,
+                elapsed_ms        = EXCLUDED.elapsed_ms,
+                distance_m        = EXCLUDED.distance_m,
+                slope_pct         = EXCLUDED.slope_pct,
+                zone              = EXCLUDED.zone,
+                was_uncomfortable = EXCLUDED.was_uncomfortable,
+                hardship_score    = EXCLUDED.hardship_score,
+                answered_at       = NOW()
+        """), {
+            "uid": uid, "route_id": route_id, "session_id": session_id,
+            "seg_index": int(a["seg_index"]), "seg_end": seg_end, "rank": int(a["rank"]),
+            "pace": float(a["pace_s_per_m"]), "elapsed_ms": int(a["elapsed_ms"]),
+            "distance_m": float(a["distance_m"]), "slope_pct": float(a["slope_pct"]),
+            "zone": a.get("zone"), "was_unc": was_unc, "score": score,
+        })
+        count += 1
+
+    db.commit()
+    return {"ok": True, "count": count}

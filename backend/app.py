@@ -32,6 +32,7 @@ from database import (
     start_navigation, add_navigation_segment, complete_navigation,
     save_zone_observation, get_user_speed_profile, save_collect_batch,
     delete_user_account, get_personalization_status,
+    get_slow_segments, save_segment_hardship_feedback,
 )
 from routing.speed import get_zone_key, estimate_route_time, get_default_speed
 from routing.segments import build_navigation_segments, extract_waypoints
@@ -638,6 +639,67 @@ def api_complete_navigation(
     )
     if result is None:
         raise HTTPException(404, "진행 중인 경로를 찾을 수 없거나 권한이 없습니다")
+    return result
+
+
+# ── 구간 체감 난이도 평가 (⑭' — pace = 1m당 소요시간 기준) ───────────────────
+# 안내 종료 후: pace 상위 min(10, 유효구간수) 구간에 대해 구간마다
+#   Q1 was_uncomfortable(불편했나요 예/아니오) → 예면 Q2 hardship_score(1~10점).
+# 랭킹은 complete_navigation 이 종료 시점에 미리 계산해 둔다.
+
+@app.get("/navigation/{route_id}/slow-segments")
+def api_slow_segments(
+    route_id: int,
+    db: Session = Depends(get_db),
+    decoded: dict = Depends(_verified),
+):
+    """pace 상위 구간 목록. eligible=false 면 FE 는 평가 단계를 건너뛴다."""
+    result = get_slow_segments(db, route_id, decoded["uid"])
+    if result is None:
+        raise HTTPException(404, "경로를 찾을 수 없거나 권한이 없습니다")
+    return result
+
+
+class SegmentHardshipAnswer(BaseModel):
+    seg_index:         int
+    seg_index_end:     int | None = None   # 묶은 구간의 끝 엣지 (GET 이 준 값 되싣기)
+    rank:              int
+    pace_s_per_m:      float
+    elapsed_ms:        int
+    distance_m:        float
+    slope_pct:         float
+    zone:              str | None = None
+    was_uncomfortable: bool
+    hardship_score:    int | None = None   # 예일 때만 1~10, 아니오면 null
+
+
+class SegmentHardshipRequest(BaseModel):
+    session_id: str | None = None
+    answers:    list[SegmentHardshipAnswer] = []
+
+
+@app.post("/navigation/{route_id}/segment-hardship-feedback")
+def api_segment_hardship_feedback(
+    route_id: int,
+    body: SegmentHardshipRequest,
+    db: Session = Depends(get_db),
+    decoded: dict = Depends(_verified),
+):
+    """구간 체감 난이도 응답 저장 (route_id+seg_index upsert)."""
+    for a in body.answers:
+        if a.was_uncomfortable and a.hardship_score is None:
+            raise HTTPException(400, f"seg_index={a.seg_index}: 불편함=예 이면 hardship_score(1~10) 필요")
+        if a.hardship_score is not None and not (1 <= a.hardship_score <= 10):
+            raise HTTPException(400, f"seg_index={a.seg_index}: hardship_score 는 1~10")
+    result = save_segment_hardship_feedback(
+        db,
+        route_id=route_id,
+        uid=decoded["uid"],
+        session_id=body.session_id,
+        answers=[a.model_dump() for a in body.answers],
+    )
+    if result is None:
+        raise HTTPException(404, "경로를 찾을 수 없거나 권한이 없습니다")
     return result
 
 
