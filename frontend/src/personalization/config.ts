@@ -13,11 +13,9 @@
  * BE(ando-BE/gdy/personalization-v2)가 candidateRoutes 에 type+distance 2장을
  * 항상 채우므로 코드는 준비됐다.
  *
- * ⚠️ 원래 이 플래그는 파일럿 3세션 로그 전수 검증(⑪⑫ 관문) + 라이브 BE
- * end-to-end 확인 후에 켜기로 문서에 정해뒀었는데, "경로가 하나만 뜬다"는
- * 리포트에 대응해 그 검증 없이 먼저 켠다(2026-09-03, JuYeong). 금요일 일괄
- * 재배포 전에 그 검증(특히 실제 기기에서 2~3경로가 정상적으로 뜨는지)을
- * 반드시 해보고, 문제 있으면 이 값을 다시 false로 되돌릴 것.
+ * ⚠️ 원래 파일럿 3세션 로그 검증 후 켜기로 했었으나 "경로가 하나만 뜬다" 리포트에
+ * 대응해 검증 없이 먼저 켠다(2026-09-03, JuYeong). 실기기 2~3경로 정상 확인 후
+ * 문제 있으면 false 로 되돌릴 것. (deploy 브랜치 전용 — ando-FE 는 false)
  */
 export const ROUTE_COMPARE_ENABLED = true;
 
@@ -25,17 +23,19 @@ export const ROUTE_COMPARE_ENABLED = true;
 export const ROUNDTRIP_HINT_ENABLED = true;
 
 /**
- * 신호 D — 안내 종료(별점) 후, BE 가 미리 계산해 둔 "1m당 소요시간(pace) 상위
+ * 신호 D — 안내 종료 후, BE 가 미리 계산해 둔 "1m당 소요시간(pace) 상위
  * min(10, 유효구간수)" 구간에 대해 구간마다:
  *   Q1 "소요시간 상위 구간이에요. 불편했나요?" 예/아니오
  *   Q1=예 → Q2 "힘듦 정도 1~10점"
  * 을 묻는 `SlowSegmentFeedbackScreen`. 기존 구간평가 화면(편함/보통/불편함)을 **대체**한다.
- * 저장은 수집 동의와 무관한 독립 엔드포인트(별점처럼 always-on).
+ * 저장은 수집 동의와 무관한 독립 엔드포인트(always-on).
  *
- * ⚠️ BE(ando-BE-pers) 엔드포인트 배포 전까지 false. 화면·API·라우팅 배선은
- * 전부 준비돼 있어 이 값만 켜면 붙는다.
+ * ON (2026-09-07). BE 엔드포인트(GET/POST /navigation/{id}/slow-segments,
+ * segment-hardship-feedback = ando-BE gdy/deploy-v2@b181217, Supabase 마이그레이션
+ * 3개 실행 완료)가 라이브가 아니면 화면 mount 시 GET 이 404 → 1회 재시도 후
+ * 조용히 RouteDetail 로 통과한다(크래시 없음). BE 라이브 시 자동으로 화면이 뜬다.
  */
-export const SLOW_SEGMENT_FEEDBACK_ENABLED = false;
+export const SLOW_SEGMENT_FEEDBACK_ENABLED = true;
 
 // 신호 D 엔드포인트 (BE: ando-BE-pers · 독립 · Bearer 필수 · 소유자 검증). 계약 잠금.
 export const SLOW_SEGMENTS_PATH = (routeId: number | string) =>
