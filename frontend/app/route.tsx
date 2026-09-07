@@ -55,18 +55,6 @@ export default function RoutePage() {
         return;
       }
 
-      // ⑬ 3경로 비교 화면. ROUTE_COMPARE_ENABLED=true 면 WalkContent의 "안내 시작"이
-      // goToRouteCompareIfEnabled → navigate("RouteCompare") 를 태우는데, 여기에
-      // 케이스가 없어서 아래 router.replace("/") 로 떨어져 홈으로 튕겨나갔다.
-      // push 로 열어야 비교 화면에서 뒤로가기가 경로 화면으로 돌아온다.
-      if (screenName === "RouteCompare") {
-        router.push({
-          pathname: "/route-compare",
-          params: screenParams,
-        });
-        return;
-      }
-
       router.replace("/");
     },
   };

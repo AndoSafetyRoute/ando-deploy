@@ -708,6 +708,10 @@ export default function NavigationScreen({ navigation, route }: Props) {
   const [currentLocation, setCurrentLocation] = useState<Coordinate | null>(null);
   const [locationError,   setLocationError]   = useState("");
   const [savedRouteId,    setSavedRouteId]     = useState("");
+  // setSavedRouteId 는 비동기(state)라 같은 tick 에 값을 읽는 proceedAfterNavigation
+  // 클로저에는 여전히 "" 로 잡힌다 → RouteDetail 이 빈 id 로 조회해 "경로 기록을
+  // 찾을 수 없어요" 가 떴다. 종료 핸들러가 만든 id 를 즉시 ref 로도 들고 있는다.
+  const savedRouteIdRef = useRef("");
   const [guidance, setGuidance] = useState<{ turn: string; text: string } | null>(null);
   // 안내 종료 여부 — true가 되면 지도(WebView)를 즉시 언마운트해
   // 대용량 좌표/구간 배열 참조를 바로 해제한다 (장거리 경로 종료 지연 대응)
@@ -1199,6 +1203,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
           });
 
           const newId = generateId();
+          savedRouteIdRef.current = newId;
           setSavedRouteId(newId);
           const record: RouteRecord = {
             id: newId, from, to, mode: (mode as any) ?? "walk", walkerType,
@@ -1244,7 +1249,8 @@ export default function NavigationScreen({ navigation, route }: Props) {
     routeAfterRating(navigation, {
       serverRouteId: serverRouteIdRef.current,
       routeSegments,
-      nextRouteId: savedRouteId,
+      // state(savedRouteId)는 이 tick 에 아직 "" — ref 를 우선 사용
+      nextRouteId: savedRouteIdRef.current || savedRouteId,
       sessionId: collectSessionIdRef.current ?? collectSessionRef.current?.sessionId,
     });
   };

@@ -6,7 +6,6 @@
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
-  ROUTE_COMPARE_ENABLED,
   SLOW_SEGMENT_FEEDBACK_ENABLED,
   ROUNDTRIP_HINT_ENABLED,
 } from "./config";
@@ -14,19 +13,8 @@ import { directionForSession, type WalkDirection } from "../utils/roundtripHint"
 
 type Nav = { navigate: (screen: string, params?: Record<string, any>) => void };
 
-/**
- * ⑬ — 도보 안내 시작 직전에 호출. 비교 화면을 띄웠으면 true(호출부는 return),
- * 아니면 false(호출부는 기존대로 Navigation 으로 진행).
- * PENDING_WIRE(walk-compare): WalkContent.handleStartNavigation 최상단.
- */
-export function goToRouteCompareIfEnabled(
-  navigation: Nav | undefined,
-  params: Record<string, any>,
-): boolean {
-  if (!ROUTE_COMPARE_ENABLED || !navigation) return false;
-  navigation.navigate("RouteCompare", params);
-  return true;
-}
+// ⑬ 거리우선/유형별 후보는 이제 별도 RouteCompare 화면이 아니라 도보 탭
+// "경로 선택" 시트(WalkContent)에서 바로 고른다 — goToRouteCompareIfEnabled 제거됨.
 
 /**
  * 신호 D — 만족도 입력(또는 건너뛰기) 뒤에 호출. 플래그가 켜져 있고 route_id 가

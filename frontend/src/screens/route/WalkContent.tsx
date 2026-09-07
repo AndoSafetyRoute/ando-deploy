@@ -1,4 +1,4 @@
-import React, { useState, useRef, useMemo } from 'react';
+import React, { useState, useRef, useMemo, useEffect } from 'react';
 import {
   View,
   Text,
@@ -6,52 +6,41 @@ import {
   TouchableOpacity,
   ScrollView,
   Animated,
+  ActivityIndicator,
   Dimensions,
   Platform,
 } from 'react-native';
-import { C, ZONE_COLORS } from '../../constants/colors';
+import { C } from '../../constants/colors';
 import { formatMinutes } from '../../utils/storage';
 import RouteMapView from './RouteMapView';
 import { useDraggableSheet } from './useDraggableSheet';
-import { goToRouteCompareIfEnabled } from '../../personalization/entry';
+import { requestRouteCandidates } from '../../api/routeCompare';
+import {
+  buildComparison,
+  buildRouteChoicePayload,
+  primaryKind,
+  type ShownCandidate,
+} from '../../utils/routeChoiceModel';
+import { CollectSession } from '../../utils/collectQueue';
+import { getCollectConsent } from '../../personalization/collectConsent';
+
+// 도보 탭 경로 선택에 그대로 노출되는 2개 후보 — 거리우선 / 유형별 경로.
+// 순서·색은 routeChoiceModel 의 CANDIDATE_ORDER(distance → type → personal)에 대응.
+const LANE_COLORS = [C.primary, C.success, C.warn];
+
+function fmtDistM(m: number | null | undefined) {
+  const n = Number(m);
+  if (!Number.isFinite(n)) return '거리 정보 없음';
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}km` : `${Math.round(n)}m`;
+}
+
+function fmtTimeS(s: number | null | undefined) {
+  const n = Number(s);
+  if (!Number.isFinite(n) || n <= 0) return '-';
+  return formatMinutes(Math.max(1, Math.round(n / 60)));
+}
 
 const { height: H } = Dimensions.get('window');
-
-type Coordinate = {
-  latitude: number;
-  longitude: number;
-};
-
-type ServerRoute = {
-  id: string;
-  tag: string;
-  color: string;
-  coordinates?: Coordinate[];
-  coordinateCount?: number;
-  totalDistance?: number | null;
-  totalCost?: number | null;
-  avgSlope?: number | null;
-  shortestDistance?: number | null;
-  detourRatio?: number | null;
-  algorithmAlpha?: number | null;
-};
-
-type WalkRoute = {
-  id: string;
-  tag: string;
-  tagColor: string;
-  color: string;
-  time: number;
-  distance: string;
-  steps: number;
-  badges: string[];
-  desc: string;
-  warning?: string;
-  coordinates: Coordinate[];
-  totalDistanceM: number | null;
-  avgSlope: number | null;
-  detourRatio: number | null;
-};
 
 type WalkContentProps = {
   navigation: any;
@@ -73,218 +62,6 @@ type WalkContentProps = {
   endLongitude?: string;
 };
 
-const BADGE_CONFIG: Record<
-  string,
-  { label: string; color: string; bg: string; icon: string }
-> = {
-  accessible: {
-    label: '교통약자 경로',
-    color: C.primary,
-    bg: C.primaryBg,
-    icon: '♿',
-  },
-  lowSlope: {
-    label: '완만한 경로',
-    color: C.success,
-    bg: '#E8F8F5',
-    icon: '🌿',
-  },
-  noSlope: {
-    label: '급경사 회피',
-    color: '#9C27B0',
-    bg: '#F3E5F5',
-    icon: '📐',
-  },
-  detour: {
-    label: '우회 경로',
-    color: C.warn,
-    bg: '#FFF3E0',
-    icon: '↪️',
-  },
-  shortest: {
-    label: '거리 우선',
-    color: C.route3,
-    bg: '#FFF8E6',
-    icon: '📏',
-  },
-};
-
-function getNumber(value: any): number | null {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
-}
-
-function normalizeCoordinates(raw: any): Coordinate[] {
-  if (!Array.isArray(raw)) return [];
-
-  return raw
-    .map((item: any) => {
-      if (Array.isArray(item) && item.length >= 2) {
-        return {
-          latitude: Number(item[1]),
-          longitude: Number(item[0]),
-        };
-      }
-
-      return {
-        latitude: Number(item.latitude ?? item.lat ?? item.y),
-        longitude: Number(item.longitude ?? item.lon ?? item.lng ?? item.x),
-      };
-    })
-    .filter(
-      (coord: Coordinate) =>
-        Number.isFinite(coord.latitude) && Number.isFinite(coord.longitude)
-    );
-}
-
-// 경사도 zone별 색상 구간 — 미리보기 지도에서 도보 경로를 통짜 단색이 아니라
-// navigation_segments(coord_start_idx/coord_end_idx) 기준으로 조각조각 색칠한다.
-function buildSlopeSegments(coordinates: Coordinate[], navSegments: any): import('./RouteMapView').MapRouteSegment[] {
-  if (!Array.isArray(navSegments) || coordinates.length === 0) return [];
-
-  return navSegments
-    .map((s: any) => ({
-      coordinates: coordinates.slice(s.coord_start_idx ?? 0, (s.coord_end_idx ?? 0) + 1),
-      color: ZONE_COLORS[s.zone] ?? ZONE_COLORS.flat,
-      slopeMean: s.slope_mean,
-      zone: s.zone,
-    }))
-    .filter((seg) => seg.coordinates.length >= 2);
-}
-
-function formatDistance(distanceM: number | null) {
-  if (distanceM === null) return '거리 정보 없음';
-
-  if (distanceM >= 1000) {
-    return `${(distanceM / 1000).toFixed(1)}km`;
-  }
-
-  return `${Math.round(distanceM)}m`;
-}
-
-function estimateTimeMinutes(distanceM: number | null) {
-  if (distanceM === null) return 0;
-
-  // 보행약자 기준 약 1m/s 가정
-  return Math.max(1, Math.round(distanceM / 60));
-}
-
-function estimateSteps(distanceM: number | null) {
-  if (distanceM === null) return 0;
-
-  // 평균 보폭 약 0.7m 가정
-  return Math.round(distanceM / 0.7);
-}
-
-function makeBadges(route: ServerRoute) {
-  const id = route.id;
-  const avgSlope = getNumber(route.avgSlope);
-  const detourRatio = getNumber(route.detourRatio);
-
-  const badges: string[] = ['accessible'];
-
-  if (id === 'safe') {
-    badges.push('lowSlope');
-  }
-
-  if (id === 'shortest') {
-    badges.push('shortest');
-  }
-
-  if (avgSlope !== null) {
-    badges.push('noSlope');
-  }
-
-  if (detourRatio !== null && detourRatio > 1.15) {
-    badges.push('detour');
-  }
-
-  return Array.from(new Set(badges));
-}
-
-function makeDescription(route: ServerRoute) {
-  const avgSlope = getNumber(route.avgSlope);
-  const detourRatio = getNumber(route.detourRatio);
-
-  const parts: string[] = [];
-
-  if (avgSlope !== null) {
-    parts.push(`평균 경사도 ${avgSlope.toFixed(2)}%`);
-  }
-
-  if (detourRatio !== null) {
-    parts.push(`우회율 ${detourRatio.toFixed(2)}배`);
-  }
-
-  if (parts.length > 0) {
-    return parts.join(' · ');
-  }
-
-  if (route.id === 'safe') {
-    return '경사 부담을 줄이는 방향으로 탐색한 경로입니다.';
-  }
-
-  if (route.id === 'shortest') {
-    return '이동 거리를 우선하여 탐색한 경로입니다.';
-  }
-
-  return '교통약자 이동 조건을 고려한 추천 경로입니다.';
-}
-
-function convertServerRoute(route: ServerRoute): WalkRoute {
-  const totalDistanceM = getNumber(route.totalDistance);
-  const avgSlope = getNumber(route.avgSlope);
-  const detourRatio = getNumber(route.detourRatio);
-  const coordinates = normalizeCoordinates(route.coordinates);
-
-  const distance = formatDistance(totalDistanceM);
-  const time = estimateTimeMinutes(totalDistanceM);
-  const steps = estimateSteps(totalDistanceM);
-
-  return {
-    id: route.id,
-    tag: route.tag,
-    tagColor: route.color || C.primary,
-    color: route.color || C.primary,
-    time,
-    distance,
-    steps,
-    badges: makeBadges(route),
-    desc: makeDescription(route),
-    warning:
-      coordinates.length === 0
-        ? '경로 좌표가 없어 지도에 경로를 표시할 수 없습니다.'
-        : undefined,
-    coordinates,
-    totalDistanceM,
-    avgSlope,
-    detourRatio,
-  };
-}
-
-function getRoutesFromRouteData(routeData: any): WalkRoute[] {
-  const serverRoutes = routeData?.routes;
-
-  if (!Array.isArray(serverRoutes)) {
-    return [];
-  }
-
-  return serverRoutes.map(convertServerRoute);
-}
-
-const Badge = ({ type }: { type: string }) => {
-  const cfg = BADGE_CONFIG[type];
-
-  if (!cfg) return null;
-
-  return (
-    <View style={[ss.badge, { backgroundColor: cfg.bg }]}>
-      <Text style={ss.badgeIcon}>{cfg.icon}</Text>
-      <Text style={[ss.badgeText, { color: cfg.color }]}>{cfg.label}</Text>
-    </View>
-  );
-};
-
 const StatPill = ({ icon, value }: { icon: string; value: string }) => (
   <View style={ss.statPill}>
     <Text style={ss.statPillIcon}>{icon}</Text>
@@ -292,32 +69,33 @@ const StatPill = ({ icon, value }: { icon: string; value: string }) => (
   </View>
 );
 
-const RouteCard = ({
-  route,
+// 경로 검색 다음 도보 탭에 바로 뜨는 후보 카드 — 거리우선 / 유형별 경로.
+const CompareCard = ({
+  cand,
+  color,
   selected,
   onSelect,
 }: {
-  route: WalkRoute;
+  cand: ShownCandidate;
+  color: string;
   selected: boolean;
-  onSelect: (id: string) => void;
+  onSelect: (pos: number) => void;
 }) => {
   const scaleAnim = useRef(new Animated.Value(1)).current;
+  const kind = primaryKind(cand.mergedKinds);
+  const desc =
+    kind === 'distance'
+      ? '이동 거리를 우선해 탐색한 경로예요.'
+      : kind === 'personal'
+      ? '내 이동 기록을 반영한 맞춤 경로예요.'
+      : '경사·유형별 이동 부담을 고려한 경로예요.';
 
   const handlePress = () => {
     Animated.sequence([
-      Animated.timing(scaleAnim, {
-        toValue: 0.97,
-        duration: 80,
-        useNativeDriver: true,
-      }),
-      Animated.timing(scaleAnim, {
-        toValue: 1,
-        duration: 80,
-        useNativeDriver: true,
-      }),
+      Animated.timing(scaleAnim, { toValue: 0.97, duration: 80, useNativeDriver: true }),
+      Animated.timing(scaleAnim, { toValue: 1, duration: 80, useNativeDriver: true }),
     ]).start();
-
-    onSelect(route.id);
+    onSelect(cand.shownPos);
   };
 
   return (
@@ -325,21 +103,13 @@ const RouteCard = ({
       <TouchableOpacity
         activeOpacity={0.9}
         onPress={handlePress}
-        style={[
-          ss.routeCard,
-          selected && {
-            borderColor: route.color,
-            borderWidth: 2,
-          },
-        ]}
+        style={[ss.routeCard, selected && { borderColor: color, borderWidth: 2 }]}
       >
-        <View style={[ss.routeCardBar, { backgroundColor: route.color }]} />
+        <View style={[ss.routeCardBar, { backgroundColor: color }]} />
 
         <View style={ss.routeCardHeader}>
-          <View style={[ss.routeTag, { backgroundColor: route.tagColor + '18' }]}>
-            <Text style={[ss.routeTagText, { color: route.tagColor }]}>
-              {route.tag}
-            </Text>
+          <View style={[ss.routeTag, { backgroundColor: color + '18' }]}>
+            <Text style={[ss.routeTagText, { color }]}>{cand.label}</Text>
           </View>
 
           {selected && (
@@ -349,66 +119,30 @@ const RouteCard = ({
           )}
 
           <View style={{ flex: 1 }} />
-
-          {route.warning && (
-            <View style={ss.warnChip}>
-              <Text style={ss.warnChipText}>⚠ 확인 필요</Text>
-            </View>
-          )}
         </View>
 
         <View style={ss.routeMainRow}>
           <View>
             <View style={ss.timeRow}>
-              <Text style={[ss.routeTime, { color: route.tagColor }]}>
-                {route.time > 0 ? formatMinutes(route.time) : '-'}
+              <Text style={[ss.routeTime, { color }]}>
+                {fmtTimeS(cand.route.estimatedTimeS)}
               </Text>
             </View>
-
-            <Text style={ss.routeDesc}>{route.desc}</Text>
+            <Text style={ss.routeDesc}>{desc}</Text>
           </View>
 
           <View style={ss.routeStats}>
-            <StatPill icon="📏" value={route.distance} />
+            <StatPill icon="📏" value={fmtDistM(cand.route.totalDistance)} />
             <StatPill
-              icon="👟"
-              value={
-                route.steps > 0
-                  ? `${route.steps.toLocaleString()}걸음`
-                  : '걸음 정보 없음'
-              }
+              icon="⛰️"
+              value={`평균 경사 ${Number(cand.route.avgSlope ?? 0).toFixed(1)}%`}
             />
           </View>
         </View>
-
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          style={ss.badgesScroll}
-        >
-          {route.badges.map((b) => (
-            <Badge key={b} type={b} />
-          ))}
-        </ScrollView>
-
-        {route.warning && (
-          <View style={ss.warningBox}>
-            <Text style={ss.warningText}>{route.warning}</Text>
-          </View>
-        )}
       </TouchableOpacity>
     </Animated.View>
   );
 };
-
-const EmptyRouteCard = () => (
-  <View style={ss.emptyCard}>
-    <Text style={ss.emptyTitle}>경로 정보를 불러오지 못했습니다</Text>
-    <Text style={ss.emptyText}>
-      출발지와 도착지를 다시 설정한 뒤 길찾기를 실행해 주세요.
-    </Text>
-  </View>
-);
 
 export default function WalkContent({
   navigation,
@@ -427,40 +161,96 @@ export default function WalkContent({
   endLatitude,
   endLongitude,
 }: WalkContentProps) {
-  const routes = useMemo(() => getRoutesFromRouteData(routeData), [routeData]);
-
-  const initialRouteId = routes[0]?.id ?? '';
-  const [selectedRoute, setSelectedRoute] = useState(initialRouteId);
-
   const [containerHeight, setContainerHeight] = useState(H);
 
-  const selectedRouteObj =
-    routes.find((route) => route.id === selectedRoute) ?? routes[0];
+  // 예전엔 "안내 시작" → 별도 RouteCompare 화면에서 거리우선/유형별을 골랐다.
+  // 이제 그 2개 후보를 도보 탭 "경로 선택" 시트에 바로 띄우고, 고르면 곧장 안내로 간다.
+  const [shown, setShown] = useState<ShownCandidate[]>([]);
+  const [selectedPos, setSelectedPos] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [reloadKey, setReloadKey] = useState(0);
 
-  const selectedRouteId = selectedRouteObj?.id ?? '';
+  // 경로 선택 계측 세션(동의 시에만 생성 — 미동의면 전부 no-op).
+  const collectRef = useRef<CollectSession | null>(null);
 
-  // 선택된 경로에만 경사도 색상 구간을 붙인다 — routeData 최상위 navigation_segments는
-  // BE가 계산한 단일 최적 경로 기준이라 selectedRouteObj와 좌표 배열이 같다.
-  const slopeSegments = useMemo(
-    () => buildSlopeSegments(selectedRouteObj?.coordinates ?? [], routeData?.navigation_segments),
-    [selectedRouteObj, routeData]
+  const hasCoords =
+    !!startLatitude && !!startLongitude && !!endLatitude && !!endLongitude;
+
+  useEffect(() => {
+    let alive = true;
+
+    (async () => {
+      setLoading(true);
+      setError('');
+
+      try {
+        const consent = await getCollectConsent();
+        if (alive && consent === 'granted' && !collectRef.current) {
+          collectRef.current = new CollectSession();
+        }
+      } catch {
+        /* 동의 확인 실패 시 수집 안 함(보수적 기본값) */
+      }
+
+      if (!hasCoords) {
+        if (alive) {
+          setError('출발지·도착지 좌표가 없어 경로를 불러올 수 없습니다.');
+          setLoading(false);
+        }
+        return;
+      }
+
+      try {
+        const res = await requestRouteCandidates({
+          startLatitude: startLatitude!,
+          startLongitude: startLongitude!,
+          endLatitude: endLatitude!,
+          endLongitude: endLongitude!,
+          userType: walkerType || 'manual_wheelchair',
+        });
+        if (!alive) return;
+        const { shown: s } = buildComparison(res.candidateRoutes);
+        setShown(s);
+        setSelectedPos(0);
+      } catch (e: any) {
+        if (alive) setError(e?.message ?? '경로를 불러오지 못했습니다.');
+      } finally {
+        if (alive) setLoading(false);
+      }
+    })();
+
+    return () => {
+      alive = false;
+    };
+  }, [startLatitude, startLongitude, endLatitude, endLongitude, walkerType, reloadKey]);
+
+  // 화면을 완전히 떠날 때 계측 세션 정리(빈 배치는 안 나감).
+  useEffect(
+    () => () => {
+      void collectRef.current?.flush({ final: true });
+      collectRef.current = null;
+    },
+    []
   );
 
-  // 매 렌더마다 새 배열을 만들면 RouteMapView의 지도가 계속 재생성되어 깜빡이고
-  // 줌 상태가 초기화된다. routes가 실제로 바뀔 때만 새로 만든다.
+  const selectedCand = shown[selectedPos] ?? shown[0];
+  const selectedId = selectedCand ? String(selectedCand.shownPos) : '';
+
+  // routes가 실제로 바뀔 때만 새 배열을 만든다(지도 깜빡임/줌 초기화 방지).
   const mapRoutes = useMemo(
-    () => routes.map((r) => ({
-      id: r.id,
-      color: r.color,
-      coordinates: r.coordinates,
-      segments: r.id === selectedRouteId ? slopeSegments : undefined,
-    })),
-    [routes, selectedRouteId, slopeSegments]
+    () =>
+      shown.map((s) => ({
+        id: String(s.shownPos),
+        color: LANE_COLORS[s.shownPos] ?? C.primary,
+        coordinates: (s.route.coordinates ?? []).map(([lng, lat]) => ({
+          latitude: lat,
+          longitude: lng,
+        })),
+      })),
+    [shown]
   );
 
-  // 전체 화면 높이(H) 기준으로 잡으면 상단 헤더/카드들 때문에 확대 시 화면 밖으로
-  // 넘쳐 "확대가 안 되는" 것처럼 보인다. 실제 렌더된 컨테이너 높이 기준으로, 손잡이를
-  // 드래그하면 실시간으로 따라오게 한다.
   const { sheetExpanded, sheetHeight, toggleSheet, panHandlers } = useDraggableSheet(
     containerHeight,
     0.38,
@@ -468,18 +258,27 @@ export default function WalkContent({
   );
 
   const handleStartNavigation = () => {
-    if (!selectedRouteObj) return;
+    if (!selectedCand) return;
 
-    // ⑬ 3경로 비교 화면이 켜져 있으면(ROUTE_COMPARE_ENABLED) 그쪽으로 보내고 종료.
-    // 꺼져 있으면 false 를 돌려주므로 아래 기존 흐름 그대로 (대중교통 도보 무관).
-    if (goToRouteCompareIfEnabled(navigation, {
-      from, to, walkerType,
-      startName, startAddress, startLatitude, startLongitude,
-      endName, endAddress, endLatitude, endLongitude,
-    })) return;
+    // 경로 선택 로그(동의 시에만). 후보가 1개뿐이면 "비교 없음"으로 남긴다.
+    const cs = collectRef.current;
+    if (cs) {
+      try {
+        cs.setRouteChoice(
+          buildRouteChoicePayload(shown, shown.length > 1 ? selectedCand : null)
+        );
+        cs.flush().catch(() => {});
+      } catch {
+        /* 로깅 실패는 안내 흐름을 막지 않는다 */
+      }
+    }
+    const sessionId = cs?.sessionId;
+    collectRef.current = null; // 아래 navigate 로 언마운트 → cleanup 의 flush 중복 방지
+
+    const color = LANE_COLORS[selectedCand.shownPos] ?? C.primary;
 
     navigation?.navigate('Navigation', {
-      routeId: selectedRouteObj.id,
+      routeId: primaryKind(selectedCand.mergedKinds),
       mode: 'walk',
       from,
       to,
@@ -495,20 +294,20 @@ export default function WalkContent({
       endLatitude,
       endLongitude,
 
-      routeData: JSON.stringify({
-        ...routeData,
-        selectedRouteId: selectedRouteObj.id,
-        selectedRouteTag: selectedRouteObj.tag,
-        selectedRouteTitle: selectedRouteObj.desc,
-        selectedRouteColor: selectedRouteObj.color,
-        coordinates: selectedRouteObj.coordinates,
+      collectSessionId: sessionId,
 
-        routeSegments:
-          routeData?.routes?.find((r: any) => r.id === selectedRouteObj.id)
-            ?.routeSegments ?? [],
-        totalDistance: selectedRouteObj.totalDistanceM,
-        avgSlope: selectedRouteObj.avgSlope,
-        detourRatio: selectedRouteObj.detourRatio,
+      routeData: JSON.stringify({
+        coordinates: selectedCand.route.coordinates,
+        routeSegments: selectedCand.route.routeSegments,
+        navigation_segments: selectedCand.route.navigation_segments ?? [],
+        waypoints: selectedCand.route.waypoints ?? [],
+        totalDistance: selectedCand.route.totalDistance,
+        avgSlope: selectedCand.route.avgSlope,
+        estimatedTimeS: selectedCand.route.estimatedTimeS,
+        selectedRouteId: String(selectedCand.shownPos),
+        selectedRouteTag: selectedCand.label,
+        selectedRouteTitle: selectedCand.label,
+        selectedRouteColor: color,
       }),
     });
   };
@@ -520,7 +319,7 @@ export default function WalkContent({
     >
       <RouteMapView
         routes={mapRoutes}
-        selectedRouteId={selectedRouteId}
+        selectedRouteId={selectedId}
         startLabel={from}
         endLabel={to}
         showSlopeMarkers={showSlopeMarkers}
@@ -533,7 +332,9 @@ export default function WalkContent({
 
           <View style={ss.sheetTitleRow}>
             <Text style={ss.sheetTitle}>경로 선택</Text>
-            <Text style={ss.sheetSubtitle}>{routes.length}개 경로 안내</Text>
+            <Text style={ss.sheetSubtitle}>
+              {loading ? '불러오는 중' : `${shown.length}개 경로 안내`}
+            </Text>
             <View style={{ flex: 1 }} />
             <Text style={ss.sheetExpandIcon}>{sheetExpanded ? '▼' : '▲'}</Text>
           </View>
@@ -544,15 +345,34 @@ export default function WalkContent({
           contentContainerStyle={ss.sheetScrollContent}
           showsVerticalScrollIndicator={false}
         >
-          {routes.length === 0 ? (
-            <EmptyRouteCard />
+          {loading ? (
+            <View style={ss.emptyCard}>
+              <ActivityIndicator color={C.primary} />
+              <Text style={[ss.emptyText, { marginTop: 12 }]}>
+                거리우선·유형별 경로를 불러오는 중이에요.
+              </Text>
+            </View>
+          ) : error || shown.length === 0 ? (
+            <View style={ss.emptyCard}>
+              <Text style={ss.emptyTitle}>경로를 불러오지 못했습니다</Text>
+              <Text style={ss.emptyText}>
+                {error || '표시할 경로가 없습니다. 잠시 후 다시 시도해 주세요.'}
+              </Text>
+              <TouchableOpacity
+                style={ss.retryBtn}
+                onPress={() => setReloadKey((k) => k + 1)}
+              >
+                <Text style={ss.retryBtnText}>다시 시도</Text>
+              </TouchableOpacity>
+            </View>
           ) : (
-            routes.map((route) => (
-              <RouteCard
-                key={route.id}
-                route={route}
-                selected={selectedRouteId === route.id}
-                onSelect={setSelectedRoute}
+            shown.map((cand) => (
+              <CompareCard
+                key={cand.shownPos}
+                cand={cand}
+                color={LANE_COLORS[cand.shownPos] ?? C.primary}
+                selected={selectedPos === cand.shownPos}
+                onSelect={setSelectedPos}
               />
             ))
           )}
@@ -563,18 +383,15 @@ export default function WalkContent({
 
       <View style={ss.startBtnWrap}>
         <TouchableOpacity
-          style={[
-            ss.startBtn,
-            !selectedRouteObj && ss.startBtnDisabled,
-          ]}
+          style={[ss.startBtn, !selectedCand && ss.startBtnDisabled]}
           activeOpacity={0.85}
-          disabled={!selectedRouteObj}
+          disabled={!selectedCand}
           onPress={handleStartNavigation}
         >
           <Text style={ss.startBtnIcon}>🚶</Text>
           <Text style={ss.startBtnText}>
-            {selectedRouteObj
-              ? `${selectedRouteObj.tag} 경로로 안내 시작`
+            {selectedCand
+              ? `${selectedCand.label} 안내 시작`
               : '경로를 선택할 수 없습니다'}
           </Text>
           <Text style={ss.startBtnArrow}>→</Text>
@@ -1001,6 +818,22 @@ const ss = StyleSheet.create({
     color: C.textSub,
     textAlign: 'center',
     lineHeight: 19,
+  },
+
+  retryBtn: {
+    marginTop: 14,
+    paddingHorizontal: 18,
+    paddingVertical: 9,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: C.border,
+    backgroundColor: C.bg,
+  },
+
+  retryBtnText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: C.navy,
   },
 
   startBtnWrap: {

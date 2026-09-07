@@ -1,0 +1,45 @@
+{
+  "cli": {
+    "version": ">= 12.0.0",
+    "appVersionSource": "local"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "android": { "buildType": "apk" },
+      "env": {
+        "EXPO_PUBLIC_ROUTE_API_URL": "http://REPLACE_WITH_TEAM_BACKEND:5000",
+        "EXPO_PUBLIC_KAKAO_JAVASCRIPT_KEY": "e98652aedb788ce4093dd6ea4bc2eeb1",
+        "EXPO_PUBLIC_KAKAO_REST_API_KEY": "fe887ce01b8078527b283d15aa85ea20",
+        "EXPO_PUBLIC_SUPABASE_URL": "https://olacebhnmpchudtlalqa.supabase.co",
+        "EXPO_PUBLIC_SUPABASE_ANON_KEY": "sb_publishable_YKSONKzoI3Lc-mOsn_o2ag_8BRGomEa"
+      }
+    },
+    "preview": {
+      "distribution": "internal",
+      "android": { "buildType": "apk" },
+      "env": {
+        "EXPO_PUBLIC_ROUTE_API_URL": "http://REPLACE_WITH_TEAM_BACKEND:5000",
+        "EXPO_PUBLIC_KAKAO_JAVASCRIPT_KEY": "e98652aedb788ce4093dd6ea4bc2eeb1",
+        "EXPO_PUBLIC_KAKAO_REST_API_KEY": "fe887ce01b8078527b283d15aa85ea20",
+        "EXPO_PUBLIC_SUPABASE_URL": "https://olacebhnmpchudtlalqa.supabase.co",
+        "EXPO_PUBLIC_SUPABASE_ANON_KEY": "sb_publishable_YKSONKzoI3Lc-mOsn_o2ag_8BRGomEa"
+      }
+    },
+    "production": {
+      "autoIncrement": true,
+      "android": { "buildType": "app-bundle" },
+      "env": {
+        "EXPO_PUBLIC_ROUTE_API_URL": "http://REPLACE_WITH_TEAM_BACKEND:5000",
+        "EXPO_PUBLIC_KAKAO_JAVASCRIPT_KEY": "e98652aedb788ce4093dd6ea4bc2eeb1",
+        "EXPO_PUBLIC_KAKAO_REST_API_KEY": "fe887ce01b8078527b283d15aa85ea20",
+        "EXPO_PUBLIC_SUPABASE_URL": "https://olacebhnmpchudtlalqa.supabase.co",
+        "EXPO_PUBLIC_SUPABASE_ANON_KEY": "sb_publishable_YKSONKzoI3Lc-mOsn_o2ag_8BRGomEa"
+      }
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}

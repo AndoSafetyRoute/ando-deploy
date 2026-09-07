@@ -43,8 +43,8 @@ export const CANDIDATE_ORDER: CandidateRoute["kind"][] = ["distance", "type", "p
 
 /** 화면에 그대로 노출되는 설명적 라벨. */
 export const CANDIDATE_LABELS: Record<CandidateRoute["kind"], string> = {
-  distance: "거리 우선",
-  type:     "유형별 추천",
+  distance: "거리우선",
+  type:     "유형별 경로",
   personal: "사용자 맞춤형",
 };
 

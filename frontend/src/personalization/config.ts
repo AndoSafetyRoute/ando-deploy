@@ -9,15 +9,11 @@
 
 // ── 기능 플래그 ──────────────────────────────────────────────────────────────
 /**
- * ⑬ 3경로 비교 화면을 도보 경로 흐름에 넣는다.
- * BE(ando-BE/gdy/personalization-v2)가 candidateRoutes 에 type+distance 2장을
- * 항상 채우므로 코드는 준비됐다.
- *
- * ⚠️ 원래 파일럿 3세션 로그 검증 후 켜기로 했었으나 "경로가 하나만 뜬다" 리포트에
- * 대응해 검증 없이 먼저 켠다(2026-09-03, JuYeong). 실기기 2~3경로 정상 확인 후
- * 문제 있으면 false 로 되돌릴 것. (deploy 브랜치 전용 — ando-FE 는 false)
+ * @deprecated 별도 3경로 비교 화면(RouteCompareScreen)은 제거됨. 거리우선/유형별
+ * 후보는 도보 탭 "경로 선택" 시트(WalkContent)가 requestRouteCandidates 로 직접
+ * 불러와 2장으로 보여준다. 이 플래그는 더 이상 참조되지 않는다.
  */
-export const ROUTE_COMPARE_ENABLED = true;
+export const ROUTE_COMPARE_ENABLED = false;
 
 /** ⑮ 안내 시작 시 왕복·방향 교대 안내 배너를 띄운다. BE 무관 — 활성. */
 export const ROUNDTRIP_HINT_ENABLED = true;
