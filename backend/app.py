@@ -43,6 +43,7 @@ from firebase import verify_token, delete_firebase_user
 from subway import get_facility_db, SubwayFacilityDB
 from subway.facility import get_station_chargers
 from lowfloor_bus import get_lowfloor_info
+import bus_arrival
 
 G = None
 _spatial_index = None
@@ -1388,6 +1389,30 @@ def api_bus_lowfloor(
     if info is None:
         raise HTTPException(404, f"'{route_no}' 노선의 저상버스 정보를 찾을 수 없습니다")
     return info
+
+
+@app.get("/bus/arrival")
+def api_bus_arrival(
+    route:            str        = Query(..., description="버스 번호 (카카오 vehicles[].name, 예: 402)"),
+    stop:             str | None = Query(None, description="승차 정류소명 (카카오 stops[].name)"),
+    ars_id:           str | None = Query(None, description="정류소 고유번호(5자리). 있으면 이름보다 우선"),
+    bus_route_id:     str | None = Query(None, description="busRouteId 를 이미 알면 직접 전달(노선명 조회 생략)"),
+    walk_remaining_s: float | None = Query(None, description="승차 정류소까지 남은 도보 시간(초) — 놓칠 위험 계산용"),
+):
+    """
+    서울시 버스도착정보 실시간 (공공데이터포털 서비스, 키는 서버에만 보관).
+
+    항상 200 + dict 를 돌려준다. 키 미설정·노선ID 미해결·정류소 미매칭·운행중 버스
+    없음 등은 `available:false` + `reason` 으로 표현 — FE 는 그 경우 실시간 배지를
+    숨기고 정적(카카오) 시간을 유지한다(graceful degradation).
+    """
+    return bus_arrival.arrival_for_boarding(
+        route_name=route,
+        stop_name=stop,
+        ars_id=ars_id,
+        bus_route_id=bus_route_id,
+        walk_remaining_s=walk_remaining_s,
+    )
 
 
 # ── 유틸 ──────────────────────────────────────────────────────────────────────

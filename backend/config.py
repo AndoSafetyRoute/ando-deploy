@@ -53,6 +53,13 @@ LOWFLOOR_BUS_XLSX = os.environ.get(
 # → openapi.seoul.go.kr 키(SEOUL_ELEVATOR_KEY 등)와 다른 별도 발급 필요. 현재 미사용.
 SEOUL_REALTIME_KEY = os.environ.get("SEOUL_REALTIME_KEY", "")
 
+# 서울시 버스도착정보 실시간 (공공데이터포털 '서울특별시_버스도착정보조회 서비스',
+# ws.bus.go.kr/api/rest/arrive/*). 노선명→busRouteId 변환은 '서울특별시_노선정보조회
+# 서비스'가 추가로 활용신청돼 있어야 동적 가능 → 그 경우 BUS_ROUTE_INFO_ENABLED=1.
+# bus_arrival.py 참고. 키 없으면 실시간 배지는 자동으로 숨겨진다(정적 시간 유지).
+BUS_ARRIVAL_KEY        = os.environ.get("BUS_ARRIVAL_KEY", "")
+BUS_ROUTE_INFO_ENABLED = os.environ.get("BUS_ROUTE_INFO_ENABLED", "") == "1"
+
 # ── 라우팅 파라미터 ───────────────────────────────────────────────────────────
 FLAT_THRESHOLD    = 0.5    # elevation 차이 이 미만 → 평지 (%)
 STDDEV_THRESHOLD  = 1.0    # slope1_stddev 기준값
