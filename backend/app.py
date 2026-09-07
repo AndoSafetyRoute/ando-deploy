@@ -173,6 +173,162 @@ def _candidate_segs(raw_segments: list, user_type: str) -> list:
     return out
 
 
+def _seoul_leg_segs(raw_segments: list, user_type: str) -> list:
+    """CCH 결과 segment → FE 형식 (start/end 좌표 포함, outside_seoul=False)."""
+    out = []
+    for s in raw_segments:
+        sp = s.get("slope_pct", 0.0)
+        ln = s.get("length_m", 0.0)
+        dr = s.get("direction", "flat")
+        u, v = s.get("u"), s.get("v")
+        ul = G.nodes[u]["lon"] if (u is not None and u in G.nodes) else None
+        ula = G.nodes[u]["lat"] if (u is not None and u in G.nodes) else None
+        vl = G.nodes[v]["lon"] if (v is not None and v in G.nodes) else None
+        vla = G.nodes[v]["lat"] if (v is not None and v in G.nodes) else None
+        out.append({
+            "name":      s.get("name", ""),
+            "direction": dr,
+            "slope_pct": round(sp, 2),
+            "length_m":  round(ln, 1),
+            "zone":      classify_zone(sp, dr, user_type),
+            "coords":    [[ul, ula], [vl, vla]],
+            "start":     {"latitude": ula, "longitude": ul},
+            "end":       {"latitude": vla, "longitude": vl},
+            "slope":     round(sp, 2),
+            "length":    round(ln, 1),
+            "outside_seoul": False,
+        })
+    return out
+
+
+def _seoul_leg_route(o: tuple, d: tuple, user_type: str, seoul_mode: str):
+    """서울 안 두 점 사이 leg. seoul_mode: 'type'|'shortest'. → (coords, result) | None."""
+    try:
+        if _cch is not None:
+            r = (_cch.find_distance_route(o, d) if seoul_mode == "shortest"
+                 else _cch.find_route(o, d, user_type))
+        else:
+            r = find_route(G, o, d, user_type, "auto", mode="accessibility")
+    except Exception as e:
+        print(f"[hybrid] 서울 leg 실패 ({seoul_mode}): {e}")
+        return None
+    try:
+        coords = [[G.nodes[n]["lon"], G.nodes[n]["lat"]] for n in r["path_nodes"]]
+    except Exception:
+        return None
+    return coords, r
+
+
+def _hybrid_walk_response(origin: tuple, dest: tuple, user_type: str,
+                          o_in: bool, d_in: bool) -> dict | None:
+    """
+    출발/도착 중 하나 이상이 서울 밖일 때: 에러 대신 하이브리드 경로.
+      서울 안 구간 = CCH(유형별 또는 최단),  서울 밖 구간 = 직선(경사 데이터 없음).
+    도보 선택지 2개를 routes[]로 돌려준다:
+      routes[0] 유형별+최단(밖) / routes[1] 최단+최단(밖).
+    실패(서울 leg 조회 불가 등) 시 None → 호출측이 기존 흐름으로 폴백.
+    """
+    try:
+        from routing.seoul_bounds import is_in_seoul
+        from routing.geo_leg import boundary_attach, densify, straight_leg_segments, path_length_m
+    except Exception as e:
+        print(f"[hybrid] 모듈 로드 실패: {e}")
+        return None
+
+    def build(seoul_mode: str):
+        if o_in and not d_in:
+            attach = boundary_attach(origin, dest, is_in_seoul)
+            leg = _seoul_leg_route(tuple(origin), tuple(attach), user_type, seoul_mode)
+            if leg is None:
+                return None
+            s_coords, s_r = leg
+            ext = densify(tuple(s_coords[-1]), tuple(dest))
+            coords = s_coords + ext[1:]
+            segs = _seoul_leg_segs(s_r["segments"], user_type) + straight_leg_segments(ext)
+            seoul_nodes = s_r["path_nodes"]
+        elif d_in and not o_in:
+            attach = boundary_attach(dest, origin, is_in_seoul)
+            leg = _seoul_leg_route(tuple(attach), tuple(dest), user_type, seoul_mode)
+            if leg is None:
+                return None
+            s_coords, s_r = leg
+            ext = densify(tuple(origin), tuple(s_coords[0]))
+            coords = ext[:-1] + s_coords
+            segs = straight_leg_segments(ext) + _seoul_leg_segs(s_r["segments"], user_type)
+            seoul_nodes = s_r["path_nodes"]
+        else:
+            # 둘 다 서울 밖 → 전 구간 직선 (중간이 서울을 지나도 단순화)
+            ext = densify(tuple(origin), tuple(dest))
+            coords, segs, seoul_nodes = ext, straight_leg_segments(ext), None
+
+        total_m = round(path_length_m(coords), 1)
+        sloped = [s for s in segs if s.get("slope_pct") is not None]
+        sloped_len = sum(s["length_m"] for s in sloped)
+        avg_slope = (round(sum(abs(s["slope_pct"]) * s["length_m"] for s in sloped) / sloped_len, 2)
+                     if sloped_len > 0 else 0.0)
+        ext_len = round(sum(s["length_m"] for s in segs if s.get("outside_seoul")), 1)
+        est_s = estimate_route_time(segs, user_type, {})
+        return {
+            "coords": coords, "segs": segs, "total_m": total_m, "avg_slope": avg_slope,
+            "ext_len": ext_len, "est_s": est_s, "seoul_nodes": seoul_nodes,
+        }
+
+    opt_type  = build("type")
+    opt_short = build("shortest")
+    if opt_type is None and opt_short is None:
+        return None
+    primary = opt_type or opt_short
+
+    routes = []
+    for rid, tag, color, opt in (
+        ("accessibility", USER_TYPES[user_type]["label"], "#3DBFA8", opt_type),
+        ("shortest",      "최단",                          "#8A8FA3", opt_short),
+    ):
+        if opt is None:
+            continue
+        routes.append({
+            "id":             rid,
+            "tag":            tag,
+            "color":          color,
+            "coordinates":    opt["coords"],
+            "totalDistance":  opt["total_m"],
+            "avgSlope":       opt["avg_slope"],
+            "routeSegments":  opt["segs"],
+            "estimatedTimeS": opt["est_s"],
+            "hasExternalLeg": opt["ext_len"] > 0,
+            "externalLengthM": opt["ext_len"],
+        })
+
+    # 서울 구간 GPS 안내(navigation_segments/waypoints)는 primary 의 서울 부분만
+    nav_json: list = []
+    if primary["seoul_nodes"] and len(primary["seoul_nodes"]) >= 2:
+        try:
+            nav_json, _ = _nav_segs_and_waypoints(primary["seoul_nodes"], user_type)
+        except Exception as e:
+            print(f"[hybrid] nav_segs 생성 실패(무시): {e}")
+
+    return {
+        "routes":         routes,
+        "coordinates":    primary["coords"],
+        "routeSegments":  primary["segs"],
+        "segments":       primary["segs"],
+        "total_length_m": primary["total_m"],
+        "avg_slope_pct":  primary["avg_slope"],
+        "estimatedTimeS": primary["est_s"],
+        "estimated_time_min": round(primary["est_s"] / 60.0, 1),
+        "navigation_segments": nav_json,
+        "waypoints":      [],
+        "algorithm":      "hybrid",
+        "service_area": {
+            "origin_in_seoul": o_in,
+            "dest_in_seoul":   d_in,
+            "partial_coverage": True,
+            "external_length_m": primary["ext_len"],
+            "note": "서울 밖 구간은 경사 데이터가 없어 최단(직선) 안내만 제공됩니다.",
+        },
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global G, _spatial_index, _cch, _personal_cache, _subway_db, _waypoints_set
@@ -869,6 +1025,23 @@ def api_route(
             except Exception as e:
                 print(f"[NAV] 역 출구 스냅 실패 → 원래 좌표 사용: {e}")
         prof.mark("station_snap")
+
+        # ── 서울 경계 밖 처리 (Task 2) — 에러/CoverageError 대신 하이브리드 최단경로 ──
+        # 출발·도착이 모두 서울 안이면 이 분기는 아무것도 안 하고 지나간다(기존 흐름
+        # 100% 불변). 하나라도 서울 밖이면: 서울 구간은 CCH(유형별/최단), 서울 밖은
+        # 직선(경사 데이터 없음)으로 이어 붙여 도보 후보 2개를 돌려준다.
+        if body.mode == "accessibility" and body.candidates != "compare":
+            try:
+                from routing.seoul_bounds import is_in_seoul
+                _o_in = is_in_seoul(origin[0], origin[1])
+                _d_in = is_in_seoul(dest[0], dest[1])
+            except Exception:
+                _o_in = _d_in = True
+            if not (_o_in and _d_in):
+                _hybrid = _hybrid_walk_response(origin, dest, body.user_type, _o_in, _d_in)
+                if _hybrid is not None:
+                    return _hybrid
+                # 하이브리드도 실패 → 아래 기존 흐름으로 떨어져 결국 CoverageError 처리
 
         # CCH 우선 (서울 전역 그래프), fallback → NetworkX
         if _cch is not None and body.mode == "accessibility":
