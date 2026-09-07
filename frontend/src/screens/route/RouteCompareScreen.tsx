@@ -224,7 +224,7 @@ export default function RouteCompareScreen({ navigation, route }: Props) {
           );
         })}
 
-        {/* 2026-09 (release_v3): 테스트 데이터 적용 전까지 제공 경로를 2종으로 축소한다
+        {/* release_v4: 테스트 데이터 적용 전까지 제공 경로를 2종으로 축소한다
             — ① 거리 우선, ② 유형별 경계 점수 반영. "사용자 맞춤형" 비활성 자리표시
             카드는 이 버전에서 노출하지 않는다(⑨ 배치 학습/테스트 데이터가 들어오면
             BE 가 personal 후보를 다시 채우고 buildComparison 이 알아서 3번째 카드를
@@ -261,12 +261,9 @@ const ss = StyleSheet.create({
   list: { flexGrow: 0, paddingHorizontal: 12, marginTop: 4 },
   card: { flexDirection: "row", alignItems: "center", gap: 12, backgroundColor: C.white, borderRadius: 12, padding: 14, marginTop: 8, borderWidth: 1.5, borderColor: "transparent" },
   cardOn: { borderColor: C.primary, backgroundColor: C.primaryBg },
-  cardDisabled: { backgroundColor: C.bg, opacity: 0.75 },
   dot: { width: 12, height: 12, borderRadius: 6 },
   cardLabel: { fontSize: 15, fontWeight: "700", color: C.text },
-  cardLabelDisabled: { color: C.textMute },
   cardMeta: { fontSize: 12.5, color: C.textSub, marginTop: 3 },
-  lockIcon: { fontSize: 15, marginLeft: 4 },
   radio: { width: 20, height: 20, borderRadius: 10, borderWidth: 2, borderColor: C.border, alignItems: "center", justifyContent: "center" },
   radioOn: { borderColor: C.primary },
   radioInner: { width: 10, height: 10, borderRadius: 5, backgroundColor: C.primary },

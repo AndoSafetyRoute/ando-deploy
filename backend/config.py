@@ -85,6 +85,7 @@ class CoverageError(ValueError):
     """
     code = "out_of_service_area"
 
+
 # ── 개인화 코스트 커브 기저함수 (ando_dev_final.md 7.1/7.3절) ─────────────────
 # c_u(g) 를 15개 3차 B-spline 기저함수로 표현.
 #

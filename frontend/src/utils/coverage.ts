@@ -23,8 +23,6 @@ export function isWithinSlopeDataCoverage(
   );
 }
 
-export const SLOPE_DATA_WARNING = "❗서울 이외의 지역에는 경사도 반영이 되지 않습니다.";
-
 // 서울 밖은 경사도뿐 아니라 라우팅 그래프 자체가 없어(경사도가 그래프 GeoJSON에
 // 함께 구워져 있음) 거리 우선 경로도 계산할 수 없다 — 그래서 "경사도 미반영"이
 // 아니라 아예 미지원 지역으로 안내하고 길찾기를 막는다. (BE도 out_of_service_area
