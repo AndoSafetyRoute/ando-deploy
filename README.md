@@ -38,8 +38,37 @@ git에 커밋하지 않았습니다:
 
 ## 이번 버전 (release_v4)
 
-release_v3에 실사용 버그수정 2건 + 경로 로직 정리 + UI 수정을 더한 버전입니다.
+release_v3에 실사용 버그수정 2건 + 경로 로직 정리 + UI 수정 + (추가분) 최단경로
+CCH 단독화·계측 + 비밀번호 재설정을 더한 버전입니다.
 release_v3는 그대로 남겨뒀으니, 이번 버전에 문제가 생기면 release_v3로 되돌릴 수 있습니다.
+
+### 최단경로 CCH 단독화 + 계측 (추가분)
+- **순수 최단거리(경로④) CCH 편입**: `backend/routing/cch_engine.py`에
+  `find_shortest_route()` 추가 — alpha=0, `metric_dist` 직접(급경사 배제 필터도 없는
+  진짜 최단). 기존 `find_distance_route()`(급경사 배제 최단, 경로②)와 구분한다.
+- **유형 우회율 계측**: `/route?candidates=compare` 응답에 `routingComparison` 필드
+  추가 — `detour.type_vs_shortest` = 유형별 경로 길이 ÷ 순수 최단거리. 요청당
+  `[ROUTECMP]` 로그 1줄. 6유형 일괄 측정은 `backend/scripts/detour_probe.py`.
+  `candidateRoutes`(선택 로그용 배열)는 건드리지 않는다.
+- **엔진 대조 — 평가 전용**: NetworkX Dijkstra 순수 최단은 `backend/routing/pathfinder.py`
+  `shortest_route_nx()` (탐색 자원 계측: settled 노드·완화 엣지·peak heap). **배포
+  기본 비활성**(`SHORTEST_NX_MAX_KM=0`), 벤치마크 시에만 `SHORTEST_NX_MAX_KM=50` 등으로
+  서버를 띄워 켠다. CCH vs NX 비교표는 `backend/scripts/shortest_bench.py`.
+  실측(서울 전역 170만 노드): CCH 쿼리 ~5–12ms(거리 무관), NX Dijkstra는 거리에
+  비례해 60ms~6.4s — 2.7km 구간 약 100배, 17.8km 구간 약 875배 차이. 경로 길이차
+  0.1~0.5%(CCH가 `length_m×1000` 정수 가중치).
+- **FE**: `frontend/src/screens/route/RouteCompareScreen.tsx`에 `__DEV__` 한정
+  "최단경로 비교" 패널 + 지도에 최단경로 2종(주황=CCH, 보라=NetworkX) 겹쳐 그리기.
+  프로덕션 사용자에겐 안 보인다.
+
+### 비밀번호 재설정 (추가분)
+- 로그인 화면에 "비밀번호를 잊으셨나요?" 링크 + `frontend/app/FindAccountScreen.tsx`
+  신규. Firebase `sendPasswordResetEmail`로 재설정 메일 발송. Google 로그인 전용
+  계정(비밀번호 없음)은 안내 문구로 처리.
+- 아이디(가입 여부) 확인 기능은 `ando-auth-db`의 이메일 열거 방지(Email Enumeration
+  Protection) 정책 처리 방향이 확정되면 후속으로 합류.
+- Firebase Android 앱 서명 SHA-1 지문은 콘솔에서 등록 완료된 상태 —
+  `frontend/google-services.json`의 기존 지문(`5e8f1606…`)과 일치, 코드 변경 없음.
 
 ### 버그수정
 - **도보 "안내 시작" → 홈으로 튕기던 문제**: `ROUTE_COMPARE_ENABLED=true`에서

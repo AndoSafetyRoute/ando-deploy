@@ -1,6 +1,9 @@
 """
 경로 탐색 — A* / Dijkstra + 우회 제한 이진탐색
 """
+import heapq
+import time
+
 import networkx as nx
 
 from config import MAX_DETOUR_RATIO, FLAT_THRESHOLD, COVERAGE_SNAP_MAX_M, CoverageError
@@ -80,6 +83,106 @@ def recalculate_path_slopes(G: nx.DiGraph, path_nodes: list) -> list:
         segments.append(seg)
 
     return segments
+
+
+def shortest_route_nx(
+    G:             nx.DiGraph,
+    origin_lonlat: tuple,
+    dest_lonlat:   tuple,
+) -> dict:
+    """
+    순수 거리 최단경로 — 계측용 자체 Dijkstra.
+
+    find_route(mode='shortest') 와 결과는 같지만 두 가지가 다르다:
+      1. set_edge_weights() 로 그래프 전체(서울: 엣지 350만개)를 매번 다시 쓰지
+         않는다 — length_m 를 가중치로 직접 읽는다. (그 3~8초짜리 그래프 mutation
+         은 이 코드베이스 특성이지 최단경로 알고리즘 비용이 아니므로 비교에서 제외)
+      2. 탐색 자원량을 센다: settled 노드 수, relax(엣지 완화) 횟수, heap push 수,
+         peak heap 크기. CCH 쿼리(수백 노드 방문)와 대비하기 위한 값.
+
+    반환 dict: path_nodes / segments / total_length_m / avg_slope_pct + 계측값.
+    """
+    dest_node, dd = nearest_node(G, *dest_lonlat)
+    origin_node   = best_origin_node(G, origin_lonlat, dest_node)
+    od = haversine(origin_lonlat[0], origin_lonlat[1],
+                   G.nodes[origin_node]["lon"], G.nodes[origin_node]["lat"])
+    if od > COVERAGE_SNAP_MAX_M or dd > COVERAGE_SNAP_MAX_M:
+        raise CoverageError(
+            f"서비스 커버리지 밖입니다 (출발 스냅 {od:.0f}m / 도착 스냅 {dd:.0f}m, "
+            f"허용 {COVERAGE_SNAP_MAX_M:.0f}m)"
+        )
+
+    if origin_node == dest_node:
+        raise ValueError("출발지와 목적지가 동일한 노드입니다.")
+
+    t0 = time.perf_counter()
+    dist  = {origin_node: 0.0}
+    prev  = {}
+    done  = set()
+    pq    = [(0.0, origin_node)]
+    n_settled = n_relax = n_push = 0
+    peak_heap = 1
+
+    while pq:
+        d, u = heapq.heappop(pq)
+        if u in done:
+            continue
+        done.add(u)
+        n_settled += 1
+        if u == dest_node:
+            break
+        for v, edata in G[u].items():
+            n_relax += 1
+            w  = edata.get("length_m", 1.0)
+            nd = d + w
+            if nd < dist.get(v, float("inf")):
+                dist[v] = nd
+                prev[v] = u
+                heapq.heappush(pq, (nd, v))
+                n_push += 1
+                if len(pq) > peak_heap:
+                    peak_heap = len(pq)
+
+    query_ms = (time.perf_counter() - t0) * 1000.0
+
+    if dest_node not in prev:
+        raise ValueError("경로를 찾을 수 없습니다.")
+
+    path_nodes = [dest_node]
+    while path_nodes[-1] != origin_node:
+        path_nodes.append(prev[path_nodes[-1]])
+    path_nodes.reverse()
+
+    segments  = recalculate_path_slopes(G, path_nodes)
+    total_len = sum(s["length_m"] for s in segments)
+    avg_slope = (
+        sum(abs(s["slope_pct"]) * s["length_m"] for s in segments) / total_len
+        if total_len > 0 else 0.0
+    )
+
+    print(f"[NX] 순수최단 완료 {query_ms/1000:.3f}s  "
+          f"settled={n_settled:,}  relax={n_relax:,}  노드={len(path_nodes)}")
+
+    return {
+        "algorithm":      "nx-dijkstra-shortest",
+        "origin_node":    origin_node,
+        "dest_node":      dest_node,
+        "path_nodes":     path_nodes,
+        "segments":       segments,
+        "total_length_m": total_len,
+        "total_cost":     total_len,
+        "avg_slope_pct":  avg_slope,
+        "user_label":     "최단거리(NetworkX)",
+        "used_alpha":     0.0,
+        # ── 계측 ──
+        "query_ms":         round(query_ms, 3),
+        "nodes_settled":    n_settled,
+        "edges_relaxed":    n_relax,
+        "heap_pushes":      n_push,
+        "peak_heap":        peak_heap,
+        "graph_nodes":      G.number_of_nodes(),
+        "path_node_count":  len(path_nodes),
+    }
 
 
 def find_route(

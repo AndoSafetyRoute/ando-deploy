@@ -17,7 +17,7 @@ import { View, Text, StyleSheet, TouchableOpacity, ActivityIndicator, ScrollView
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { C } from "../../constants/colors";
 import RouteMapView, { type MapRoute } from "./RouteMapView";
-import { requestRouteCandidates } from "../../api/routeCompare";
+import { requestRouteCandidates, type RoutingComparison, type DebugRoute } from "../../api/routeCompare";
 import {
   buildComparison,
   buildRouteChoicePayload,
@@ -57,6 +57,55 @@ function fmtTime(s: number) {
   return `약 ${min}분`;
 }
 
+// ── __DEV__ 전용: 최단경로 2종(CCH vs NetworkX) 계측 패널 ──────────────────────
+function DebugPanel({
+  cmp, open, onToggle,
+}: { cmp: RoutingComparison; open: boolean; onToggle: () => void }) {
+  const sc: any = cmp.shortest_cch ?? {};
+  const sn: any = cmp.shortest_nx ?? {};
+  const ec = cmp.engine_compare;
+  const dt = cmp.detour;
+  const Row = ({ k, v }: { k: string; v: React.ReactNode }) => (
+    <View style={ss.dbgRow}><Text style={ss.dbgK}>{k}</Text><Text style={ss.dbgV}>{v}</Text></View>
+  );
+  return (
+    <View style={ss.dbg}>
+      <TouchableOpacity onPress={onToggle} activeOpacity={0.7}>
+        <Text style={ss.dbgTitle}>{open ? "▾" : "▸"} 최단경로 비교 (DEV)</Text>
+      </TouchableOpacity>
+      {open && (
+        <View style={{ marginTop: 6 }}>
+          {dt && (
+            <>
+              <Row k="유형 우회율 (type ÷ 최단CCH)" v={`${dt.type_vs_shortest?.toFixed(3)}x`} />
+              {dt.safe_distance_vs_shortest != null && (
+                <Row k="급경사배제 우회율 (distance ÷ 최단)" v={`${dt.safe_distance_vs_shortest.toFixed(3)}x`} />
+              )}
+              <Row k="순수 최단거리 (CCH)" v={`${Math.round(dt.base_length_m)}m`} />
+            </>
+          )}
+          <View style={ss.dbgHr} />
+          <Row k="CCH 쿼리" v={"query_ms" in sc ? `${sc.query_ms}ms · path ${sc.path_nodes}노드` : (sc.error ?? "-")} />
+          <Row k="NetworkX 쿼리" v={
+            "query_ms" in sn
+              ? `${sn.query_ms}ms · settled ${sn.nodes_settled?.toLocaleString()} · relax ${sn.edges_relaxed?.toLocaleString()} · heap↑${sn.peak_heap?.toLocaleString()}`
+              : (sn.skipped ?? sn.error ?? "-")
+          } />
+          {ec && (
+            <>
+              <View style={ss.dbgHr} />
+              <Row k="속도차 (NX ÷ CCH)" v={`${ec.speedup_x}x 느림`} />
+              <Row k="탐색량 (NX settled ÷ CCH path)" v={ec.settled_vs_pathnodes_x != null ? `${ec.settled_vs_pathnodes_x}x` : "-"} />
+              <Row k="경로 동일" v={ec.paths_identical ? "예" : `아니오 (Δ${ec.length_delta_m}m)`} />
+            </>
+          )}
+          {cmp.od_straight_m != null && <Row k="직선거리" v={`${Math.round(cmp.od_straight_m)}m`} />}
+        </View>
+      )}
+    </View>
+  );
+}
+
 export default function RouteCompareScreen({ navigation, route }: Props) {
   const p = route?.params ?? {};
   const insets = useSafeAreaInsets();
@@ -65,6 +114,10 @@ export default function RouteCompareScreen({ navigation, route }: Props) {
   const [error, setError] = useState("");
   const [shown, setShown] = useState<ShownCandidate[]>([]);
   const [selectedPos, setSelectedPos] = useState<number | null>(null);
+  // __DEV__ 디버그 전용 — 최단경로 2종 비교 계측값 + 지도에 겹쳐 그릴 좌표.
+  const [routingCmp, setRoutingCmp] = useState<RoutingComparison | null>(null);
+  const [debugRoutes, setDebugRoutes] = useState<DebugRoute[]>([]);
+  const [showDebug, setShowDebug] = useState(true);
 
   // 화면 진입 시 계측 세션을 연다 — 선택 로그와 이후 안내 계측이 같은 session_id 를 공유한다.
   // 동의 전엔 세션 자체를 안 만든다(이하 collectRef.current?. 호출은 전부 안전하게 no-op) —
@@ -91,6 +144,10 @@ export default function RouteCompareScreen({ navigation, route }: Props) {
         const { shown: s } = buildComparison(res.candidateRoutes);
         setShown(s);
         setSelectedPos(s.length === 1 ? 0 : null);
+        if (__DEV__) {
+          setRoutingCmp(res.routingComparison ?? null);
+          setDebugRoutes(res.debugRoutes ?? []);
+        }
       } catch (e: any) {
         if (alive) setError(e?.message ?? "경로를 불러오지 못했습니다.");
       } finally {
@@ -106,13 +163,22 @@ export default function RouteCompareScreen({ navigation, route }: Props) {
   }, []);
 
   const mapRoutes: MapRoute[] = useMemo(
-    () =>
-      shown.map((s) => ({
+    () => [
+      ...shown.map((s) => ({
         id: String(s.shownPos),
         color: LANE_COLORS[s.shownPos] ?? C.primary,
         coordinates: (s.route.coordinates ?? []).map(([lng, lat]) => ({ latitude: lat, longitude: lng })),
       })),
-    [shown],
+      // __DEV__: 최단경로 2종(CCH 주황 / NetworkX 보라)을 지도에 겹쳐 그린다.
+      ...(__DEV__
+        ? debugRoutes.map((d) => ({
+            id: `dbg-${d.kind}`,
+            color: d.color,
+            coordinates: (d.coordinates ?? []).map(([lng, lat]) => ({ latitude: lat, longitude: lng })),
+          }))
+        : []),
+    ],
+    [shown, debugRoutes],
   );
 
   const proceed = () => {
@@ -231,6 +297,10 @@ export default function RouteCompareScreen({ navigation, route }: Props) {
             만든다 — 그때 이 자리표시 UI 복원 여부를 다시 판단). */}
       </ScrollView>
 
+      {__DEV__ && routingCmp && (
+        <DebugPanel cmp={routingCmp} open={showDebug} onToggle={() => setShowDebug((v) => !v)} />
+      )}
+
       <TouchableOpacity
         style={[ss.cta, selectedPos === null && ss.ctaOff, { marginBottom: insets.bottom + 12 }]}
         disabled={selectedPos === null}
@@ -267,6 +337,13 @@ const ss = StyleSheet.create({
   radio: { width: 20, height: 20, borderRadius: 10, borderWidth: 2, borderColor: C.border, alignItems: "center", justifyContent: "center" },
   radioOn: { borderColor: C.primary },
   radioInner: { width: 10, height: 10, borderRadius: 5, backgroundColor: C.primary },
+
+  dbg: { marginHorizontal: 12, marginTop: 4, marginBottom: 6, padding: 10, borderRadius: 10, backgroundColor: "#1B0F4A0D", borderWidth: 1, borderColor: C.border },
+  dbgTitle: { fontSize: 12, fontWeight: "800", color: C.navy },
+  dbgRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", paddingVertical: 2, gap: 10 },
+  dbgK: { fontSize: 11, color: C.textSub, flexShrink: 1 },
+  dbgV: { fontSize: 11, color: C.text, fontWeight: "700", textAlign: "right", flexShrink: 1 },
+  dbgHr: { height: 1, backgroundColor: C.border, marginVertical: 4 },
 
   cta: { backgroundColor: C.primary, marginHorizontal: 16, borderRadius: 14, paddingVertical: 15, alignItems: "center" },
   ctaOff: { backgroundColor: C.primaryLight },

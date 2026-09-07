@@ -17,11 +17,38 @@ import {
   CANDIDATE_ROUTES_FIELD,
 } from "../personalization/config";
 
+// 시각화되지 않는 계측값 — 최단경로 2종(CCH/NetworkX) 비교 + 유형 우회율.
+// candidates=compare 일 때만 채워진다. FE 는 __DEV__ 디버그 패널에서만 읽는다.
+export type RoutingComparison = {
+  od_straight_m?: number;
+  type?:         { engine: string; length_m: number; avgSlope: number; query_ms: number; used_alpha: number | null; path_nodes: number };
+  shortest_cch?: { engine: string; length_m: number; avgSlope: number; query_ms: number; total_ms: number; path_nodes: number } | { error: string };
+  shortest_nx?:  { engine: string; length_m: number; avgSlope: number; query_ms: number; nodes_settled: number; edges_relaxed: number; heap_pushes: number; peak_heap: number; graph_nodes: number; path_nodes: number } | { skipped: string } | { error: string };
+  detour?:       { base: string; base_length_m: number; type_vs_shortest: number; safe_distance_vs_shortest?: number };
+  engine_compare?: {
+    cch_query_ms: number; nx_query_ms: number; speedup_x: number;
+    paths_identical: boolean; length_delta_m: number;
+    cch_path_nodes: number; nx_nodes_settled: number; nx_edges_relaxed: number;
+    settled_vs_pathnodes_x: number | null;
+  };
+};
+
+export type DebugRoute = {
+  kind: "shortest_cch" | "shortest_nx";
+  label: string;
+  color: string;
+  coordinates: [number, number][];
+  totalDistance: number;
+  avgSlope: number;
+};
+
 export type RouteCompareResponse = {
   // 기존 /route single 응답 필드도 그대로 옴(단일 경로). 여기선 비교에 필요한 것만 명시.
   coordinates?:   [number, number][];
   routeSegments?: any[];
   candidateRoutes: CandidateRoute[];
+  routingComparison?: RoutingComparison;
+  debugRoutes?: DebugRoute[];
 };
 
 export async function requestRouteCandidates(params: {

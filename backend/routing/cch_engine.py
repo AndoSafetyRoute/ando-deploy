@@ -280,6 +280,57 @@ class CCHEngine:
             "used_alpha":     0.0,
         }
 
+    def find_shortest_route(self, origin_lonlat: tuple, dest_lonlat: tuple) -> dict:
+        """
+        경로④ "순수 최단거리" — alpha=0, metric_dist 직접 사용.
+        find_distance_route()(=metric_dist_safe, 급경사 배제)와 달리 안전 필터도
+        없는 진짜 최단거리다. 유형 점수에 의한 우회 정도(우회율)를 재는 분모,
+        그리고 NetworkX Dijkstra 최단경로와의 알고리즘 효율 비교용.
+
+        반환 dict 에 계측값(query_ms / total_ms / path_node_count)을 함께 담는다.
+        """
+        t0 = time.perf_counter()
+
+        src_id = self._nearest_id(*origin_lonlat)
+        dst_id = self._nearest_id(*dest_lonlat)
+        if src_id == dst_id:
+            raise ValueError("출발지와 목적지가 동일한 노드입니다.")
+
+        tq = time.perf_counter()
+        path_nodes = self._query(self.metric_dist, src_id, dst_id)
+        query_ms = (time.perf_counter() - tq) * 1000.0
+        if path_nodes is None:
+            raise ValueError("경로를 찾을 수 없습니다.")
+
+        G = self.G
+        segments = recalculate_path_slopes(G, path_nodes)
+        total_len = sum(s["length_m"] for s in segments)
+        avg_slope = (
+            sum(abs(s["slope_pct"]) * s["length_m"] for s in segments) / total_len
+            if total_len > 0 else 0.0
+        )
+
+        total_ms = (time.perf_counter() - t0) * 1000.0
+        print(f"[CCH] 순수최단 완료 {total_ms/1000:.3f}s  "
+              f"쿼리={query_ms:.1f}ms  노드={len(path_nodes)}")
+
+        return {
+            "algorithm":      "cch-shortest",
+            "origin_node":    self.node_list[src_id],
+            "dest_node":      self.node_list[dst_id],
+            "path_nodes":     path_nodes,
+            "segments":       segments,
+            "total_length_m": total_len,
+            "total_cost":     total_len,
+            "avg_slope_pct":  avg_slope,
+            "user_label":     "최단거리(CCH)",
+            "used_alpha":     0.0,
+            # ── 계측 ──
+            "query_ms":        round(query_ms, 3),
+            "total_ms":        round(total_ms, 3),
+            "path_node_count": len(path_nodes),
+        }
+
     def find_route_with_metric(self, origin_lonlat: tuple, dest_lonlat: tuple,
                                 metric, label: str, kind: str) -> dict:
         """

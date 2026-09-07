@@ -146,6 +146,14 @@ export default function LoginScreen() {
           <Text style={styles.loginBtnText}>이메일로 로그인</Text>
         </TouchableOpacity>
 
+        {/* 비밀번호 재설정 링크 */}
+        <TouchableOpacity
+          style={styles.findLink}
+          onPress={() => router.push('/FindAccountScreen')}
+        >
+          <Text style={styles.findLinkText}>비밀번호를 잊으셨나요?</Text>
+        </TouchableOpacity>
+
         {/* 회원가입 링크 */}
         <TouchableOpacity
           style={styles.signupLink}
@@ -247,8 +255,17 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '700',
   },
+  findLink: {
+    marginTop: 20,
+    alignItems: 'center',
+  },
+  findLinkText: {
+    color: TEXT_GRAY,
+    fontSize: 14,
+    textDecorationLine: 'underline',
+  },
   signupLink: {
-    marginTop: 24,
+    marginTop: 14,
     alignItems: 'center',
   },
   signupLinkText: {

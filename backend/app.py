@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from config import GEOJSON_PATH, CoverageError
-from routing import build_graph, find_route, USER_TYPES, classify_zone, precompute_edge_costs
+from routing import build_graph, find_route, USER_TYPES, classify_zone, precompute_edge_costs, shortest_route_nx
 from routing.search import build_spatial_index
 from routing.cch_engine import build_cch_engine, CCHEngine
 from routing.personal_cache import PersonalMetricCache
@@ -35,6 +35,7 @@ from database import (
 )
 from routing.speed import get_zone_key, estimate_route_time, get_default_speed
 from routing.segments import build_navigation_segments, extract_waypoints
+from routing.graph import haversine
 from routing.voice_guidance import calculate_bearing, get_turn_direction, generate_guidance_text
 from routing.travel_time import estimate_route_time as estimate_nav_time
 from firebase import verify_token, delete_firebase_user
@@ -1087,6 +1088,140 @@ def api_route(
             prof.mark("personal_cand")
 
             response["candidateRoutes"] = candidate_routes
+
+            # ── 최단경로 2종 비교 (CCH vs NetworkX) + 유형 우회율 계측 ──────────
+            # candidateRoutes(선택 로그용)는 건드리지 않고, 별도 필드로만 싣는다.
+            #   routingComparison : 시각화 안 되는 계측값(소요시간·탐색 자원·우회율)
+            #   debugRoutes       : 지도에 겹쳐 그릴 최단경로 2종 좌표
+            try:
+                marks = dict(prof.marks)
+                rc: dict = {
+                    "od_straight_m": round(haversine(*origin, *dest), 1),
+                    "type": {
+                        "engine":    "cch",
+                        "length_m":  total_length_m,
+                        "avgSlope":  avg_slope_pct,
+                        "query_ms":  round(marks.get("find_route", 0.0), 1),
+                        "used_alpha": result.get("used_alpha"),
+                        "path_nodes": len(result["path_nodes"]),
+                    },
+                }
+                debug_routes: list = []
+
+                # (c) CCH 순수 최단 (alpha=0, metric_dist)
+                sc = None
+                if _cch is not None:
+                    try:
+                        sc = _cch.find_shortest_route(origin, dest)
+                        rc["shortest_cch"] = {
+                            "engine":     "cch",
+                            "length_m":   round(sc["total_length_m"], 1),
+                            "avgSlope":   round(sc["avg_slope_pct"], 2),
+                            "query_ms":   sc["query_ms"],
+                            "total_ms":   sc["total_ms"],
+                            "path_nodes": sc["path_node_count"],
+                        }
+                        debug_routes.append({
+                            "kind":          "shortest_cch",
+                            "label":         "최단거리(CCH)",
+                            "color":         "#F4A100",
+                            "coordinates":   [[G.nodes[n]["lon"], G.nodes[n]["lat"]]
+                                              for n in sc["path_nodes"]],
+                            "totalDistance": round(sc["total_length_m"], 1),
+                            "avgSlope":      round(sc["avg_slope_pct"], 2),
+                        })
+                    except Exception as e:
+                        rc["shortest_cch"] = {"error": str(e)}
+
+                # (b) NetworkX 순수 최단 (Dijkstra, weight=length_m) — 평가 전용.
+                #     배포 라우팅은 CCH 단독(위 shortest_cch)이고, NetworkX 는
+                #     "CCH 대비 얼마나 느린가"를 재는 대조군일 뿐이다. 서울 전역
+                #     그래프에서 장거리 Dijkstra 는 수 초~수십 초 걸려 응답을 막으므로
+                #     기본값 SHORTEST_NX_MAX_KM=0 (완전 비활성). 벤치마크 시에만
+                #     scripts/shortest_bench.py 안내대로 SHORTEST_NX_MAX_KM=50 등으로
+                #     서버를 띄워 켠다.
+                nx_cap_km = float(os.environ.get("SHORTEST_NX_MAX_KM", "0"))
+                if nx_cap_km <= 0 or rc["od_straight_m"] > nx_cap_km * 1000:
+                    rc["shortest_nx"] = {
+                        "skipped": ("배포 기본 비활성 (SHORTEST_NX_MAX_KM=0)"
+                                    if nx_cap_km <= 0 else
+                                    f"직선거리 {rc['od_straight_m']/1000:.1f}km > "
+                                    f"{nx_cap_km:.0f}km (NX Dijkstra 스킵)")
+                    }
+                else:
+                    try:
+                        sn = shortest_route_nx(G, origin, dest)
+                        rc["shortest_nx"] = {
+                            "engine":         "nx-dijkstra",
+                            "length_m":       round(sn["total_length_m"], 1),
+                            "avgSlope":       round(sn["avg_slope_pct"], 2),
+                            "query_ms":       sn["query_ms"],
+                            "nodes_settled":  sn["nodes_settled"],
+                            "edges_relaxed":  sn["edges_relaxed"],
+                            "heap_pushes":    sn["heap_pushes"],
+                            "peak_heap":      sn["peak_heap"],
+                            "graph_nodes":    sn["graph_nodes"],
+                            "path_nodes":     sn["path_node_count"],
+                        }
+                        debug_routes.append({
+                            "kind":          "shortest_nx",
+                            "label":         "최단거리(NetworkX)",
+                            "color":         "#8E44EC",
+                            "coordinates":   [[G.nodes[n]["lon"], G.nodes[n]["lat"]]
+                                              for n in sn["path_nodes"]],
+                            "totalDistance": round(sn["total_length_m"], 1),
+                            "avgSlope":      round(sn["avg_slope_pct"], 2),
+                        })
+                    except Exception as e:
+                        rc["shortest_nx"] = {"error": str(e)}
+                prof.mark("shortest_bench")
+
+                # 우회율 — 순수 최단(CCH) 기준
+                base_len = None
+                if sc is not None:
+                    base_len = sc["total_length_m"]
+                if base_len and base_len > 0:
+                    rc["detour"] = {
+                        "base": "shortest_cch",
+                        "base_length_m": round(base_len, 1),
+                        # 유형 점수(경사비용)에 의한 우회율
+                        "type_vs_shortest": round(total_length_m / base_len, 4),
+                    }
+                    # distance 후보(급경사 배제 최단)도 있으면 함께
+                    dcand = next((c for c in candidate_routes if c["kind"] == "distance"), None)
+                    if dcand:
+                        rc["detour"]["safe_distance_vs_shortest"] = round(
+                            dcand["totalDistance"] / base_len, 4
+                        )
+
+                # 엔진 효율 비교 (둘 다 성공했을 때만)
+                if (isinstance(rc.get("shortest_cch"), dict) and "query_ms" in rc["shortest_cch"]
+                        and isinstance(rc.get("shortest_nx"), dict) and "query_ms" in rc["shortest_nx"]):
+                    cch_ms = rc["shortest_cch"]["query_ms"] or 0.001
+                    nx_ms  = rc["shortest_nx"]["query_ms"]
+                    cch_visits = rc["shortest_cch"]["path_nodes"]
+                    nx_settled = rc["shortest_nx"]["nodes_settled"]
+                    rc["engine_compare"] = {
+                        "cch_query_ms":  rc["shortest_cch"]["query_ms"],
+                        "nx_query_ms":   nx_ms,
+                        "speedup_x":     round(nx_ms / cch_ms, 1),
+                        "paths_identical": (sc is not None and sn is not None
+                                            and sc["path_nodes"] == sn["path_nodes"]),
+                        "length_delta_m": (round(rc["shortest_nx"]["length_m"]
+                                                 - rc["shortest_cch"]["length_m"], 1)),
+                        "cch_path_nodes": cch_visits,
+                        "nx_nodes_settled": nx_settled,
+                        "nx_edges_relaxed": rc["shortest_nx"]["edges_relaxed"],
+                        "settled_vs_pathnodes_x": (round(nx_settled / cch_visits, 1)
+                                                   if cch_visits else None),
+                    }
+
+                response["routingComparison"] = rc
+                if debug_routes:
+                    response["debugRoutes"] = debug_routes
+                print(f"[ROUTECMP] {rc}")
+            except Exception as e:
+                print(f"[ROUTECMP] 최단경로 비교 실패 (무시): {e}")
 
         prof.done(
             nodes=len(result["path_nodes"]),
