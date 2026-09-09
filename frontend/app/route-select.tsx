@@ -4,20 +4,18 @@ import {
   Text,
   TouchableOpacity,
   StyleSheet,
-  SafeAreaView,
   Platform,
   Alert,
   ActivityIndicator,
   ScrollView,
-  Linking,
 } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { router, useLocalSearchParams } from "expo-router";
-import * as Location from "expo-location";
-import { requestRoute, RouteApiError } from "../src/api/routeApi";
-import { getUserType, toApiUserType } from "../src/utils/storage";
-import { isWithinSlopeDataCoverage, OUT_OF_SERVICE_AREA_MESSAGE } from "../src/utils/coverage";
 import { goHome } from "../src/utils/navigation";
+import { requestRoute } from "../src/api/routeApi";
+import { getUserType, toApiUserType } from "../src/utils/storage";
+import { isWithinSlopeDataCoverage, SLOPE_DATA_WARNING } from "../src/utils/coverage";
 
 const NAVY = "#1B0F4A";
 const LIGHT_GRAY = "#F1F2F6";
@@ -25,35 +23,14 @@ const BORDER_GRAY = "#E4E5EA";
 const TEXT_GRAY = "#666666";
 const BUTTON_GRAY = "#9D9696";
 
-const KAKAO_REST_API_KEY = process.env.EXPO_PUBLIC_KAKAO_REST_API_KEY;
-
 function getParam(value: string | string[] | undefined, fallback = "") {
   if (Array.isArray(value)) return value[0] ?? fallback;
   return value ?? fallback;
 }
 
-// 좌표 → 주소 문자열. 실패해도 좌표 자체는 이미 있으니 "현재 위치"로 표시만
-// 하고 계속 진행한다(주소 못 붙여도 출발지로 쓰는 데는 지장 없음).
-async function reverseGeocode(lat: number, lon: number): Promise<string | null> {
-  try {
-    const res = await fetch(
-      `https://dapi.kakao.com/v2/local/geo/coord2address.json?x=${lon}&y=${lat}`,
-      { headers: { Authorization: `KakaoAK ${KAKAO_REST_API_KEY}` } },
-    );
-    if (!res.ok) return null;
-    const json = await res.json();
-    const doc = json.documents?.[0];
-    return doc?.road_address?.address_name || doc?.address?.address_name || null;
-  } catch {
-    return null;
-  }
-}
-
 export default function RouteSelectScreen() {
   const params = useLocalSearchParams();
   const [loading, setLoading] = useState(false);
-  const [locating, setLocating] = useState(false);
-  const [locatingEnd, setLocatingEnd] = useState(false);
 
   const startName = getParam(params.startName);
   const startAddress = getParam(params.startAddress);
@@ -67,14 +44,11 @@ export default function RouteSelectScreen() {
 
   const hasStart = !!startName && !!startLatitude && !!startLongitude;
   const hasEnd = !!endName && !!endLatitude && !!endLongitude;
+  const canStartRoute = hasStart && hasEnd && !loading;
 
-  // 서울 밖 좌표: 경사도뿐 아니라 라우팅 그래프 자체가 없어 거리 우선 경로도
-  // 못 만든다 → 안내 문구만 띄우고 길찾기 시작을 막는다(에러 팝업 대신).
   const outOfCoverage =
     (hasStart && !isWithinSlopeDataCoverage(startLatitude, startLongitude)) ||
     (hasEnd && !isWithinSlopeDataCoverage(endLatitude, endLongitude));
-
-  const canStartRoute = hasStart && hasEnd && !loading && !outOfCoverage;
 
   const moveToSearchForStart = () => {
     router.push({
@@ -93,134 +67,6 @@ export default function RouteSelectScreen() {
         endLongitude,
       },
     });
-  };
-
-  // "현재 위치" 버튼 — 검색 화면으로 안 보내고 바로 GPS를 찍어 출발지로 채운다.
-  const useCurrentLocationAsStart = async () => {
-    try {
-      setLocating(true);
-
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== "granted") {
-        Alert.alert("위치 권한 필요", "현재 위치를 출발지로 쓰려면 위치 권한을 허용해주세요.");
-        return;
-      }
-
-      const providerStatus = await Location.getProviderStatusAsync();
-      if (!providerStatus.locationServicesEnabled) {
-        Alert.alert(
-          "위치 서비스 꺼짐",
-          "설정에서 위치 서비스를 켜주세요.",
-          [
-            { text: "설정 열기", onPress: () => Linking.openSettings() },
-            { text: "취소", style: "cancel" },
-          ]
-        );
-        return;
-      }
-
-      let coords: { latitude: number; longitude: number } | null = null;
-      try {
-        const loc: any = await Promise.race([
-          Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 5000)),
-        ]);
-        coords = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
-      } catch {
-        const last = await Location.getLastKnownPositionAsync({});
-        if (last) coords = { latitude: last.coords.latitude, longitude: last.coords.longitude };
-      }
-
-      if (!coords) {
-        Alert.alert("위치를 가져올 수 없습니다", "실외로 이동한 후 다시 시도해주세요.");
-        return;
-      }
-
-      const address = await reverseGeocode(coords.latitude, coords.longitude);
-
-      router.replace({
-        pathname: "/route-select",
-        params: {
-          startName: "현재 위치",
-          startAddress: address ?? "",
-          startLatitude: String(coords.latitude),
-          startLongitude: String(coords.longitude),
-
-          endName,
-          endAddress,
-          endLatitude,
-          endLongitude,
-        },
-      });
-    } catch (err: any) {
-      Alert.alert("위치를 가져올 수 없습니다", err?.message ?? "잠시 후 다시 시도해주세요.");
-    } finally {
-      setLocating(false);
-    }
-  };
-
-  // 출발지 GPS 버튼과 동일 — 도착지를 현재 위치로 채운다(3-2: 실효성 있어 도착지에도 적용).
-  const useCurrentLocationAsEnd = async () => {
-    try {
-      setLocatingEnd(true);
-
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== "granted") {
-        Alert.alert("위치 권한 필요", "현재 위치를 도착지로 쓰려면 위치 권한을 허용해주세요.");
-        return;
-      }
-
-      const providerStatus = await Location.getProviderStatusAsync();
-      if (!providerStatus.locationServicesEnabled) {
-        Alert.alert(
-          "위치 서비스 꺼짐",
-          "설정에서 위치 서비스를 켜주세요.",
-          [
-            { text: "설정 열기", onPress: () => Linking.openSettings() },
-            { text: "취소", style: "cancel" },
-          ]
-        );
-        return;
-      }
-
-      let coords: { latitude: number; longitude: number } | null = null;
-      try {
-        const loc: any = await Promise.race([
-          Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 5000)),
-        ]);
-        coords = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
-      } catch {
-        const last = await Location.getLastKnownPositionAsync({});
-        if (last) coords = { latitude: last.coords.latitude, longitude: last.coords.longitude };
-      }
-
-      if (!coords) {
-        Alert.alert("위치를 가져올 수 없습니다", "실외로 이동한 후 다시 시도해주세요.");
-        return;
-      }
-
-      const address = await reverseGeocode(coords.latitude, coords.longitude);
-
-      router.replace({
-        pathname: "/route-select",
-        params: {
-          startName,
-          startAddress,
-          startLatitude,
-          startLongitude,
-
-          endName: "현재 위치",
-          endAddress: address ?? "",
-          endLatitude: String(coords.latitude),
-          endLongitude: String(coords.longitude),
-        },
-      });
-    } catch (err: any) {
-      Alert.alert("위치를 가져올 수 없습니다", err?.message ?? "잠시 후 다시 시도해주세요.");
-    } finally {
-      setLocatingEnd(false);
-    }
   };
 
   const moveToSearchForEnd = () => {
@@ -245,11 +91,6 @@ export default function RouteSelectScreen() {
   const handleStartRoute = async () => {
     if (!hasStart || !hasEnd) {
       Alert.alert("경로 설정 필요", "출발지와 도착지를 모두 입력해주세요.");
-      return;
-    }
-
-    if (outOfCoverage) {
-      Alert.alert("서비스 지역이 아닙니다", OUT_OF_SERVICE_AREA_MESSAGE);
       return;
     }
 
@@ -288,16 +129,10 @@ export default function RouteSelectScreen() {
       });
     } catch (error) {
       console.log("route api error:", error);
-      if (error instanceof RouteApiError && error.code === "out_of_service_area") {
-        // bbox 사전 검사를 통과했지만(대략치) 실제 그래프 범위 밖인 경우 —
-        // 스크리한 실패 팝업 대신 같은 안내 문구로 처리한다.
-        Alert.alert("서비스 지역이 아닙니다", OUT_OF_SERVICE_AREA_MESSAGE);
-      } else {
-        Alert.alert(
-          "경로 탐색 실패",
-          "백엔드 경로 탐색 중 오류가 발생했습니다. 서버 주소와 실행 상태를 확인해주세요."
-        );
-      }
+      Alert.alert(
+        "경로 탐색 실패",
+        "백엔드 경로 탐색 중 오류가 발생했습니다. 서버 주소와 실행 상태를 확인해주세요."
+      );
     } finally {
       setLoading(false);
     }
@@ -380,28 +215,14 @@ export default function RouteSelectScreen() {
             )}
           </View>
 
-          <View style={styles.startButtonGroup}>
-            <TouchableOpacity
-              style={[styles.smallButton, styles.currentLocationButton]}
-              onPress={useCurrentLocationAsStart}
-              disabled={locating}
-            >
-              {locating ? (
-                <ActivityIndicator size="small" color={NAVY} />
-              ) : (
-                <Ionicons name="locate" size={18} color={NAVY} />
-              )}
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.smallButton}
-              onPress={moveToSearchForStart}
-            >
-              <Text style={styles.smallButtonText}>
-                {hasStart ? "변경" : "입력"}
-              </Text>
-            </TouchableOpacity>
-          </View>
+          <TouchableOpacity
+            style={styles.smallButton}
+            onPress={moveToSearchForStart}
+          >
+            <Text style={styles.smallButtonText}>
+              {hasStart ? "변경" : "입력"}
+            </Text>
+          </TouchableOpacity>
         </View>
 
         <View style={styles.verticalLine} />
@@ -428,35 +249,21 @@ export default function RouteSelectScreen() {
             )}
           </View>
 
-          <View style={styles.startButtonGroup}>
-            <TouchableOpacity
-              style={[styles.smallButton, styles.currentLocationButton]}
-              onPress={useCurrentLocationAsEnd}
-              disabled={locatingEnd}
-            >
-              {locatingEnd ? (
-                <ActivityIndicator size="small" color={NAVY} />
-              ) : (
-                <Ionicons name="locate" size={18} color={NAVY} />
-              )}
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.smallButton}
-              onPress={moveToSearchForEnd}
-            >
-              <Text style={styles.smallButtonText}>
-                {hasEnd ? "변경" : "입력"}
-              </Text>
-            </TouchableOpacity>
-          </View>
+          <TouchableOpacity
+            style={styles.smallButton}
+            onPress={moveToSearchForEnd}
+          >
+            <Text style={styles.smallButtonText}>
+              {hasEnd ? "변경" : "입력"}
+            </Text>
+          </TouchableOpacity>
         </View>
       </View>
 
-      {/* 서비스 지역(서울) 밖 안내 — 길찾기 시작은 위 canStartRoute 에서 비활성화됨 */}
+      {/* 경사도 데이터 범위 경고 */}
       {outOfCoverage && (
         <View style={styles.coverageWarningCard}>
-          <Text style={styles.coverageWarningText}>{OUT_OF_SERVICE_AREA_MESSAGE}</Text>
+          <Text style={styles.coverageWarningText}>{SLOPE_DATA_WARNING}</Text>
         </View>
       )}
 
@@ -468,7 +275,8 @@ export default function RouteSelectScreen() {
         </View>
 
         <Text style={styles.optionDescription}>
-          6가지 유형별 추천 경로를 경사도에 따라 제공합니다.
+          출발지와 도착지를 모두 설정하면 백엔드 경로 탐색 API를 호출하여
+          보행약자 맞춤 경로를 계산합니다.
         </Text>
       </View>
 
@@ -669,17 +477,6 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: "700",
     color: NAVY,
-  },
-
-  startButtonGroup: {
-    flexDirection: "row",
-    alignItems: "center",
-  },
-
-  currentLocationButton: {
-    paddingHorizontal: 0,
-    width: 36,
-    marginLeft: 8,
   },
 
   optionCard: {

@@ -1,12 +1,11 @@
 import React, { useState, useEffect, useRef } from "react";
 import {
   StyleSheet, View, Text, TextInput, TouchableOpacity,
-  Platform, Alert, FlatList, ActivityIndicator, Linking,
+  Platform, Alert, FlatList, ActivityIndicator,
 } from "react-native";
 import { Ionicons, Feather, MaterialCommunityIcons } from "@expo/vector-icons";
 import { router } from "expo-router";
 import { goHome } from "../src/utils/navigation";
-import * as Location from "expo-location";
 import { WebView } from "react-native-webview";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import {
@@ -38,33 +37,6 @@ const shadowStyle = Platform.select({
   android: { elevation: 4 },
 });
 
-// GPS를 못 가져왔을 때만 쓰는 폴백 지도 중심(서울시청 인근). 정상 상황에선
-// 마운트 시 자동으로 받아온 실제 현위치로 지도를 옮긴다. (HomeScreen 과 동일 패턴)
-const MAP_FALLBACK_CENTER = { latitude: 37.553149, longitude: 126.968881 };
-
-// 화면 진입 시 조용히 현위치를 한 번 받아온다 — 실패해도 alert 없이 null.
-async function autoLocateOnMount(): Promise<{ latitude: number; longitude: number } | null> {
-  try {
-    const { status } = await Location.requestForegroundPermissionsAsync();
-    if (status !== "granted") return null;
-    const providerStatus = await Location.getProviderStatusAsync();
-    if (!providerStatus.locationServicesEnabled) return null;
-    try {
-      const loc: any = await Promise.race([
-        Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 5000)),
-      ]);
-      return { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
-    } catch {
-      const last = await Location.getLastKnownPositionAsync({});
-      return last ? { latitude: last.coords.latitude, longitude: last.coords.longitude } : null;
-    }
-  } catch (e: any) {
-    console.log("[GPS] 책갈피 자동 위치 조회 실패(무시):", e?.message ?? e);
-    return null;
-  }
-}
-
 export default function BookmarkScreen() {
   const insets = useSafeAreaInsets();
   const webViewRef = useRef<WebView>(null);
@@ -78,31 +50,12 @@ export default function BookmarkScreen() {
   const [searching, setSearching]           = useState(false);
   const [showSearch, setShowSearch]         = useState(false);
 
-  // 마운트 시 자동으로 받아온 현위치. 못 받으면 null → 지도는 MAP_FALLBACK_CENTER.
-  const [currentCoords, setCurrentCoords]   = useState<{ latitude: number; longitude: number } | null>(null);
-  // WebView 안 카카오맵 로드 완료 신호 — 그 전에 injectJavaScript 하면 무시된다.
-  const [mapLoaded, setMapLoaded]           = useState(false);
-
   // 연관 검색어 — search.tsx와 동일하게 타이핑 중 디바운스 자동조회.
   // 실패해도 조용히 무시(Alert 없음), 응답이 늦게 와서 이미 검색어가
   // 바뀐 경우(searchSeqRef 불일치)엔 결과를 버린다.
   const searchSeqRef = useRef(0);
 
   useEffect(() => { loadBookmarks(); }, []);
-
-  // 화면 진입 시 1회, 조용히 현위치 시도 → 지도 중심을 현위치로.
-  useEffect(() => {
-    autoLocateOnMount().then((coords) => { if (coords) setCurrentCoords(coords); });
-  }, []);
-
-  // 현위치를 받았고 지도 로드도 끝났으면 지도를 현위치로 이동(파란 점 마커 포함).
-  useEffect(() => {
-    if (currentCoords && mapLoaded) {
-      webViewRef.current?.injectJavaScript(
-        `if (window.moveToCurrentLocation) { window.moveToCurrentLocation(${currentCoords.latitude}, ${currentCoords.longitude}); } true;`
-      );
-    }
-  }, [currentCoords, mapLoaded]);
 
   const loadBookmarks = async () => {
     // 로컬 캐시 즉시 표시
@@ -130,47 +83,6 @@ export default function BookmarkScreen() {
       })();
       true;
     `);
-  };
-
-  // "현위치" 버튼 — 사용자가 직접 눌렀을 때는 권한/서비스 거부 이유를 알려준다.
-  const moveToCurrentLocation = async () => {
-    try {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== "granted") {
-        Alert.alert("위치 권한 필요", "현재 위치를 보려면 위치 권한을 허용해주세요.");
-        return;
-      }
-      const providerStatus = await Location.getProviderStatusAsync();
-      if (!providerStatus.locationServicesEnabled) {
-        Alert.alert("위치 서비스 꺼짐", "설정에서 위치 서비스를 켜주세요.", [
-          { text: "설정 열기", onPress: () => Linking.openSettings() },
-          { text: "취소", style: "cancel" },
-        ]);
-        return;
-      }
-      let coords: { latitude: number; longitude: number } | null = null;
-      try {
-        const loc: any = await Promise.race([
-          Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 5000)),
-        ]);
-        coords = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
-      } catch {
-        const last = await Location.getLastKnownPositionAsync({});
-        if (last) coords = { latitude: last.coords.latitude, longitude: last.coords.longitude };
-      }
-      if (!coords) {
-        Alert.alert("위치를 가져올 수 없습니다", "실외로 이동한 후 다시 시도해주세요.");
-        return;
-      }
-      setSelectedPlace(null);
-      setCurrentCoords(coords);
-      webViewRef.current?.injectJavaScript(
-        `if (window.moveToCurrentLocation) { window.moveToCurrentLocation(${coords.latitude}, ${coords.longitude}); } true;`
-      );
-    } catch (err: any) {
-      Alert.alert("위치를 가져올 수 없습니다", "잠시 후 다시 시도해주세요.");
-    }
   };
 
   const handleSelectBookmark = (item: BookmarkItem) => {
@@ -315,30 +227,8 @@ export default function BookmarkScreen() {
   <script>
     kakao.maps.load(function(){
       window.kakaoMap = new kakao.maps.Map(document.getElementById('map'),{
-        center: new kakao.maps.LatLng(${MAP_FALLBACK_CENTER.latitude},${MAP_FALLBACK_CENTER.longitude}), level:5
+        center: new kakao.maps.LatLng(37.553149,126.968881), level:5
       });
-
-      // ── 현위치: React 쪽에서 GPS 좌표를 받아 지도를 이동시킨다 (파란 점 마커) ──
-      window.myLocationMarker = null;
-      window.moveToCurrentLocation = function (lat, lng) {
-        var pos = new kakao.maps.LatLng(lat, lng);
-        if (!window.myLocationMarker) {
-          window.myLocationMarker = new kakao.maps.Marker({
-            image: new kakao.maps.MarkerImage(
-              'data:image/svg+xml;base64,' + btoa(
-                '<svg xmlns="http://www.w3.org/2000/svg" width="26" height="26">' +
-                  '<circle cx="13" cy="13" r="8" fill="#1B7AFF" stroke="#FFFFFF" stroke-width="3"/>' +
-                '</svg>'
-              ),
-              new kakao.maps.Size(26, 26)
-            )
-          });
-        }
-        window.myLocationMarker.setPosition(pos);
-        window.myLocationMarker.setMap(window.kakaoMap);
-        window.kakaoMap.setCenter(pos);
-        window.kakaoMap.setLevel(3);
-      };
     });
   </script>
 </body></html>`;
@@ -493,19 +383,8 @@ export default function BookmarkScreen() {
               javaScriptEnabled
               domStorageEnabled
               mixedContentMode="always"
-              onLoadEnd={() => setMapLoaded(true)}
               style={{ flex: 1 }}
             />
-
-            {/* 현위치 버튼 — 지도를 현재 GPS 위치로 이동 */}
-            <TouchableOpacity
-              style={styles.gpsButton}
-              activeOpacity={0.85}
-              onPress={moveToCurrentLocation}
-            >
-              <MaterialCommunityIcons name="crosshairs-gps" size={22} color={NAVY} />
-            </TouchableOpacity>
-
             {selectedPlace && (
               <View style={styles.mapInfoBar}>
                 <View style={{ flex: 1 }}>
@@ -547,7 +426,7 @@ export default function BookmarkScreen() {
         <TouchableOpacity style={[styles.navButton, styles.activeNavButton]}>
           <Feather name="bookmark" size={29} color="#FFFFFF" />
         </TouchableOpacity>
-        <TouchableOpacity style={styles.navButton} onPress={moveToCurrentLocation}>
+        <TouchableOpacity style={styles.navButton} onPress={goHome}>
           <MaterialCommunityIcons name="crosshairs-gps" size={32} color={NAVY} />
         </TouchableOpacity>
         <TouchableOpacity style={styles.navButton} onPress={() => router.push("/settings")}>
@@ -650,21 +529,6 @@ const styles = StyleSheet.create({
     borderRadius: 22,
     overflow: "hidden",
     backgroundColor: LIGHT_GRAY,
-    borderWidth: 1,
-    borderColor: BORDER_GRAY,
-    ...shadowStyle,
-  },
-
-  gpsButton: {
-    position: "absolute",
-    top: 10,
-    right: 10,
-    width: 40,
-    height: 40,
-    borderRadius: 12,
-    backgroundColor: "#FFFFFF",
-    justifyContent: "center",
-    alignItems: "center",
     borderWidth: 1,
     borderColor: BORDER_GRAY,
     ...shadowStyle,

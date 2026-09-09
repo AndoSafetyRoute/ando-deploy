@@ -36,11 +36,7 @@ export default function RoutePage() {
 
     navigate: (screenName: string, screenParams?: Record<string, any>) => {
       if (screenName === "Navigation") {
-        // push를 쓰면 search→place-info→route-select→route가 스택에 그대로
-        // 남아있어서, 안내를 마치고 뒤로가기를 홈까지 4~5번 눌러야 하는 문제가
-        // 있었다(route-compare.tsx의 같은 어댑터는 이미 replace를 쓰고 있음 —
-        // 도보/대중교통/자동차 단일경로 흐름만 여기 남아있던 불일치).
-        router.replace({
+        router.push({
           pathname: "/navigation",
           params: screenParams,
         });
@@ -55,19 +51,7 @@ export default function RoutePage() {
         return;
       }
 
-      // ⑬ 3경로 비교 화면. ROUTE_COMPARE_ENABLED=true 면 WalkContent의 "안내 시작"이
-      // goToRouteCompareIfEnabled → navigate("RouteCompare") 를 태우는데, 여기에
-      // 케이스가 없어서 아래 router.replace("/") 로 떨어져 홈으로 튕겨나갔다.
-      // push 로 열어야 비교 화면에서 뒤로가기가 경로 화면으로 돌아온다.
-      if (screenName === "RouteCompare") {
-        router.push({
-          pathname: "/route-compare",
-          params: screenParams,
-        });
-        return;
-      }
-
-      router.replace("/");
+      router.push("/");
     },
   };
 

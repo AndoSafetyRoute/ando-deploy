@@ -168,7 +168,8 @@ function normalizeSegments(raw: any): RouteSegment[] {
       direction: seg.direction ?? "flat",
       name:      seg.name ?? "",
       zone:      seg.zone ?? undefined,
-      // 하이브리드(서울 밖) 직선 구간 — 경사 데이터 없음. slope=0 을 실측값으로 오인 방지용 표식.
+      // 하이브리드(서울 밖) 직선 구간 — 경사 데이터 없음. 다운스트림(경사색·신호 D)이
+      // slope=0 을 실측값으로 오인하지 않도록 표식만 넘긴다.
       outsideSeoul: seg.outside_seoul === true,
     }))
     .filter(
@@ -382,9 +383,9 @@ function makeKakaoMapHtml({
     <html>
       <head>
         <meta charset="utf-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
         <style>
-          html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; touch-action:none; }
+          html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; }
           #map { width:100%; height:100%; }
           .label {
             padding:6px 10px; border-radius:14px; background:#fff; color:#1A1A2E;
@@ -710,6 +711,10 @@ export default function NavigationScreen({ navigation, route }: Props) {
   const [currentLocation, setCurrentLocation] = useState<Coordinate | null>(null);
   const [locationError,   setLocationError]   = useState("");
   const [savedRouteId,    setSavedRouteId]     = useState("");
+  // setSavedRouteId 는 비동기(state)라 같은 tick 에 값을 읽는 proceedAfterNavigation
+  // 클로저에는 여전히 "" 로 잡힌다 → RouteDetail 이 빈 id 로 조회해 "경로 기록을
+  // 찾을 수 없어요" 가 떴다. 종료 핸들러가 만든 id 를 즉시 ref 로도 들고 있는다.
+  const savedRouteIdRef = useRef("");
   const [guidance, setGuidance] = useState<{ turn: string; text: string } | null>(null);
   // 안내 종료 여부 — true가 되면 지도(WebView)를 즉시 언마운트해
   // 대용량 좌표/구간 배열 참조를 바로 해제한다 (장거리 경로 종료 지연 대응)
@@ -1061,7 +1066,10 @@ export default function NavigationScreen({ navigation, route }: Props) {
             if (dist <= PROXIMITY_THRESHOLD) {
               visitedWaypointsRef.current.add(idx);
               setGuidance({ turn: wp.turn_direction, text: wp.guidance_text });
-              Speech.speak(wp.guidance_text, { language: "ko" });
+              // speak() 래퍼를 거쳐야 음성안내 OFF(voiceEnabledRef)가 적용된다.
+              // 예전엔 Speech.speak 를 직접 불러서, 껐다가도 다음 교차로에서
+              // 다시 나오기 시작했다.
+              speak(wp.guidance_text);
             }
           });
         }
@@ -1168,39 +1176,25 @@ export default function NavigationScreen({ navigation, route }: Props) {
             binTrackerRef.current = null;
           }
 
-          const curIdx = currentSegIdxRef.current;
-          if (curIdx < routeSegments.length && measuredMsRef.current[curIdx] === null) {
-            measuredMsRef.current[curIdx] = now - segmentStartTimesRef.current[curIdx];
-            currentSegIdxRef.current = curIdx + 1;
-          }
-
-          const measuredTotal = (measuredMsRef.current as (number | null)[])
-            .filter((v): v is number => v !== null)
-            .reduce((s, v) => s + v, 0);
-          const unmeasuredDist = routeSegments
-            .filter((_, i) => measuredMsRef.current[i] === null)
-            .reduce((s, seg) => s + (seg.length ?? 5), 0);
-          const remainingMs = Math.max(0, totalDurationMs - measuredTotal);
-
-          const segments: SegmentTime[] = routeSegments.map((seg, i) => {
+          // 도중에 종료해도, 실제로 GPS 로 끝점까지 통과한 구간만 저장한다(옵션 b).
+          // 종료 순간 밟고 있던 구간은 "부분 통과"라 소요시간을 만들지 않고 버린다.
+          // 안 지나온 구간에 가짜 시간을 채워 넣던 예전 방식이 기록에 "0초 · 좋음"
+          // 유령 구간을 남기던 문제를 없앤다 — 모아진 것만 남긴다.
+          const segments: SegmentTime[] = [];
+          routeSegments.forEach((seg, i) => {
             const measured = measuredMsRef.current[i];
-            if (measured !== null) {
-              return {
-                index: i, distanceM: seg.length ?? 5, slopePercent: seg.slope ?? 0,
-                elapsedMs: measured, measured: true, zone: seg.zone, direction: seg.direction,
-              };
-            }
-            const segDist = seg.length ?? 5;
-            return {
-              index: i, distanceM: segDist, slopePercent: seg.slope ?? 0,
-              elapsedMs: unmeasuredDist > 0
-                ? Math.round(remainingMs * (segDist / unmeasuredDist))
-                : Math.round(totalDurationMs / Math.max(1, routeSegments.length)),
-              measured: false, zone: seg.zone, direction: seg.direction,
-            };
+            if (measured == null) return; // 미통과·부분통과 → 저장 안 함
+            segments.push({
+              index: i,
+              distanceM: seg.length ?? 5,
+              slopePercent: seg.slope ?? 0,
+              elapsedMs: measured,
+              measured: true,
+            });
           });
 
           const newId = generateId();
+          savedRouteIdRef.current = newId;
           setSavedRouteId(newId);
           const record: RouteRecord = {
             id: newId, from, to, mode: (mode as any) ?? "walk", walkerType,
@@ -1217,8 +1211,8 @@ export default function NavigationScreen({ navigation, route }: Props) {
               const token = await getAuthToken();
               const rid   = serverRouteIdRef.current;
               if (token && rid !== null) {
-                const unmeasured = segments.filter((s) => !s.measured);
-                await Promise.allSettled(unmeasured.map((s) => submitSegment(rid, s, token)));
+                // 통과한 구간은 지나는 시점에 이미 실시간 업로드됨(submitSegment).
+                // 여기선 완료 처리만 — 안 지나온 구간은 서버에도 올리지 않는다.
                 await completeNavigation(rid, totalDurationMs, token);
                 await updateServerRouteId(newId, rid);
               }
@@ -1246,7 +1240,8 @@ export default function NavigationScreen({ navigation, route }: Props) {
     routeAfterRating(navigation, {
       serverRouteId: serverRouteIdRef.current,
       routeSegments,
-      nextRouteId: savedRouteId,
+      // state(savedRouteId)는 이 tick 에 아직 "" — ref 를 우선 사용
+      nextRouteId: savedRouteIdRef.current || savedRouteId,
       sessionId: collectSessionIdRef.current ?? collectSessionRef.current?.sessionId,
     });
   };
@@ -1440,6 +1435,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
       >
         <Text style={ss.endBtnText}>안내 종료</Text>
       </TouchableOpacity>
+
     </View>
   );
 }

@@ -11,13 +11,11 @@
 /**
  * ⑬ 3경로 비교 화면을 도보 경로 흐름에 넣는다.
  * BE(ando-BE/gdy/personalization-v2)가 candidateRoutes 에 type+distance 2장을
- * 항상 채우므로 코드는 준비됐다.
- *
- * ⚠️ 원래 파일럿 3세션 로그 검증 후 켜기로 했었으나 "경로가 하나만 뜬다" 리포트에
- * 대응해 검증 없이 먼저 켠다(2026-09-03, JuYeong). 실기기 2~3경로 정상 확인 후
- * 문제 있으면 false 로 되돌릴 것. (deploy 브랜치 전용 — ando-FE 는 false)
+ * 항상 채우므로 코드는 준비됐다. 다만 이 플래그는 **파일럿 3세션 로그 전수 검증
+ * (⑪⑫ 관문) + 라이브 BE end-to-end 확인 후** true 로 바꾼다 (인계 §관문).
+ * false 인 동안 도보 흐름은 지금과 100% 동일하다.
  */
-export const ROUTE_COMPARE_ENABLED = true;
+export const ROUTE_COMPARE_ENABLED = false;
 
 /** ⑮ 안내 시작 시 왕복·방향 교대 안내 배너를 띄운다. BE 무관 — 활성. */
 export const ROUNDTRIP_HINT_ENABLED = true;

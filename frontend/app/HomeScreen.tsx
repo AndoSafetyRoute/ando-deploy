@@ -47,8 +47,8 @@ const CATEGORY_GROUP_CODES: Record<string, string> = {
   restaurant: "FD6",
 };
 
-// GPS를 못 가져왔을 때만 쓰는 폴백 좌표(서울역). 정상 상황에선 마운트 시
-// 자동으로 받아온 실제 현위치(currentCoords)를 지도 중심 + 장소 검색 기준으로 쓴다.
+// 지도가 처음 여는 중심 좌표와 동일하게 맞춘다. 지도를 실제로 움직였을 때
+// 그 위치 기준으로 재검색하는 기능은 아직 없어서, 우선 이 좌표 주변으로 고정 검색한다.
 const MAP_DEFAULT_CENTER = { lat: 37.553149, lng: 126.968881 };
 const NEARBY_SEARCH_RADIUS_M = 1500;
 
@@ -82,17 +82,14 @@ async function fetchWheelchairChargers(): Promise<MapPlace[]> {
   }));
 }
 
-async function fetchNearbyPlaces(
-  categoryGroupCode: string,
-  center: { lat: number; lng: number },
-): Promise<MapPlace[]> {
+async function fetchNearbyPlaces(categoryGroupCode: string): Promise<MapPlace[]> {
   const results: MapPlace[] = [];
 
   for (let page = 1; page <= 3; page++) {
     const url =
       `https://dapi.kakao.com/v2/local/search/category.json` +
       `?category_group_code=${categoryGroupCode}` +
-      `&x=${center.lng}&y=${center.lat}` +
+      `&x=${MAP_DEFAULT_CENTER.lng}&y=${MAP_DEFAULT_CENTER.lat}` +
       `&radius=${NEARBY_SEARCH_RADIUS_M}&sort=distance&page=${page}`;
 
     const response = await fetch(url, {
@@ -123,43 +120,13 @@ async function fetchNearbyPlaces(
   return results;
 }
 
-function fetchPlacesForCategory(
-  categoryId: string,
-  center: { lat: number; lng: number },
-): Promise<MapPlace[]> {
+function fetchPlacesForCategory(categoryId: string): Promise<MapPlace[]> {
   if (categoryId === "wheelchair-charge") return fetchWheelchairChargers();
 
   const groupCode = CATEGORY_GROUP_CODES[categoryId];
-  if (groupCode) return fetchNearbyPlaces(groupCode, center);
+  if (groupCode) return fetchNearbyPlaces(groupCode);
 
   return Promise.resolve([]);
-}
-
-// 앱 켜질 때 자동으로 현위치를 한 번 가져온다(조용히 — 실패해도 alert 안 띄우고
-// 그냥 폴백 좌표를 계속 쓰게 둔다. 사용자가 명시적으로 누르는 "현위치" 버튼
-// (moveToCurrentLocation)과 달리, 여기선 권한 거부/서비스 꺼짐도 그냥 null로 처리).
-async function autoLocateOnMount(): Promise<{ latitude: number; longitude: number } | null> {
-  try {
-    const { status } = await Location.requestForegroundPermissionsAsync();
-    if (status !== "granted") return null;
-
-    const providerStatus = await Location.getProviderStatusAsync();
-    if (!providerStatus.locationServicesEnabled) return null;
-
-    try {
-      const loc: any = await Promise.race([
-        Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 5000)),
-      ]);
-      return { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
-    } catch {
-      const last = await Location.getLastKnownPositionAsync({});
-      return last ? { latitude: last.coords.latitude, longitude: last.coords.longitude } : null;
-    }
-  } catch (e: any) {
-    console.log("[GPS] 자동 위치 조회 실패(무시, 폴백 좌표 유지):", e?.message ?? e);
-    return null;
-  }
 }
 
 export default function HomeScreen() {
@@ -168,69 +135,30 @@ export default function HomeScreen() {
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   // 카테고리별로 한 번 불러온 결과는 다시 선택해도 재조회하지 않고 캐시에서 쓴다.
   const [placesCache, setPlacesCache] = useState<Record<string, MapPlace[]>>({});
-  // 마운트 시 자동으로 받아온 현위치. 못 받으면 null로 남고, 이 경우 지도/검색
-  // 둘 다 MAP_DEFAULT_CENTER(서울역) 폴백을 계속 쓴다.
-  const [currentCoords, setCurrentCoords] = useState<{ latitude: number; longitude: number } | null>(null);
-  // WebView 안의 카카오맵 스크립트가 로드를 마쳐야 window.moveToCurrentLocation이 존재한다.
-  // 그 전에 injectJavaScript를 호출하면 조용히 무시되므로, 로드 완료 신호를 따로 받는다.
-  const [webviewLoaded, setWebviewLoaded] = useState(false);
   const webviewRef = useRef<WebView>(null);
 
   const toggleCategory = (id: string) => {
     setSelectedCategory((prev) => (prev === id ? null : id));
   };
 
-  // 앱 진입 시 1회, 조용히 현위치 시도.
+  // 선택된 카테고리가 처음 선택될 때 한 번만 데이터를 불러온다.
   useEffect(() => {
-    autoLocateOnMount().then((coords) => {
-      if (coords) {
-        console.log("[GPS] 자동 위치 수신:", coords.latitude, coords.longitude);
-        setCurrentCoords(coords);
-      }
-    });
-  }, []);
+    if (!selectedCategory || placesCache[selectedCategory]) return;
 
-  // 현위치를 받았고 지도도 로드가 끝났으면, 지도를 그 위치로 옮긴다
-  // ("현위치" 버튼(moveToCurrentLocation)이 쓰는 것과 같은 브릿지 재사용).
-  useEffect(() => {
-    if (currentCoords && webviewLoaded) {
-      webviewRef.current?.injectJavaScript(
-        `if (window.moveToCurrentLocation) { window.moveToCurrentLocation(${currentCoords.latitude}, ${currentCoords.longitude}); } true;`
-      );
-    }
-  }, [currentCoords, webviewLoaded]);
-
-  // 선택된 카테고리가 처음 선택될 때 한 번만 데이터를 불러온다. 현위치를 받았으면
-  // 그 주변, 못 받았으면 폴백(서울역) 주변으로 검색한다.
-  //
-  // 캐시 키에 center를 포함해야 한다 — 카테고리 id만으로 캐싱하면, GPS가 아직
-  // 안 들어온 틈에(autoLocateOnMount는 몇 초 걸림) 사용자가 카페 칩을 먼저
-  // 누른 경우 서울역 폴백 결과가 캐시에 박혀버려서, 잠시 뒤 GPS가 실제로
-  // 잡혀도 재조회를 안 하고 계속 서울역 근처 결과만 보여주는 문제가 있었다.
-  const center = currentCoords
-    ? { lat: currentCoords.latitude, lng: currentCoords.longitude }
-    : MAP_DEFAULT_CENTER;
-  const cacheKey = selectedCategory
-    ? `${selectedCategory}:${center.lat.toFixed(3)},${center.lng.toFixed(3)}`
-    : null;
-
-  useEffect(() => {
-    if (!cacheKey || !selectedCategory || placesCache[cacheKey]) return;
-
-    fetchPlacesForCategory(selectedCategory, center)
+    fetchPlacesForCategory(selectedCategory)
       .then((data) => {
         console.log(`${selectedCategory} 장소 개수:`, data.length);
-        setPlacesCache((prev) => ({ ...prev, [cacheKey]: data }));
+        setPlacesCache((prev) => ({ ...prev, [selectedCategory]: data }));
       })
       .catch((e) => {
         console.log("장소 조회 오류:", e);
         Alert.alert("오류", "장소 정보를 불러오지 못했습니다.");
       });
-  }, [cacheKey, selectedCategory]);
+  }, [selectedCategory]);
 
   // 선택된 카테고리에 해당하는 장소들을 지도에 마커로 표시하고, 해제되면 지운다.
   useEffect(() => {
-    const places = cacheKey ? placesCache[cacheKey] : undefined;
+    const places = selectedCategory ? placesCache[selectedCategory] : undefined;
 
     if (selectedCategory && places && places.length > 0) {
       webviewRef.current?.injectJavaScript(
@@ -243,9 +171,14 @@ export default function HomeScreen() {
     }
   }, [selectedCategory, placesCache]);
 
-  // "현위치" 버튼 — autoLocateOnMount와 달리 사용자가 직접 눌렀을 때이므로
-  // 권한/위치서비스 거부 시 조용히 넘어가지 않고 이유를 알려준다.
-  const moveToCurrentLocation = async () => {
+  // 홈 화면 자체엔 연관검색어 자동완성을 따로 구현하지 않고, 검색창을 누르면
+  // 바로 search.tsx로 넘어가서 그쪽에서만 타이핑하게 한다 — 입력 UI를 두 곳에
+  // 중복 구현하지 않고, 자동완성도 한 군데(search.tsx)에서만 관리하기 위함.
+  const moveToSearchScreen = () => {
+    router.push({ pathname: "/search", params: {} });
+  };
+
+  const moveToMyLocation = async () => {
     try {
       console.log("[GPS] 현위치 버튼 눌림");
 
@@ -293,21 +226,13 @@ export default function HomeScreen() {
         return;
       }
 
-      setCurrentCoords(coords);
       webviewRef.current?.injectJavaScript(
-        `if (window.moveToCurrentLocation) { window.moveToCurrentLocation(${coords.latitude}, ${coords.longitude}); } true;`
+        `if (window.moveToLocation) { window.moveToLocation(${coords.latitude}, ${coords.longitude}); } true;`
       );
     } catch (err: any) {
       console.log("[GPS] 에러:", err?.message ?? err);
       Alert.alert("위치를 가져올 수 없습니다", "잠시 후 다시 시도해주세요.");
     }
-  };
-
-  // 홈 화면 자체엔 연관검색어 자동완성을 따로 구현하지 않고, 검색창을 누르면
-  // 바로 search.tsx로 넘어가서 그쪽에서만 타이핑하게 한다 — 입력 UI를 두 곳에
-  // 중복 구현하지 않고, 자동완성도 한 군데(search.tsx)에서만 관리하기 위함.
-  const moveToSearchScreen = () => {
-    router.push({ pathname: "/search", params: {} });
   };
 
   const kakaoMapHtml = useMemo(() => `
@@ -317,7 +242,7 @@ export default function HomeScreen() {
         <meta charset="utf-8" />
         <meta
           name="viewport"
-          content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+          content="width=device-width, initial-scale=1.0, maximum-scale=1.0"
         />
         <style>
           html, body {
@@ -326,7 +251,6 @@ export default function HomeScreen() {
             width: 100%;
             height: 100%;
             overflow: hidden;
-            touch-action: none;
           }
 
           #map {
@@ -357,40 +281,11 @@ export default function HomeScreen() {
 
             var map = new kakao.maps.Map(container, options);
 
-            // 핀치/더블탭 확대 외에, 손가락 조작이 어려운 교통약자 사용자를 위해
-            // 우측에 +/- 버튼도 같이 제공한다.
-            map.addControl(new kakao.maps.ZoomControl(), kakao.maps.ControlPosition.RIGHT);
+            var marker = new kakao.maps.Marker({
+              position: center
+            });
 
-            // (이전엔 여기 center(서울역) 고정 마커를 심어뒀었다 — GPS로 지도
-            // 중심이 실제 위치로 옮겨간 뒤에도 이 마커는 안 움직이고 서울역에
-            // 그대로 남아있어서 "위치가 서울역에 고정된 것처럼" 보이는 원인이었다.
-            // moveToCurrentLocation이 자기 마커(파란 점)를 따로 그리므로 여기선
-            // 그냥 지도만 띄운다 — GPS 실패 시엔 마커 없이 폴백 중심만 보여준다.)
-
-            // ── 현위치: React 쪽에서 GPS 좌표를 받아 지도를 이동시킨다 ──
-            var myLocationMarker = null;
-
-            window.moveToCurrentLocation = function (lat, lng) {
-              var pos = new kakao.maps.LatLng(lat, lng);
-
-              if (!myLocationMarker) {
-                myLocationMarker = new kakao.maps.Marker({
-                  image: new kakao.maps.MarkerImage(
-                    'data:image/svg+xml;base64,' + btoa(
-                      '<svg xmlns="http://www.w3.org/2000/svg" width="26" height="26">' +
-                        '<circle cx="13" cy="13" r="8" fill="#1B7AFF" stroke="#FFFFFF" stroke-width="3"/>' +
-                      '</svg>'
-                    ),
-                    new kakao.maps.Size(26, 26)
-                  )
-                });
-              }
-
-              myLocationMarker.setPosition(pos);
-              myLocationMarker.setMap(map);
-              map.setCenter(pos);
-              map.setLevel(3);
-            };
+            marker.setMap(map);
 
             // ── 카테고리 마커: React 쪽에서 injectJavaScript 로 호출한다 ──
             var categoryMarkers = [];
@@ -442,6 +337,16 @@ export default function HomeScreen() {
               categoryInfo.close();
             };
 
+            // ── 현위치 마커: "현위치" 버튼 눌렀을 때 React 쪽에서 호출 ──
+            var myLocationMarker = null;
+            window.moveToLocation = function (lat, lng) {
+              var pos = new kakao.maps.LatLng(lat, lng);
+              map.setLevel(3);
+              map.setCenter(pos);
+              if (myLocationMarker) myLocationMarker.setMap(null);
+              myLocationMarker = new kakao.maps.Marker({ position: pos });
+              myLocationMarker.setMap(map);
+            };
           });
         </script>
       </body>
@@ -508,7 +413,6 @@ export default function HomeScreen() {
           javaScriptEnabled={true}
           domStorageEnabled={true}
           mixedContentMode="always"
-          onLoadEnd={() => setWebviewLoaded(true)}
           style={styles.webView}
         />
       </View>
@@ -531,7 +435,7 @@ export default function HomeScreen() {
 
         <TouchableOpacity
           style={styles.navButton}
-          onPress={moveToCurrentLocation}
+          onPress={moveToMyLocation}
         >
           <MaterialCommunityIcons name="crosshairs-gps" size={32} color={NAVY} />
         </TouchableOpacity>

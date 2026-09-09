@@ -7,8 +7,6 @@ app.py — Ando 접근성 경로 탐색 FastAPI 서버
 "로그인은 성공하는데 그 다음 백엔드 호출이 전부 실패하는" 원인이 된다.
 0.0.0.0 으로 띄워야 같은 네트워크의 다른 기기에서 접속할 수 있다.
 """
-import os
-import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Depends, Header
@@ -17,8 +15,8 @@ from sqlalchemy import text
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from config import GEOJSON_PATH, CoverageError
-from routing import build_graph, find_route, USER_TYPES, classify_zone, precompute_edge_costs, shortest_route_nx
+from config import GEOJSON_PATH
+from routing import build_graph, find_route, USER_TYPES, classify_zone, precompute_edge_costs
 from routing.search import build_spatial_index
 from routing.cch_engine import build_cch_engine, CCHEngine
 from routing.personal_cache import PersonalMetricCache
@@ -26,7 +24,7 @@ from places.kakao import search_places, debug_raw
 from database import (
     init_db, get_db, get_or_create_user, update_user_type,
     get_user_profile, get_user_stats, save_user_route, get_user_routes,
-    delete_user_route, save_or_update_feedback,
+    delete_user_route,
     get_user_bookmarks, save_user_bookmark, delete_user_bookmark,
     get_search_history, save_search_history,
     start_navigation, add_navigation_segment, complete_navigation,
@@ -36,7 +34,6 @@ from database import (
 )
 from routing.speed import get_zone_key, estimate_route_time, get_default_speed
 from routing.segments import build_navigation_segments, extract_waypoints
-from routing.graph import haversine
 from routing.voice_guidance import calculate_bearing, get_turn_direction, generate_guidance_text
 from routing.travel_time import estimate_route_time as estimate_nav_time
 from firebase import verify_token, delete_firebase_user
@@ -54,36 +51,6 @@ _subway_db: SubwayFacilityDB | None = None
 # 그래프(수십만 노드)에서 이걸 매 /route 요청마다 다시 계산하면 요청당 유의미한
 # 지연이 생긴다. 그래프는 서버 실행 중 바뀌지 않으므로 1회만 계산해 재사용한다.
 _waypoints_set: set | None = None
-
-
-class _Prof:
-    """
-    2-2 탐색시간 프로파일링 — /route 요청 1건의 구간별 소요시간(ms)을 모아
-    마지막에 한 줄(`[PROFILE] …`)로 출력한다. 실배포 서버 로그에서
-    `grep '\\[PROFILE\\]'` 로 구간별 병목을 수집하는 용도.
-
-    항상 켜져 있지만 요청당 딱 한 줄이라 로그 부담이 거의 없다. 완전히 끄려면
-    환경변수 ROUTE_PROFILE=0.
-    """
-    _ENABLED = os.environ.get("ROUTE_PROFILE", "1") not in ("0", "false", "False")
-
-    def __init__(self, tag: str):
-        self.tag = tag
-        self.t0 = self.last = time.perf_counter()
-        self.marks: list[tuple[str, float]] = []
-
-    def mark(self, label: str) -> None:
-        now = time.perf_counter()
-        self.marks.append((label, (now - self.last) * 1000))
-        self.last = now
-
-    def done(self, **extra) -> None:
-        if not self._ENABLED:
-            return
-        total = (time.perf_counter() - self.t0) * 1000
-        parts = "  ".join(f"{k}={v:.0f}ms" for k, v in self.marks)
-        tail = "  ".join(f"{k}={v}" for k, v in extra.items())
-        print(f"[PROFILE] {self.tag}  total={total:.0f}ms  {parts}  {tail}".rstrip())
 
 
 def _nav_segs_and_waypoints(path_nodes: list, user_type: str) -> tuple[list, list]:
@@ -208,7 +175,10 @@ def _seoul_leg_route(o: tuple, d: tuple, user_type: str, seoul_mode: str):
             r = (_cch.find_distance_route(o, d) if seoul_mode == "shortest"
                  else _cch.find_route(o, d, user_type))
         else:
-            r = find_route(G, o, d, user_type, "auto", mode="accessibility")
+            # CCH 미가용 폴백 — seoul_mode 를 그대로 반영해야 "최단" leg 가
+            # 유형별 leg 와 똑같이 나오지 않는다.
+            r = find_route(G, o, d, user_type, "auto",
+                           mode="shortest" if seoul_mode == "shortest" else "accessibility")
     except Exception as e:
         print(f"[hybrid] 서울 leg 실패 ({seoul_mode}): {e}")
         return None
@@ -542,21 +512,9 @@ def api_delete_user_route(
     return {"deleted": route_id}
 
 
-class FeedbackRequest(BaseModel):
-    rating: int
-
-
-@app.post("/routes/{route_id}/feedback")
-def api_save_feedback(
-    route_id: int,
-    body: FeedbackRequest,
-    db: Session = Depends(get_db),
-    decoded: dict = Depends(_verified),
-):
-    """만족도 저장/수정 (안내 직후 팝업 + 마이페이지 상세에서 모두 호출)"""
-    if not (1 <= body.rating <= 5):
-        raise HTTPException(400, "rating은 1~5 사이여야 합니다")
-    return save_or_update_feedback(db, route_id, decoded["uid"], body.rating)
+# (제거됨) POST /routes/{id}/feedback — 전체 경로 별점 만족도. 구간별 평가
+# (segment-hardship-feedback)로 대체되어 FE 호출부가 전무. `feedback` 테이블과
+# database.save_or_update_feedback 은 기존 파일럿 데이터 보존 위해 남겨 둠(비활성).
 
 
 # ── 북마크 엔드포인트 ─────────────────────────────────────────────────────────
@@ -1008,7 +966,6 @@ def api_route(
     if body.candidates not in ("single", "compare"):
         raise HTTPException(400, "candidates는 'single' 또는 'compare'여야 합니다")
 
-    prof = _Prof(f"/route mode={body.mode} candidates={body.candidates}")
     try:
         origin = (body.origin_lon, body.origin_lat)
         dest   = (body.dest_lon,   body.dest_lat)
@@ -1024,9 +981,8 @@ def api_route(
                     dest = (exit_info["lon"], exit_info["lat"])
             except Exception as e:
                 print(f"[NAV] 역 출구 스냅 실패 → 원래 좌표 사용: {e}")
-        prof.mark("station_snap")
 
-        # ── 서울 경계 밖 처리 (Task 2) — 에러/CoverageError 대신 하이브리드 최단경로 ──
+        # ── 서울 경계 밖 처리 (Task 2) — 에러 화면 대신 하이브리드 최단경로 ────────
         # 출발·도착이 모두 서울 안이면 이 분기는 아무것도 안 하고 지나간다(기존 흐름
         # 100% 불변). 하나라도 서울 밖이면: 서울 구간은 CCH(유형별/최단), 서울 밖은
         # 직선(경사 데이터 없음)으로 이어 붙여 도보 후보 2개를 돌려준다.
@@ -1041,19 +997,12 @@ def api_route(
                 _hybrid = _hybrid_walk_response(origin, dest, body.user_type, _o_in, _d_in)
                 if _hybrid is not None:
                     return _hybrid
-                # 하이브리드도 실패 → 아래 기존 흐름으로 떨어져 결국 CoverageError 처리
+                # 하이브리드도 실패 → 아래 기존 흐름으로 떨어져 결국 에러 처리
 
         # CCH 우선 (서울 전역 그래프), fallback → NetworkX
         if _cch is not None and body.mode == "accessibility":
             try:
                 result = _cch.find_route(origin, dest, body.user_type)
-            except ValueError:
-                # 커버리지 밖(스냅거리 초과) 등 CCH가 이미 명확히 판정한 거부는
-                # NetworkX로 다시 시도해도 같은 결론이다 — 다만 NetworkX는
-                # 그래프 전체(수십만~백만 노드)를 순회하는 무차별 탐색이라
-                # 이 경로에서 재시도하면 그 자체로 요청 하나가 몇 초씩 걸린다.
-                # 재시도 없이 그대로 올려 위 except ValueError(400)로 보낸다.
-                raise
             except Exception as e:
                 print(f"[CCH] 쿼리 실패 → NetworkX fallback: {e}")
                 result = find_route(G, origin, dest, body.user_type,
@@ -1061,7 +1010,6 @@ def api_route(
         else:
             result = find_route(G, origin, dest, body.user_type,
                                 body.algorithm, mode=body.mode)
-        prof.mark("find_route")
 
         coords = [
             [G.nodes[n]["lon"], G.nodes[n]["lat"]]
@@ -1106,7 +1054,6 @@ def api_route(
             except Exception:
                 pass
         estimated_time_s = estimate_route_time(segs, body.user_type, speed_profile)
-        prof.mark("segs+speed_profile")
 
         # WalkContent ServerRoute 형식으로 래핑
         route_obj = {
@@ -1170,7 +1117,6 @@ def api_route(
                     })
         except Exception as _nav_err:
             print(f"[NAV] 네비게이션 구간 생성 실패 (무시): {_nav_err}")
-        prof.mark("nav_build(type)")
 
         response = {
             # FE WalkContent 호환 필드
@@ -1273,7 +1219,6 @@ def api_route(
                         })
                 except Exception as e:
                     print(f"[route2] 거리경로 조회 실패 (무시): {e}")
-            prof.mark("distance_cand")
 
             if _personal_cache is not None and decoded is not None:
                 personal_metric = _personal_cache.get(decoded["uid"])
@@ -1321,162 +1266,11 @@ def api_route(
                             })
                     except Exception as e:
                         print(f"[route3] 맞춤경로 조회 실패 (무시): {e}")
-            prof.mark("personal_cand")
 
             response["candidateRoutes"] = candidate_routes
 
-            # ── 최단경로 2종 비교 (CCH vs NetworkX) + 유형 우회율 계측 ──────────
-            # candidateRoutes(선택 로그용)는 건드리지 않고, 별도 필드로만 싣는다.
-            #   routingComparison : 시각화 안 되는 계측값(소요시간·탐색 자원·우회율)
-            #   debugRoutes       : 지도에 겹쳐 그릴 최단경로 2종 좌표
-            try:
-                marks = dict(prof.marks)
-                rc: dict = {
-                    "od_straight_m": round(haversine(*origin, *dest), 1),
-                    "type": {
-                        "engine":    "cch",
-                        "length_m":  total_length_m,
-                        "avgSlope":  avg_slope_pct,
-                        "query_ms":  round(marks.get("find_route", 0.0), 1),
-                        "used_alpha": result.get("used_alpha"),
-                        "path_nodes": len(result["path_nodes"]),
-                    },
-                }
-                debug_routes: list = []
-
-                # (c) CCH 순수 최단 (alpha=0, metric_dist)
-                sc = None
-                if _cch is not None:
-                    try:
-                        sc = _cch.find_shortest_route(origin, dest)
-                        rc["shortest_cch"] = {
-                            "engine":     "cch",
-                            "length_m":   round(sc["total_length_m"], 1),
-                            "avgSlope":   round(sc["avg_slope_pct"], 2),
-                            "query_ms":   sc["query_ms"],
-                            "total_ms":   sc["total_ms"],
-                            "path_nodes": sc["path_node_count"],
-                        }
-                        debug_routes.append({
-                            "kind":          "shortest_cch",
-                            "label":         "최단거리(CCH)",
-                            "color":         "#F4A100",
-                            "coordinates":   [[G.nodes[n]["lon"], G.nodes[n]["lat"]]
-                                              for n in sc["path_nodes"]],
-                            "totalDistance": round(sc["total_length_m"], 1),
-                            "avgSlope":      round(sc["avg_slope_pct"], 2),
-                        })
-                    except Exception as e:
-                        rc["shortest_cch"] = {"error": str(e)}
-
-                # (b) NetworkX 순수 최단 (Dijkstra, weight=length_m) — 평가 전용.
-                #     배포 라우팅은 CCH 단독(위 shortest_cch)이고, NetworkX 는
-                #     "CCH 대비 얼마나 느린가"를 재는 대조군일 뿐이다. 서울 전역
-                #     그래프에서 장거리 Dijkstra 는 수 초~수십 초 걸려 응답을 막으므로
-                #     기본값 SHORTEST_NX_MAX_KM=0 (완전 비활성). 벤치마크 시에만
-                #     scripts/shortest_bench.py 안내대로 SHORTEST_NX_MAX_KM=50 등으로
-                #     서버를 띄워 켠다.
-                nx_cap_km = float(os.environ.get("SHORTEST_NX_MAX_KM", "0"))
-                if nx_cap_km <= 0 or rc["od_straight_m"] > nx_cap_km * 1000:
-                    rc["shortest_nx"] = {
-                        "skipped": ("배포 기본 비활성 (SHORTEST_NX_MAX_KM=0)"
-                                    if nx_cap_km <= 0 else
-                                    f"직선거리 {rc['od_straight_m']/1000:.1f}km > "
-                                    f"{nx_cap_km:.0f}km (NX Dijkstra 스킵)")
-                    }
-                else:
-                    try:
-                        sn = shortest_route_nx(G, origin, dest)
-                        rc["shortest_nx"] = {
-                            "engine":         "nx-dijkstra",
-                            "length_m":       round(sn["total_length_m"], 1),
-                            "avgSlope":       round(sn["avg_slope_pct"], 2),
-                            "query_ms":       sn["query_ms"],
-                            "nodes_settled":  sn["nodes_settled"],
-                            "edges_relaxed":  sn["edges_relaxed"],
-                            "heap_pushes":    sn["heap_pushes"],
-                            "peak_heap":      sn["peak_heap"],
-                            "graph_nodes":    sn["graph_nodes"],
-                            "path_nodes":     sn["path_node_count"],
-                        }
-                        debug_routes.append({
-                            "kind":          "shortest_nx",
-                            "label":         "최단거리(NetworkX)",
-                            "color":         "#8E44EC",
-                            "coordinates":   [[G.nodes[n]["lon"], G.nodes[n]["lat"]]
-                                              for n in sn["path_nodes"]],
-                            "totalDistance": round(sn["total_length_m"], 1),
-                            "avgSlope":      round(sn["avg_slope_pct"], 2),
-                        })
-                    except Exception as e:
-                        rc["shortest_nx"] = {"error": str(e)}
-                prof.mark("shortest_bench")
-
-                # 우회율 — 순수 최단(CCH) 기준
-                base_len = None
-                if sc is not None:
-                    base_len = sc["total_length_m"]
-                if base_len and base_len > 0:
-                    rc["detour"] = {
-                        "base": "shortest_cch",
-                        "base_length_m": round(base_len, 1),
-                        # 유형 점수(경사비용)에 의한 우회율
-                        "type_vs_shortest": round(total_length_m / base_len, 4),
-                    }
-                    # distance 후보(급경사 배제 최단)도 있으면 함께
-                    dcand = next((c for c in candidate_routes if c["kind"] == "distance"), None)
-                    if dcand:
-                        rc["detour"]["safe_distance_vs_shortest"] = round(
-                            dcand["totalDistance"] / base_len, 4
-                        )
-
-                # 엔진 효율 비교 (둘 다 성공했을 때만)
-                if (isinstance(rc.get("shortest_cch"), dict) and "query_ms" in rc["shortest_cch"]
-                        and isinstance(rc.get("shortest_nx"), dict) and "query_ms" in rc["shortest_nx"]):
-                    cch_ms = rc["shortest_cch"]["query_ms"] or 0.001
-                    nx_ms  = rc["shortest_nx"]["query_ms"]
-                    cch_visits = rc["shortest_cch"]["path_nodes"]
-                    nx_settled = rc["shortest_nx"]["nodes_settled"]
-                    rc["engine_compare"] = {
-                        "cch_query_ms":  rc["shortest_cch"]["query_ms"],
-                        "nx_query_ms":   nx_ms,
-                        "speedup_x":     round(nx_ms / cch_ms, 1),
-                        "paths_identical": (sc is not None and sn is not None
-                                            and sc["path_nodes"] == sn["path_nodes"]),
-                        "length_delta_m": (round(rc["shortest_nx"]["length_m"]
-                                                 - rc["shortest_cch"]["length_m"], 1)),
-                        "cch_path_nodes": cch_visits,
-                        "nx_nodes_settled": nx_settled,
-                        "nx_edges_relaxed": rc["shortest_nx"]["edges_relaxed"],
-                        "settled_vs_pathnodes_x": (round(nx_settled / cch_visits, 1)
-                                                   if cch_visits else None),
-                    }
-
-                response["routingComparison"] = rc
-                if debug_routes:
-                    response["debugRoutes"] = debug_routes
-                print(f"[ROUTECMP] {rc}")
-            except Exception as e:
-                print(f"[ROUTECMP] 최단경로 비교 실패 (무시): {e}")
-
-        prof.done(
-            nodes=len(result["path_nodes"]),
-            n_cand=len(response.get("candidateRoutes", [1])),
-        )
         return response
 
-    except CoverageError as e:
-        # 서울 전역 그래프 밖 좌표(지방 등) — 경사도가 이 그래프 하나에 함께
-        # 구워져 있어 "거리 우선만" 같은 부분 응답도 불가능하다. FE 는 code 를 보고
-        # 스크리한 "경로 탐색 실패" 팝업 대신 안내 문구를 띄운다.
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "out_of_service_area",
-                "message": "현재 서울 지역만 경로 안내를 제공합니다. 서울 안의 출발지·도착지를 선택해 주세요.",
-                "debug": str(e),
-            },
-        )
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:

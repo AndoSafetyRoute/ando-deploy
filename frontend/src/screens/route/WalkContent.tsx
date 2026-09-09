@@ -34,11 +34,12 @@ type ServerRoute = {
   shortestDistance?: number | null;
   detourRatio?: number | null;
   algorithmAlpha?: number | null;
+  crossings?: number;
   // 하이브리드(서울 안팎) 응답 — 서울 밖 구간은 경사 데이터 없이 직선(최단)만.
-  estimatedTimeS?: number | null;
+  estimatedTimeS?: number | null;   // 서울 안(경사반영) + 밖(직선) 합산 소요(초)
   hasExternalLeg?: boolean;
   externalLengthM?: number | null;
-  routeSegments?: any[];
+  routeSegments?: any[];             // 각 seg 에 outside_seoul, coords[[lon,lat],...]
 };
 
 type WalkRoute = {
@@ -49,6 +50,7 @@ type WalkRoute = {
   time: number;
   distance: string;
   steps: number;
+  crossings: number;
   badges: string[];
   desc: string;
   warning?: string;
@@ -110,7 +112,7 @@ const BADGE_CONFIG: Record<
     icon: '↪️',
   },
   shortest: {
-    label: '거리 우선',
+    label: '최단 거리',
     color: C.route3,
     bg: '#FFF8E6',
     icon: '📏',
@@ -189,14 +191,16 @@ function makeBadges(route: ServerRoute) {
   const avgSlope = getNumber(route.avgSlope);
   const detourRatio = getNumber(route.detourRatio);
 
+  // 최단 거리 경로는 거리만 보고 뽑은 경로 — 경사/계단을 피하지 않으므로
+  // '교통약자 경로'·'급경사 회피' 뱃지를 붙이면 안 된다.
+  if (id === 'shortest') {
+    return ['shortest'];
+  }
+
   const badges: string[] = ['accessible'];
 
   if (id === 'safe') {
     badges.push('lowSlope');
-  }
-
-  if (id === 'shortest') {
-    badges.push('shortest');
   }
 
   if (avgSlope !== null) {
@@ -213,6 +217,14 @@ function makeBadges(route: ServerRoute) {
 function makeDescription(route: ServerRoute) {
   const avgSlope = getNumber(route.avgSlope);
   const detourRatio = getNumber(route.detourRatio);
+
+  // 최단 거리 경로 — 거리만 보고 뽑았음을 분명히 하고, 경사/계단을
+  // 피하지 않는다는 점을 함께 알린다.
+  if (route.id === 'shortest') {
+    const slopeText =
+      avgSlope !== null ? ` · 평균 경사도 ${avgSlope.toFixed(2)}%` : '';
+    return `이동 거리가 가장 짧은 경로예요${slopeText} · 경사·계단은 피하지 않아요`;
+  }
 
   const parts: string[] = [];
 
@@ -232,14 +244,11 @@ function makeDescription(route: ServerRoute) {
     return '경사 부담을 줄이는 방향으로 탐색한 경로입니다.';
   }
 
-  if (route.id === 'shortest') {
-    return '이동 거리를 우선하여 탐색한 경로입니다.';
-  }
-
   return '교통약자 이동 조건을 고려한 추천 경로입니다.';
 }
 
 // 하이브리드 응답의 routeSegments 중 outside_seoul 인 것을 회색 직선 구간으로.
+// seg 는 { outside_seoul, coords:[[lon,lat],[lon,lat]] } 또는 start/end 좌표를 가진다.
 function buildExternalSegments(routeSegments: any[] | undefined): import('./RouteMapView').MapRouteSegment[] {
   if (!Array.isArray(routeSegments)) return [];
   const out: import('./RouteMapView').MapRouteSegment[] = [];
@@ -269,7 +278,8 @@ function convertServerRoute(route: ServerRoute): WalkRoute {
   const coordinates = normalizeCoordinates(route.coordinates);
 
   const distance = formatDistance(totalDistanceM);
-  // 하이브리드: estimatedTimeS(서울 안 경사반영 + 밖 직선 합산) 있으면 우선.
+  // 하이브리드 응답은 서울 안(경사 반영) + 밖(직선) 합산 소요를 estimatedTimeS 로 준다 —
+  // 거리 기반 추정보다 정확하므로 있으면 우선한다.
   const estS = getNumber((route as any).estimatedTimeS);
   const time = estS !== null && estS > 0 ? Math.max(1, Math.round(estS / 60)) : estimateTimeMinutes(totalDistanceM);
   const steps = estimateSteps(totalDistanceM);
@@ -282,6 +292,7 @@ function convertServerRoute(route: ServerRoute): WalkRoute {
     time,
     distance,
     steps,
+    crossings: Number(route.crossings ?? 0),
     badges: makeBadges(route),
     desc: makeDescription(route),
     warning:
@@ -414,6 +425,7 @@ const RouteCard = ({
                   : '걸음 정보 없음'
               }
             />
+            <StatPill icon="🚦" value={`횡단보도 ${route.crossings}회`} />
           </View>
         </View>
 
@@ -482,7 +494,7 @@ export default function WalkContent({
     [selectedRouteObj, routeData]
   );
 
-  // 하이브리드: 서울 밖 구간은 경사 데이터가 없어 회색 직선으로만 표시.
+  // 하이브리드 응답: 서울 밖 구간은 경사 데이터가 없어 회색 직선으로만 표시한다.
   const externalSegments = useMemo(
     () => buildExternalSegments(selectedRouteObj?.routeSegments),
     [selectedRouteObj]

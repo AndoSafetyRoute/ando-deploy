@@ -21,7 +21,7 @@ import time
 import numpy as np
 from scipy.spatial import KDTree
 
-from config import MAX_DETOUR_RATIO, FORBIDDEN_PENALTY, BASE_DIR, COVERAGE_SNAP_MAX_M, CoverageError
+from config import MAX_DETOUR_RATIO, FORBIDDEN_PENALTY, BASE_DIR
 from routing.cost import USER_TYPES, slope_cost
 from routing.pathfinder import recalculate_path_slopes
 from routing.basis import precompute_basis_weights, save_basis_weights, load_basis_weights
@@ -91,27 +91,10 @@ class CCHEngine:
     # ── 내부 헬퍼 ────────────────────────────────────────────────────────────
 
     def _nearest_id(self, lon: float, lat: float) -> int:
-        """
-        WGS84 좌표 → 최근접 CCH 노드 ID (KDTree).
-
-        routing/pathfinder.py의 NetworkX find_route()에만 스냅거리 검증을
-        넣었었는데, CCH가 활성화된 환경(그래프 20만 노드 초과 — 서울 전역
-        GEOJSON_PATH 배포 시 항상 이 경로)에서는 find_route/find_distance_route/
-        find_route_with_metric 전부 이 함수 하나로 노드를 찾기 때문에 그 검증을
-        안 거쳤다. 실제로 그래프 범위 밖 좌표(예: 부산)를 넣어도 에러 없이
-        수백 km 떨어진 "그나마 가장 가까운" 노드로 조용히 스냅되는 걸
-        기동 후 실제 호출로 확인함 — NetworkX 전용 수정으로는 CCH 배포에서
-        무의미했던 것. KDTree.query가 이미 미터 단위 거리를 반환하므로
-        여기서 한 번만 검증하면 세 함수 모두 보호된다.
-        """
+        """WGS84 좌표 → 최근접 CCH 노드 ID (KDTree)."""
         x = lon * self._lon_to_m
         y = lat * self._lat_to_m
-        dist_m, idx = self.tree.query([x, y])
-        if dist_m > COVERAGE_SNAP_MAX_M:
-            raise CoverageError(
-                f"서비스 커버리지 밖입니다 (좌표 스냅 거리 {dist_m:.0f}m, "
-                f"허용 {COVERAGE_SNAP_MAX_M:.0f}m)"
-            )
+        _, idx = self.tree.query([x, y])
         return int(idx)
 
     def _path_dist_m(self, path_nodes: list) -> float:
@@ -238,12 +221,16 @@ class CCHEngine:
             "used_alpha":     used_alpha,
         }
 
-    def find_distance_route(self, origin_lonlat: tuple, dest_lonlat: tuple) -> dict:
+    def find_distance_route(self, origin_lonlat: tuple, dest_lonlat: tuple,
+                            safe: bool = False) -> dict:
         """
-        경로② "거리 우선" — ando_dev_final.md 6.1/6.2절.
-        순수 최단거리(alpha=0)가 아니라, 급경사(6개 유형 중 하나라도 금지 판정)만
-        제외한 최단거리를 찾는다. metric_dist_safe가 없으면(구버전 엔진) 순수
-        거리로 폴백한다 — 이 경우 호출측이 안전성을 별도로 검증해야 한다.
+        경로② "최단 경로" — 말 그대로 그래프상 길이가 가장 짧은 경로(다익스트라,
+        alpha=0, 거리 외 제약 없음). 유형별 경로가 우회 배율을 재는 기준선과 동일하므로
+        항상 유형별 경로 거리 ≤ 최단 경로 거리 × MAX_DETOUR_RATIO 관계가 성립한다.
+
+        safe=True 를 주면 예전 동작(6개 유형 중 하나라도 금지인 급경사 엣지를
+        FORBIDDEN_PENALTY 로 회피한 '안전 최단')으로 조회한다 — "거리 우선" 카드가
+        아니라 별도의 안전 baseline 이 필요할 때만 쓴다.
         """
         t0 = time.time()
 
@@ -252,7 +239,9 @@ class CCHEngine:
         if src_id == dst_id:
             raise ValueError("출발지와 목적지가 동일한 노드입니다.")
 
-        metric = self.metric_dist_safe if self.metric_dist_safe is not None else self.metric_dist
+        metric = (self.metric_dist_safe
+                  if safe and self.metric_dist_safe is not None
+                  else self.metric_dist)
         path_nodes = self._query(metric, src_id, dst_id)
         if path_nodes is None:
             raise ValueError("경로를 찾을 수 없습니다.")
@@ -265,10 +254,11 @@ class CCHEngine:
             if total_len > 0 else 0.0
         )
 
-        print(f"[CCH] 거리경로 완료 {time.time() - t0:.2f}s  노드={len(path_nodes)}")
+        print(f"[CCH] 최단경로({'safe' if safe else 'pure'}) 완료 "
+              f"{time.time() - t0:.2f}s  길이={total_len:.0f}m  노드={len(path_nodes)}")
 
         return {
-            "algorithm":      "cch-distance",
+            "algorithm":      "cch-distance-safe" if safe else "cch-distance",
             "origin_node":    self.node_list[src_id],
             "dest_node":      self.node_list[dst_id],
             "path_nodes":     path_nodes,
@@ -276,59 +266,8 @@ class CCHEngine:
             "total_length_m": total_len,
             "total_cost":     total_len,
             "avg_slope_pct":  avg_slope,
-            "user_label":     "거리 우선",
+            "user_label":     "최단 경로",
             "used_alpha":     0.0,
-        }
-
-    def find_shortest_route(self, origin_lonlat: tuple, dest_lonlat: tuple) -> dict:
-        """
-        경로④ "순수 최단거리" — alpha=0, metric_dist 직접 사용.
-        find_distance_route()(=metric_dist_safe, 급경사 배제)와 달리 안전 필터도
-        없는 진짜 최단거리다. 유형 점수에 의한 우회 정도(우회율)를 재는 분모,
-        그리고 NetworkX Dijkstra 최단경로와의 알고리즘 효율 비교용.
-
-        반환 dict 에 계측값(query_ms / total_ms / path_node_count)을 함께 담는다.
-        """
-        t0 = time.perf_counter()
-
-        src_id = self._nearest_id(*origin_lonlat)
-        dst_id = self._nearest_id(*dest_lonlat)
-        if src_id == dst_id:
-            raise ValueError("출발지와 목적지가 동일한 노드입니다.")
-
-        tq = time.perf_counter()
-        path_nodes = self._query(self.metric_dist, src_id, dst_id)
-        query_ms = (time.perf_counter() - tq) * 1000.0
-        if path_nodes is None:
-            raise ValueError("경로를 찾을 수 없습니다.")
-
-        G = self.G
-        segments = recalculate_path_slopes(G, path_nodes)
-        total_len = sum(s["length_m"] for s in segments)
-        avg_slope = (
-            sum(abs(s["slope_pct"]) * s["length_m"] for s in segments) / total_len
-            if total_len > 0 else 0.0
-        )
-
-        total_ms = (time.perf_counter() - t0) * 1000.0
-        print(f"[CCH] 순수최단 완료 {total_ms/1000:.3f}s  "
-              f"쿼리={query_ms:.1f}ms  노드={len(path_nodes)}")
-
-        return {
-            "algorithm":      "cch-shortest",
-            "origin_node":    self.node_list[src_id],
-            "dest_node":      self.node_list[dst_id],
-            "path_nodes":     path_nodes,
-            "segments":       segments,
-            "total_length_m": total_len,
-            "total_cost":     total_len,
-            "avg_slope_pct":  avg_slope,
-            "user_label":     "최단거리(CCH)",
-            "used_alpha":     0.0,
-            # ── 계측 ──
-            "query_ms":        round(query_ms, 3),
-            "total_ms":        round(total_ms, 3),
-            "path_node_count": len(path_nodes),
         }
 
     def find_route_with_metric(self, origin_lonlat: tuple, dest_lonlat: tuple,

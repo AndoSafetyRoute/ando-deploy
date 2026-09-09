@@ -7,6 +7,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import { getAuth, sendPasswordResetEmail } from '@react-native-firebase/auth';
+import { checkEmailRegistered } from '../src/api/accountLookup';
 
 // LoginScreen / SignupScreen 과 짝을 맞춘 배색
 const NAVY        = '#1B0F4A';
@@ -14,9 +15,12 @@ const LIGHT_GRAY  = '#F1F2F6';
 const BORDER_GRAY = '#E4E5EA';
 const TEXT_GRAY   = '#666666';
 
+type Mode = 'id' | 'password';
+
 // 대충 형태만 확인 — 실제 존재 여부는 Firebase 가 판정한다.
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+// Firebase 오류코드 → 사용자 문구. 두 기능이 공유한다.
 function messageForCode(code: string, fallback: string): string {
   switch (code) {
     case 'auth/invalid-email':
@@ -32,14 +36,64 @@ function messageForCode(code: string, fallback: string): string {
   }
 }
 
-// 비밀번호 재설정 전용 화면.
-//  - 이메일·비밀번호로 가입한 계정: Firebase 가 재설정 링크(oobCode)를 메일로 보낸다.
-//  - Google 로그인으로만 가입한 계정: 비밀번호 자체가 없어 재설정 대상이 아니며,
-//    이 경우 Google 로그인을 쓰라고 안내한다.
 export default function FindAccountScreen() {
+  const [mode, setMode]       = useState<Mode>('id');
   const [email, setEmail]     = useState('');
   const [loading, setLoading] = useState(false);
+  // 아이디 확인 결과 — null 이면 아직 조회 안 함
+  const [idResult, setIdResult] = useState<
+    | null
+    | { exists: false }
+    | { exists: true; google: boolean; password: boolean }
+  >(null);
 
+  const switchMode = (next: Mode) => {
+    if (next === mode) return;
+    setMode(next);
+    setIdResult(null);
+  };
+
+  // ── 아이디(가입 여부) 확인 ────────────────────────────────
+  // 이 프로젝트는 Firebase 이메일 열거 방지가 켜져 있어 클라이언트
+  // fetchSignInMethodsForEmail() 이 항상 빈 배열을 준다. 그래서 서버(방식 B)
+  // GET /auth/check-email(Admin SDK) 로 조회한다 — ando-BE/account_lookup.py.
+  // 서버 엔드포인트가 아직 배선되지 않았으면 안내 문구만 띄운다.
+  const handleCheckId = async () => {
+    const target = email.trim().toLowerCase();
+    if (!EMAIL_RE.test(target)) {
+      Alert.alert('입력 오류', '이메일 주소를 정확히 입력해주세요.');
+      return;
+    }
+    setLoading(true);
+    setIdResult(null);
+    try {
+      const r = await checkEmailRegistered(target);
+      if (!r.exists) {
+        setIdResult({ exists: false });
+      } else {
+        setIdResult({
+          exists: true,
+          google:   r.providers.includes('google.com'),
+          password: r.providers.includes('password'),
+        });
+      }
+    } catch (e: any) {
+      if (e?.message === 'NOT_DEPLOYED') {
+        Alert.alert(
+          '준비 중',
+          '아이디 확인 기능은 아직 서버에 배포되지 않았습니다.\n비밀번호 재설정은 정상 이용 가능합니다.',
+        );
+      } else {
+        Alert.alert('조회 실패', e?.message ?? '알 수 없는 오류');
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ── 비밀번호 재설정 메일 ──────────────────────────────────
+  // Firebase 가 재설정 링크(oobCode 포함)를 이메일로 보낸다. 링크에서
+  // 새 비밀번호를 입력하면 즉시 반영된다 — 앱에서 따로 처리할 것 없음.
   const handleResetPassword = async () => {
     const target = email.trim().toLowerCase();
     if (!EMAIL_RE.test(target)) {
@@ -60,8 +114,7 @@ export default function FindAccountScreen() {
       if (code === 'auth/user-not-found') {
         Alert.alert(
           '재설정할 수 없음',
-          '가입되지 않았거나, 비밀번호 없이 Google 로그인으로만 가입된 이메일입니다.\n'
-          + 'Google 로그인으로 가입하셨다면 로그인 화면에서 "Google로 계속하기"를 이용해주세요.',
+          '가입되지 않았거나, 비밀번호 없이 Google 로그인으로만 가입된 이메일입니다.',
         );
       } else {
         Alert.alert('전송 실패', messageForCode(code, e?.message ?? '알 수 없는 오류'));
@@ -70,6 +123,8 @@ export default function FindAccountScreen() {
       setLoading(false);
     }
   };
+
+  const onSubmit = mode === 'id' ? handleCheckId : handleResetPassword;
 
   return (
     <SafeAreaView style={styles.container}>
@@ -82,14 +137,37 @@ export default function FindAccountScreen() {
           <TouchableOpacity onPress={() => router.back()} hitSlop={12} style={styles.backBtn}>
             <Ionicons name="chevron-back" size={26} color={NAVY} />
           </TouchableOpacity>
-          <Text style={styles.headerTitle}>비밀번호 재설정</Text>
+          <Text style={styles.headerTitle}>계정 찾기</Text>
           <View style={styles.backBtn} />
         </View>
 
         <ScrollView contentContainerStyle={styles.inner} keyboardShouldPersistTaps="handled">
+          {/* 모드 전환 */}
+          <View style={styles.segment}>
+            <TouchableOpacity
+              style={[styles.segBtn, mode === 'id' && styles.segBtnActive]}
+              onPress={() => switchMode('id')}
+              activeOpacity={0.85}
+            >
+              <Text style={[styles.segText, mode === 'id' && styles.segTextActive]}>
+                아이디 확인
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.segBtn, mode === 'password' && styles.segBtnActive]}
+              onPress={() => switchMode('password')}
+              activeOpacity={0.85}
+            >
+              <Text style={[styles.segText, mode === 'password' && styles.segTextActive]}>
+                비밀번호 재설정
+              </Text>
+            </TouchableOpacity>
+          </View>
+
           <Text style={styles.desc}>
-            가입한 이메일로 비밀번호 재설정 링크를 보내드립니다. 링크에서 새 비밀번호를
-            입력하면 즉시 반영됩니다.
+            {mode === 'id'
+              ? '가입할 때 사용한 이메일을 입력하면 가입 여부와 로그인 방식을 알려드립니다.'
+              : '가입한 이메일로 비밀번호 재설정 링크를 보내드립니다.'}
           </Text>
 
           <TextInput
@@ -97,29 +175,64 @@ export default function FindAccountScreen() {
             placeholder="이메일"
             placeholderTextColor="#999999"
             value={email}
-            onChangeText={setEmail}
+            onChangeText={(t) => { setEmail(t); setIdResult(null); }}
             keyboardType="email-address"
             autoCapitalize="none"
             autoCorrect={false}
-            onSubmitEditing={handleResetPassword}
-            returnKeyType="send"
+            onSubmitEditing={onSubmit}
+            returnKeyType={mode === 'id' ? 'search' : 'send'}
           />
 
           <TouchableOpacity
             style={[styles.btn, loading && { opacity: 0.7 }]}
-            onPress={handleResetPassword}
+            onPress={onSubmit}
             disabled={loading}
             activeOpacity={0.85}
           >
             {loading
               ? <ActivityIndicator color="#FFFFFF" />
-              : <Text style={styles.btnText}>재설정 메일 보내기</Text>}
+              : <Text style={styles.btnText}>
+                  {mode === 'id' ? '가입 여부 확인' : '재설정 메일 보내기'}
+                </Text>}
           </TouchableOpacity>
 
-          <Text style={styles.hint}>
-            Google 로그인으로만 가입한 계정은 비밀번호가 없어 재설정이 필요 없습니다 —
-            로그인 화면에서 "Google로 계속하기"를 이용해주세요.
-          </Text>
+          {/* 아이디 확인 결과 */}
+          {mode === 'id' && idResult && (
+            <View style={styles.resultBox}>
+              {!idResult.exists ? (
+                <Text style={styles.resultText}>
+                  이 이메일로 가입된 계정이 없습니다. 회원가입을 진행해주세요.
+                </Text>
+              ) : (
+                <>
+                  <Text style={[styles.resultText, { fontWeight: '800', color: NAVY }]}>
+                    가입된 계정입니다.
+                  </Text>
+                  <Text style={styles.resultText}>
+                    로그인 방식:{' '}
+                    {[
+                      idResult.password && '이메일 · 비밀번호',
+                      idResult.google && 'Google 로그인',
+                    ].filter(Boolean).join(' / ') || '알 수 없음'}
+                  </Text>
+                  {idResult.google && !idResult.password && (
+                    <Text style={[styles.resultText, { marginTop: 4 }]}>
+                      비밀번호 없이 Google 로그인으로만 가입된 계정이라, 비밀번호 재설정 대신
+                      Google로 로그인해주세요.
+                    </Text>
+                  )}
+                  {idResult.password && (
+                    <TouchableOpacity
+                      style={styles.inlineLink}
+                      onPress={() => switchMode('password')}
+                    >
+                      <Text style={styles.inlineLinkText}>비밀번호 재설정하기 →</Text>
+                    </TouchableOpacity>
+                  )}
+                </>
+              )}
+            </View>
+          )}
 
           <TouchableOpacity style={styles.backLink} onPress={() => router.replace('/LoginScreen')}>
             <Text style={styles.backText}>
@@ -162,6 +275,33 @@ const styles = StyleSheet.create({
     paddingTop: 24,
     paddingBottom: 40,
   },
+  segment: {
+    flexDirection: 'row',
+    backgroundColor: LIGHT_GRAY,
+    borderRadius: 14,
+    padding: 4,
+    marginBottom: 20,
+  },
+  segBtn: {
+    flex: 1,
+    height: 42,
+    borderRadius: 10,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  segBtnActive: {
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: BORDER_GRAY,
+  },
+  segText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: TEXT_GRAY,
+  },
+  segTextActive: {
+    color: NAVY,
+  },
   desc: {
     fontSize: 14,
     color: TEXT_GRAY,
@@ -192,11 +332,26 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '700',
   },
-  hint: {
-    marginTop: 18,
-    fontSize: 13,
-    color: TEXT_GRAY,
-    lineHeight: 19,
+  resultBox: {
+    marginTop: 20,
+    padding: 16,
+    borderRadius: 14,
+    backgroundColor: LIGHT_GRAY,
+    borderWidth: 1,
+    borderColor: BORDER_GRAY,
+  },
+  resultText: {
+    fontSize: 14,
+    color: '#333333',
+    lineHeight: 20,
+  },
+  inlineLink: {
+    marginTop: 12,
+  },
+  inlineLinkText: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: NAVY,
   },
   backLink: {
     marginTop: 28,

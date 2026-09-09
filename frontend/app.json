@@ -33,7 +33,6 @@
       "expo-web-browser",
       "@react-native-firebase/app",
       "@react-native-firebase/auth",
-      "@react-native-google-signin/google-signin",
       "expo-router",
       [
         "expo-build-properties",
@@ -44,7 +43,8 @@
           }
         }
       ],
-      "expo-font"
+      "expo-font",
+      "@react-native-google-signin/google-signin"
     ]
   }
 }

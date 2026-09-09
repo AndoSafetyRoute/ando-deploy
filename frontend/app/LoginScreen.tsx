@@ -146,12 +146,12 @@ export default function LoginScreen() {
           <Text style={styles.loginBtnText}>이메일로 로그인</Text>
         </TouchableOpacity>
 
-        {/* 비밀번호 재설정 링크 */}
+        {/* 계정 찾기 링크 (아이디 존재 확인 / 비밀번호 재설정 메일) */}
         <TouchableOpacity
           style={styles.findLink}
           onPress={() => router.push('/FindAccountScreen')}
         >
-          <Text style={styles.findLinkText}>비밀번호를 잊으셨나요?</Text>
+          <Text style={styles.findLinkText}>아이디 · 비밀번호를 잊으셨나요?</Text>
         </TouchableOpacity>
 
         {/* 회원가입 링크 */}

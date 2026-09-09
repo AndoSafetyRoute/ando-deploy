@@ -309,16 +309,7 @@ async function computeWalkLegUncached(
     // 그걸 쓴다 — distance/60(=1m/s 가정) 근사치는 완만 경사나 고령자 등
     // 실제 보행 속도를 전혀 반영 못 하고, 특히 경로가 우회로 늘어난 경우
     // 체감보다 훨씬 큰 시간으로 튀는 문제가 있었다.
-    // 서버가 200을 반환해도, 좌표가 서비스 범위 경계에 걸쳐 있으면(백엔드
-    // COVERAGE_SNAP_MAX_M 문턱 바로 안쪽) 여전히 살짝 튄 스냅 거리 위에 경사
-    // 페널티가 얹혀 사람이 걸을 수 없는 속도가 나올 수 있다 — 방어적으로 한 번
-    // 더 걸러낸다(초당 5cm 미만이면 도저히 도보 소요시간일 수 없음).
-    const MIN_WALK_SPEED_MPS = 0.05;
-    const serverTimeMinRaw = Number(res?.estimated_time_min);
-    const impliedSpeedMps = serverTimeMinRaw > 0
-      ? finalDistance / (serverTimeMinRaw * 60)
-      : Infinity;
-    const serverTimeMin = impliedSpeedMps >= MIN_WALK_SPEED_MPS ? serverTimeMinRaw : NaN;
+    const serverTimeMin = Number(res?.estimated_time_min);
     const durationMin = serverTimeMin > 0
       ? Math.max(1, Math.round(serverTimeMin))
       : Math.max(1, Math.round(finalDistance / 60));

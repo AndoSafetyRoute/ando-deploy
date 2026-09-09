@@ -155,6 +155,20 @@ export default function RouteScreen({ navigation, route }: Props) {
   );
   const [to, setTo] = useState(params.to ?? params.endName ?? "도착지");
 
+  // 출발지·도착지의 "실제 값"(좌표·주소). 교환 버튼을 눌러도 이게 함께 뒤집혀야
+  // 지도/거리/소요시간/안내 시작이 반대 방향으로 갱신된다. 예전엔 from/to 라벨만
+  // 바꾸고 좌표는 params 를 그대로 써서 "눌러도 아무 것도 안 바뀌는" 것처럼 보였다.
+  const [endpoints, setEndpoints] = useState({
+    startName: params.startName,
+    startAddress: params.startAddress,
+    startLatitude: params.startLatitude,
+    startLongitude: params.startLongitude,
+    endName: params.endName,
+    endAddress: params.endAddress,
+    endLatitude: params.endLatitude,
+    endLongitude: params.endLongitude,
+  });
+
   const [editingField, setEditingField] = useState<"from" | "to" | null>(null);
   const [walkerType, setWalkerType] = useState("manual_wheelchair");
   const [showSlopeMarkers, setShowSlopeMarkersState] = useState(true);
@@ -167,18 +181,18 @@ export default function RouteScreen({ navigation, route }: Props) {
   // 탭을 열어야만 실제 값으로 바뀐다"는 문제가 해결되고, 유형을 바꿨을 때도 지금 보고
   // 있는 탭과 무관하게 즉시 재조회가 시작된다.
   const hasCoordsForTransit =
-    !!params.startLatitude &&
-    !!params.startLongitude &&
-    !!params.endLatitude &&
-    !!params.endLongitude;
+    !!endpoints.startLatitude &&
+    !!endpoints.startLongitude &&
+    !!endpoints.endLatitude &&
+    !!endpoints.endLongitude;
 
   const transitState = useTransitRoutes({
-    startLatitude: params.startLatitude,
-    startLongitude: params.startLongitude,
-    endLatitude: params.endLatitude,
-    endLongitude: params.endLongitude,
-    startName: params.startName,
-    endName: params.endName,
+    startLatitude: endpoints.startLatitude,
+    startLongitude: endpoints.startLongitude,
+    endLatitude: endpoints.endLatitude,
+    endLongitude: endpoints.endLongitude,
+    startName: endpoints.startName,
+    endName: endpoints.endName,
     walkerType,
   });
 
@@ -257,10 +271,54 @@ export default function RouteScreen({ navigation, route }: Props) {
     }, 50);
   };
 
-  const handleSwap = () => {
-    const prevFrom = from;
+  const handleSwap = async () => {
+    if (routeLoading) return;
+
+    // 1) 표시 라벨 뒤집기
     setFrom(to);
-    setTo(prevFrom);
+    setTo(from);
+
+    // 2) 실제 좌표·주소도 함께 뒤집기 (이게 빠져서 "안 눌리는" 것처럼 보였다)
+    const swapped = {
+      startName: endpoints.endName,
+      startAddress: endpoints.endAddress,
+      startLatitude: endpoints.endLatitude,
+      startLongitude: endpoints.endLongitude,
+      endName: endpoints.startName,
+      endAddress: endpoints.startAddress,
+      endLatitude: endpoints.startLatitude,
+      endLongitude: endpoints.startLongitude,
+    };
+    setEndpoints(swapped);
+
+    // 3) 뒤집힌 방향으로 경로 재탐색 (좌표 없으면 라벨만 바꾸고 종료)
+    const hasCoords =
+      swapped.startLatitude &&
+      swapped.startLongitude &&
+      swapped.endLatitude &&
+      swapped.endLongitude;
+    if (!hasCoords) return;
+
+    try {
+      setRouteLoading(true);
+      const routeResult = await requestRoute({
+        startLatitude: swapped.startLatitude!,
+        startLongitude: swapped.startLongitude!,
+        endLatitude: swapped.endLatitude!,
+        endLongitude: swapped.endLongitude!,
+        userType: walkerType,
+        endStationName: swapped.endName,
+      });
+      setParsedRouteData(routeResult);
+    } catch (error) {
+      console.log("swap re-route error:", error);
+      Alert.alert(
+        "경로 재탐색 실패",
+        "출발지·도착지를 바꾼 경로를 계산하지 못했습니다. 잠시 후 다시 시도해주세요."
+      );
+    } finally {
+      setRouteLoading(false);
+    }
   };
 
   const openWalkerModal = () => {
@@ -279,10 +337,10 @@ export default function RouteScreen({ navigation, route }: Props) {
     saveUserType(toKoreanUserType(nextType)).catch(() => {});
 
     const hasCoords =
-      params.startLatitude &&
-      params.startLongitude &&
-      params.endLatitude &&
-      params.endLongitude;
+      endpoints.startLatitude &&
+      endpoints.startLongitude &&
+      endpoints.endLatitude &&
+      endpoints.endLongitude;
 
     if (!hasCoords) return;
 
@@ -290,12 +348,12 @@ export default function RouteScreen({ navigation, route }: Props) {
       setRouteLoading(true);
 
       const routeResult = await requestRoute({
-        startLatitude: params.startLatitude!,
-        startLongitude: params.startLongitude!,
-        endLatitude: params.endLatitude!,
-        endLongitude: params.endLongitude!,
+        startLatitude: endpoints.startLatitude!,
+        startLongitude: endpoints.startLongitude!,
+        endLatitude: endpoints.endLatitude!,
+        endLongitude: endpoints.endLongitude!,
         userType: nextType,
-        endStationName: params.endName,
+        endStationName: endpoints.endName,
       });
 
       setParsedRouteData(routeResult);
@@ -324,14 +382,14 @@ export default function RouteScreen({ navigation, route }: Props) {
     showSlopeMarkers,
     onToggleSlopeMarkers: handleToggleSlopeMarkers,
     routeData: parsedRouteData,
-    startName: params.startName,
-    startAddress: params.startAddress,
-    startLatitude: params.startLatitude,
-    startLongitude: params.startLongitude,
-    endName: params.endName,
-    endAddress: params.endAddress,
-    endLatitude: params.endLatitude,
-    endLongitude: params.endLongitude,
+    startName: endpoints.startName,
+    startAddress: endpoints.startAddress,
+    startLatitude: endpoints.startLatitude,
+    startLongitude: endpoints.startLongitude,
+    endName: endpoints.endName,
+    endAddress: endpoints.endAddress,
+    endLatitude: endpoints.endLatitude,
+    endLongitude: endpoints.endLongitude,
   };
 
   const renderContent = () => {
@@ -427,7 +485,15 @@ export default function RouteScreen({ navigation, route }: Props) {
           </TouchableOpacity>
         </View>
 
-        <TouchableOpacity style={styles.swapButton} onPress={handleSwap}>
+        <TouchableOpacity
+          style={styles.swapButton}
+          onPress={handleSwap}
+          disabled={routeLoading}
+          activeOpacity={0.6}
+          hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+          accessibilityRole="button"
+          accessibilityLabel="출발지와 도착지 바꾸기"
+        >
           <Text style={styles.swapIcon}>⇅</Text>
         </TouchableOpacity>
       </View>
