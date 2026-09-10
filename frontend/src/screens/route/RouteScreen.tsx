@@ -25,31 +25,35 @@ import { resolveCurrentLocation } from "../../utils/currentLocation";
 
 const KAKAO_REST_API_KEY = process.env.EXPO_PUBLIC_KAKAO_REST_API_KEY;
 
-// 텍스트 한 줄 → 좌표. 카카오 키워드 검색 첫 결과. 실패하면 null.
-async function geocodeKeyword(
-  query: string
-): Promise<{ name: string; address: string; latitude: string; longitude: string } | null> {
+type GeoPlace = { name: string; address: string; latitude: string; longitude: string };
+
+// 카카오 키워드 검색 → 후보 목록. size 개까지.
+async function geocodeKeywordList(query: string, size = 6): Promise<GeoPlace[]> {
   const q = query.trim();
-  if (!q || !KAKAO_REST_API_KEY) return null;
+  if (!q || !KAKAO_REST_API_KEY) return [];
   try {
     const res = await fetch(
       "https://dapi.kakao.com/v2/local/search/keyword.json?query=" +
-        encodeURIComponent(q) + "&size=1",
+        encodeURIComponent(q) + `&size=${size}`,
       { headers: { Authorization: `KakaoAK ${KAKAO_REST_API_KEY}` } }
     );
-    if (!res.ok) return null;
+    if (!res.ok) return [];
     const data = await res.json();
-    const d = data?.documents?.[0];
-    if (!d) return null;
-    return {
+    return (data?.documents ?? []).map((d: any) => ({
       name: d.place_name || q,
       address: d.road_address_name || d.address_name || "",
       latitude: String(d.y),
       longitude: String(d.x),
-    };
+    }));
   } catch {
-    return null;
+    return [];
   }
+}
+
+// 첫 결과만 (엔터/포커스아웃 폴백용).
+async function geocodeKeyword(query: string): Promise<GeoPlace | null> {
+  const list = await geocodeKeywordList(query, 1);
+  return list[0] ?? null;
 }
 
 type TransportKey = "transit" | "car" | "walk";
@@ -200,6 +204,9 @@ export default function RouteScreen({ navigation, route }: Props) {
   });
 
   const [editingField, setEditingField] = useState<"from" | "to" | null>(null);
+  const [suggestions, setSuggestions] = useState<GeoPlace[]>([]);
+  const [suggestLoading, setSuggestLoading] = useState(false);
+  const pickingRef = useRef(false); // 추천 항목 탭 중에는 onBlur 지오코딩을 건너뛴다
   const [walkerType, setWalkerType] = useState("manual_wheelchair");
   const [showSlopeMarkers, setShowSlopeMarkersState] = useState(true);
   const [tempWalkerType, setTempWalkerType] = useState("manual_wheelchair");
@@ -387,14 +394,42 @@ export default function RouteScreen({ navigation, route }: Props) {
     }
   };
 
+  // 편집 중인 칸의 텍스트로 연관검색어(추천 장소) 목록을 디바운스 조회한다.
+  useEffect(() => {
+    if (!editingField) { setSuggestions([]); return; }
+    const q = (editingField === "from" ? from : to).trim();
+    const prevName = editingField === "from" ? endpoints.startName : endpoints.endName;
+    if (!q || q === prevName) { setSuggestions([]); return; }
+    let alive = true;
+    setSuggestLoading(true);
+    const t = setTimeout(async () => {
+      const list = await geocodeKeywordList(q, 6);
+      if (!alive) return;
+      setSuggestions(list);
+      setSuggestLoading(false);
+    }, 250);
+    return () => { alive = false; clearTimeout(t); };
+  }, [editingField, from, to, endpoints.startName, endpoints.endName]);
+
+  // 추천 목록에서 한 곳을 고름 → 그 좌표로 재탐색.
+  const pickSuggestion = async (field: "from" | "to", place: GeoPlace) => {
+    pickingRef.current = true;
+    setSuggestions([]);
+    setEditingField(null);
+    if (field === "from") setFrom(place.name); else setTo(place.name);
+    await applyEndpointAndReroute(field, place);
+    setTimeout(() => { pickingRef.current = false; }, 300);
+  };
+
   // 텍스트 입력 확정(엔터 or 포커스 아웃) → 카카오로 지오코딩 후 재탐색.
-  // onSubmitEditing 과 onBlur 가 연달아 부르므로 재진입을 ref 로 막는다.
+  // 추천 항목을 탭한 경우(pickingRef)엔 건너뛴다. 재진입도 ref 로 막는다.
   const committingRef = useRef(false);
   const commitFieldEdit = async (field: "from" | "to") => {
-    if (committingRef.current) return;
+    if (committingRef.current || pickingRef.current) return;
     const typed = (field === "from" ? from : to).trim();
     const prevName = field === "from" ? endpoints.startName : endpoints.endName;
     setEditingField(null);
+    setSuggestions([]);
     if (!typed || typed === prevName) return;
 
     committingRef.current = true;
@@ -629,6 +664,36 @@ export default function RouteScreen({ navigation, route }: Props) {
           <Text style={styles.swapIcon}>⇅</Text>
         </TouchableOpacity>
       </View>
+
+      {/* 연관검색어(추천 장소) 목록 — 출발/도착 칸을 편집 중일 때 */}
+      {editingField && (suggestLoading || suggestions.length > 0) && (
+        <View style={styles.suggestBox}>
+          {suggestLoading && suggestions.length === 0 ? (
+            <View style={styles.suggestRow}>
+              <ActivityIndicator size="small" color={NAVY} />
+              <Text style={styles.suggestName}>  검색 중…</Text>
+            </View>
+          ) : (
+            suggestions.map((s, i) => (
+              <TouchableOpacity
+                key={`${s.latitude},${s.longitude},${i}`}
+                style={styles.suggestRow}
+                activeOpacity={0.7}
+                onPressIn={() => { pickingRef.current = true; }}
+                onPress={() => pickSuggestion(editingField, s)}
+              >
+                <Ionicons name="location-outline" size={16} color={C.textMute} />
+                <View style={{ flex: 1, marginLeft: 8 }}>
+                  <Text style={styles.suggestName} numberOfLines={1}>{s.name}</Text>
+                  {!!s.address && (
+                    <Text style={styles.suggestAddr} numberOfLines={1}>{s.address}</Text>
+                  )}
+                </View>
+              </TouchableOpacity>
+            ))
+          )}
+        </View>
+      )}
 
       {/* 보행자 맞춤경로 / 보행약자 유형 / 교통수단 탭 - 접기/펼치기 가능 */}
       <Animated.View
@@ -1049,6 +1114,34 @@ const styles = StyleSheet.create({
   contentArea: {
     flex: 1,
     marginTop: 10,
+  },
+
+  suggestBox: {
+    backgroundColor: C.white,
+    marginHorizontal: 16,
+    marginTop: 6,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: C.line,
+    overflow: "hidden",
+  },
+  suggestRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+    borderBottomWidth: 1,
+    borderBottomColor: C.line,
+  },
+  suggestName: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: C.text,
+  },
+  suggestAddr: {
+    marginTop: 2,
+    fontSize: 11.5,
+    color: C.textMute,
   },
 
   panelHandle: {
