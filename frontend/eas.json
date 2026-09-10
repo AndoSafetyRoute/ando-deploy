@@ -9,7 +9,7 @@
       "distribution": "internal",
       "android": { "buildType": "apk" },
       "env": {
-        "EXPO_PUBLIC_ROUTE_API_URL": "http://REPLACE_WITH_TEAM_BACKEND:5000",
+        "EXPO_PUBLIC_ROUTE_API_URL": "http://3.34.107.148",
         "EXPO_PUBLIC_KAKAO_JAVASCRIPT_KEY": "e98652aedb788ce4093dd6ea4bc2eeb1",
         "EXPO_PUBLIC_KAKAO_REST_API_KEY": "fe887ce01b8078527b283d15aa85ea20",
         "EXPO_PUBLIC_SUPABASE_URL": "https://olacebhnmpchudtlalqa.supabase.co",
@@ -20,7 +20,7 @@
       "distribution": "internal",
       "android": { "buildType": "apk" },
       "env": {
-        "EXPO_PUBLIC_ROUTE_API_URL": "http://REPLACE_WITH_TEAM_BACKEND:5000",
+        "EXPO_PUBLIC_ROUTE_API_URL": "http://3.34.107.148",
         "EXPO_PUBLIC_KAKAO_JAVASCRIPT_KEY": "e98652aedb788ce4093dd6ea4bc2eeb1",
         "EXPO_PUBLIC_KAKAO_REST_API_KEY": "fe887ce01b8078527b283d15aa85ea20",
         "EXPO_PUBLIC_SUPABASE_URL": "https://olacebhnmpchudtlalqa.supabase.co",
@@ -31,7 +31,7 @@
       "autoIncrement": true,
       "android": { "buildType": "app-bundle" },
       "env": {
-        "EXPO_PUBLIC_ROUTE_API_URL": "http://REPLACE_WITH_TEAM_BACKEND:5000",
+        "EXPO_PUBLIC_ROUTE_API_URL": "http://3.34.107.148",
         "EXPO_PUBLIC_KAKAO_JAVASCRIPT_KEY": "e98652aedb788ce4093dd6ea4bc2eeb1",
         "EXPO_PUBLIC_KAKAO_REST_API_KEY": "fe887ce01b8078527b283d15aa85ea20",
         "EXPO_PUBLIC_SUPABASE_URL": "https://olacebhnmpchudtlalqa.supabase.co",
