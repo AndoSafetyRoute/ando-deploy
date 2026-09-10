@@ -80,6 +80,9 @@ type RouteSegment = {
   direction?: string;
   name?: string;
   zone?: string;
+  // 하이브리드(서울 밖) 직선 구간 — 경사 데이터 없음.
+  // 소요시간 측정·구간 피드백·신호 A/D 판단에서 제외한다(중도 종료 구간과 동일 취급).
+  outsideSeoul?: boolean;
 };
 
 // slopeMean/zone 추가 — 오르막/내리막 화살표 표시용
@@ -996,33 +999,41 @@ export default function NavigationScreen({ navigation, route }: Props) {
             if (dist >= PROXIMITY_THRESHOLD) break;
 
             const elapsed = now - segmentStartTimesRef.current[curIdx];
-            measuredMsRef.current[curIdx] = elapsed;
-
-            const rid = serverRouteIdRef.current;
-            if (rid !== null) {
-              const segIdx = curIdx;
-              getAuthToken().then((token) => {
-                if (!token) return;
-                submitSegment(rid, {
-                  index: segIdx, distanceM: seg.length ?? 5,
-                  slopePercent: seg.slope ?? 0, elapsedMs: elapsed,
-                  measured: true, zone: seg.zone, direction: seg.direction,
-                }, token).catch(() => {});
-              }).catch(() => {});
-            }
-
             const nextSeg = curIdx + 1 < routeSegments.length ? routeSegments[curIdx + 1] : null;
-            // 신호 A — 이 구간을 현재 bin 에 누적하고, bin 경계면 관측 1행을 돌려받는다.
-            const obs = binTrackerRef.current?.completeSegment(
-              seg.length ?? 5,
-              nextSeg ? (nextSeg.slope ?? 0) : null,
-              now,
-              serverRouteIdRef.current,
-            );
-            if (obs) {
-              collectSessionRef.current?.addSlopeObservation(obs);
-              // 안전 음성 안내는 zone 기준 유지 (self-dedupe)
-              announceZoneEntry(nextSeg ? getZoneKey(nextSeg.zone, nextSeg.direction) : null);
+
+            if (seg.outsideSeoul) {
+              // 서울 밖(경사 데이터 없는 직선) 구간 — 측정·제출·신호 A/D 판단에서 제외.
+              // GPS 공백/중도 종료 구간과 동일하게 현재 bin 을 무효화하고 그냥 지나간다.
+              binTrackerRef.current?.invalidateCurrent(now);
+            } else {
+              measuredMsRef.current[curIdx] = elapsed;
+
+              const rid = serverRouteIdRef.current;
+              if (rid !== null) {
+                const segIdx = curIdx;
+                getAuthToken().then((token) => {
+                  if (!token) return;
+                  submitSegment(rid, {
+                    index: segIdx, distanceM: seg.length ?? 5,
+                    slopePercent: seg.slope ?? 0, elapsedMs: elapsed,
+                    measured: true, zone: seg.zone, direction: seg.direction,
+                  }, token).catch(() => {});
+                }).catch(() => {});
+              }
+
+              // 신호 A — 이 구간을 현재 bin 에 누적하고, bin 경계면 관측 1행을 돌려받는다.
+              // (다음 구간이 서울 밖이면 그 경사(0)는 넘기지 않는다.)
+              const obs = binTrackerRef.current?.completeSegment(
+                seg.length ?? 5,
+                nextSeg && !nextSeg.outsideSeoul ? (nextSeg.slope ?? 0) : null,
+                now,
+                serverRouteIdRef.current,
+              );
+              if (obs) {
+                collectSessionRef.current?.addSlopeObservation(obs);
+                // 안전 음성 안내는 zone 기준 유지 (self-dedupe)
+                announceZoneEntry(nextSeg ? getZoneKey(nextSeg.zone, nextSeg.direction) : null);
+              }
             }
 
             curIdx += 1;
@@ -1184,6 +1195,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
           routeSegments.forEach((seg, i) => {
             const measured = measuredMsRef.current[i];
             if (measured == null) return; // 미통과·부분통과 → 저장 안 함
+            if (seg.outsideSeoul) return; // 서울 밖(경사 데이터 없음) → 판단 구간 제외
             segments.push({
               index: i,
               distanceM: seg.length ?? 5,
