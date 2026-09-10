@@ -13,10 +13,17 @@
 | `backend/scripts/densify_slope.py` | `<2m` 도로 세그먼트를 버리지 않고 유지 (직전 경사 상속). 끊겨 있던 도보망 연결 복원 |
 | `backend/routing/graph.py` | 그래프 빌드 시 5m 이내 미연결 노드쌍에 보행 링크 추가(`SNAP_TOL_M=5.0`) + 교량/터널/layer 태그 적재 |
 | `backend/routing/cch_engine.py` | CCH inertial order 를 `<geojson>.cchorder.pkl` 로 디스크 캐시 → 2회차 부팅부터 ~120초 단축 |
-| `backend/app.py` | `/route` 스냅 진단 로그 (`[ROUTE]` / `[SNAP/CCH]`) |
+| `backend/app.py` | `/route` 스냅 진단 로그 (`[ROUTE]` / `[SNAP/CCH]`) + **`@app.post("/route")` 데코레이터가 헬퍼 함수에 잘못 붙어 있던 것 수정** (`fc780ed`) |
+| `backend/requirements.txt` | **`python-multipart==0.0.32` 추가** — 없으면 컨테이너 부팅이 즉시 크래시 (`fastapi` Form 엔드포인트 필수 의존성) |
 | `frontend/eas.json` | v6 이후 누락됐던 것 복구. **값은 placeholder — 아래 2번에서 채워야 함** |
 
 **효과**: 서울역 동/서 횡단 도보경로가 14,278m → 476m (검증 완료). 코드만으로는 안 되고 **아래 3번 데이터 파일 교체가 반드시 있어야** 완전히 고쳐집니다.
+
+> ⚠️ **`/route` 데코레이터 버그**: `a380d97`(최단거리 카드) 에서 헬퍼 함수 2개가
+> `@app.post("/route")` 와 `def api_route` 사이에 삽입돼 `/route` 가 잘못된 핸들러로
+> 등록됨 → 모든 `/route` 호출이 HTTP 422. `release_v8` (`fc780ed`) 에서 수정됨.
+> **같은 버그가 `ando-BE gdy/deploy-v2` (a380d97) 와 `release_v7` 에도 있음** — 거기서
+> 분기하는 다른 작업은 `ando-BE gdy/deploy-v2-routing 7a60638` 의 1줄 수정을 가져갈 것.
 
 ---
 
@@ -114,15 +121,15 @@ EOF
 
 ## 5. 서버 메모리 요구사항
 
-- **pkl 로드 부팅**: 피크 RSS 약 4.5 ~ 5 GB (그래프) + CCH 구조 → 합산 **6 GB 에 근접**.
-- 현재 `docker-compose.yml` `deploy.resources.limits.memory: 6G` → **8G 로 올리는 것을 권장.** 6G 로 두면 CCH 전처리 중 OOM 가능.
+- **이 문서 작성 중 실측** (pkl 로드 + CCH 부팅, 이 배포본 그대로): 프로세스 RSS 피크 **약 8.2 GB**, 부팅 완료 후 정착 **약 6.4 ~ 7.8 GB**.
+- 현재 `docker-compose.yml` `deploy.resources.limits.memory: 6G` → **최소 8G, 여유롭게 10G 권장.** 6G 로 두면 CCH 전처리 중 OOM 확정.
   ```yaml
   deploy:
     resources:
       limits:
-        memory: 8G        # 6G → 8G
+        memory: 10G       # 6G → 10G (CCH 부팅 피크 ~8.2GB 실측)
       reservations:
-        memory: 4G
+        memory: 6G
   ```
 - geojson 에서 pkl 을 **재빌드**해야 하는 상황이면 (pkl 을 못 받았을 때): 네이티브 빌더는 8~9 GB 피크라 16 GB 머신에서 OOM 납니다. 작업자에게 lean 스트리밍 빌더(`build_lean.py`, 피크 6.5 GB) 를 받으세요. **가급적 pkl 을 직접 받아서 재빌드를 피하세요.**
 
@@ -130,9 +137,9 @@ EOF
 
 ## 6. 첫 부팅
 
-- 서버에 `road_10m_slope_seoul.cchorder.pkl` 이 **없으므로** 첫 부팅은 CCH inertial order 계산에 **약 120 ~ 150 초** 걸립니다. `/health` 가 그동안 안 뜹니다.
+- 서버에 `road_10m_slope_seoul.cchorder.pkl` 이 **없으므로** 첫 부팅은 CCH inertial order 계산에 **약 120 ~ 150 초** 걸립니다. `/health` 가 그동안 안 뜹니다. (전체 부팅: 그래프 로드 ~20s + 교차로 사전계산 + CCH 전처리.)
 - `backend/Dockerfile` 의 `HEALTHCHECK --start-period=600s` 라서 이 시간은 이미 감안돼 있습니다. **로드밸런서/오케스트레이터의 헬스체크 grace period 도 최소 5분**으로 잡으세요.
-- 부팅 완료 후 `data/` 에 `road_10m_slope_seoul.cchorder.pkl` (약 8.5 MB) 이 생깁니다. **두 번째 부팅부터는 ~0.2초**로 끝납니다. 이 파일을 지우지 마세요 (data 볼륨에 유지되면 재시작 빨라짐).
+- 부팅 완료 후 `data/` 에 `road_10m_slope_seoul.cchorder.pkl` (약 8.5 MB) 이 생깁니다. **두 번째 부팅부터는** inertial order 계산을 건너뛰어 CCH 전처리가 **약 80 초**로 줄어듭니다 (KDTree·엣지배열·7개 metric 은 매번 다시 만듦 — "~0.2초" 는 order 계산 단계만). 이 파일을 지우지 마세요.
 - 부팅 성공 확인:
   ```bash
   curl -s http://localhost:5000/health
@@ -194,6 +201,25 @@ curl -s -XPOST $BASE/route -H 'Content-Type: application/json' -d \
 
 ---
 
+## 8.5 이미 검증된 것 / 부가 엔드포인트 참고
+
+이 배포본을 로컬에서 실제 기동해 전 엔드포인트를 돌려봤습니다 (`ando-BE/data` 의 새 geojson+pkl, CCH 엔진 사용).
+
+**정상 (FAIL 0):**
+- `/route` 도보 — **6개 이동유형 전부 + 최단** × 10개 OD: 우회·블로업 없음. 동측→서측 **486 m** (CCH, NX baseline 476 대비 +2%). 한강 건너편 OD 도 정상 도하.
+- `/route/safe` (대중교통 도보구간) — 6유형 × `light` F/T: `/route` 와 거리 일치, `light=true` 시 nav segment 축약.
+- `/route?candidates=compare` — 6유형: 유형별+최단 카드 정상, 블로업 없음.
+- `end_station_name="서울역"` — 6유형: 도착지가 역 출구(126.97221, 37.55462)로 스냅, 경로 ~1,810 m.
+- 서울 경계 밖(광명) — `routes` 2개(유형별+최단) 하이브리드 응답.
+- `/bus/lowfloor?route_no=402` → `{licensed:37, lowfloor:26, ratio:70.3}` 정상.
+- `/subway/station-summary`, `/subway/chargers` → 200 (graceful).
+
+**데이터/키 의존 — 코드 문제 아님, FE 폴백으로 처리됨:**
+- `/subway/best-exit?station=서울역` → **404** ("이용 가능한 출구 없음"). 지하철 편의시설 DB 에 서울역 엘리베이터/에스컬레이터 출구 데이터가 없음. FE 는 404 시 답사 기반 하드코딩 출구로 폴백 (설계된 동작). 서울역 출구 데이터를 넣으려면 `subway_data` 디렉토리 보강 필요 — **이번 배포 블로커 아님.**
+- `/bus/arrival` → `{available:false, reason:"route_id_unresolved"}`. 서울시 버스도착 API 키(`.env`)가 서버에 있어야 실시간 배지가 뜸. 없으면 FE 는 정적(카카오) 시간만 표시 (graceful).
+
+---
+
 ## 9. 롤백
 
 ```bash
@@ -212,8 +238,8 @@ rm -f road_10m_slope_seoul.cchorder.pkl
 
 | repo | 브랜치 | commit | 내용 |
 |---|---|---|---|
-| ando-deploy | `release_v8` | `e413865` | 이 배포본 |
-| ando-BE | `gdy/deploy-v2-routing` | `ebb6fa1` | backend 소스 원본 (release_v8/backend 와 5개 파일 byte-identical) |
+| ando-deploy | `release_v8` | `fc780ed` | 이 배포본 (`/route` 데코레이터 + python-multipart 수정 포함) |
+| ando-BE | `gdy/deploy-v2-routing` | `7a60638` | backend 소스 원본 (release_v8/backend `app.py` 와 byte-identical) |
 | ando-BE | `gdy/seoul-routing` | `5b2bf50` | 우회 수정 6커밋 + 회귀 하네스 (`tests/`) |
 | ando-FE | `gdy/fe-personalization` | `8cae653` | frontend 소스 (routeApi 폴백 포트 정정 포함) |
 
