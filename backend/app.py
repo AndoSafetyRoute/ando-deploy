@@ -986,7 +986,6 @@ def _snap_debug(tag: str, lon: float, lat: float) -> None:
         print(f"[SNAP] {tag} 스냅 로깅 실패: {e}")
 
 
-@app.post("/route")
 def _segments_payload(segments: list, user_type: str) -> list:
     """result['segments'] → FE(WalkContent/NavigationScreen) 호환 seg 배열.
 
@@ -1042,6 +1041,7 @@ def _shortest_route_card(origin: tuple, dest: tuple, user_type: str,
     }
 
 
+@app.post("/route")
 def api_route(
     body: RouteRequest,
     db: Session = Depends(get_db),
