@@ -154,6 +154,11 @@ def make_features(feat: dict, dem_data, transform, nodata, step_m: float,
     # Geofabrik 형식은 "fclass", 기존 OSM은 "highway"
     highway = props.get("highway") or props.get("fclass") or "footway"
     name    = props.get("name") or props.get("name:ko") or ""
+    # 구조물 속성 통과 — 교량/터널 slope 처리 + _connect_components 의
+    # geometry 기반 연결 거부 조건에 필요 (그전엔 highway/name 만 통과돼 유실됐음).
+    layer   = props.get("layer", 0)
+    bridge  = props.get("bridge", "F")
+    tunnel  = props.get("tunnel", "F")
 
     geom = feat["geometry"]
     all_lines = (
@@ -176,24 +181,58 @@ def make_features(feat: dict, dem_data, transform, nodata, step_m: float,
         ]
         elevs = smooth_elevations(raw_elevs, smooth_window) if smooth_window > 0 else raw_elevs
 
+        # 첫 sub-segment 가 <2m 라 상속 대상이면 채울 값이 없으므로,
+        # 그 line 의 첫 유효 경사가 나오면 소급 적용한다(아래 backfill_idx).
+        prev_slope = 0.0
+        have_real_slope = False
+        line_start = len(features)
+        backfill_idx: list[int] = []
+
         for i in range(len(dense) - 1):
             lon1, lat1 = dense[i]
             lon2, lat2 = dense[i + 1]
             seg_len = haversine(lon1, lat1, lon2, lat2)
-            if seg_len < 2.0:   # 2m 미만 구간 제외 (DEM 해상도 3m에서 노이즈)
-                continue
 
             e1 = elevs[i]
             e2 = elevs[i + 1]
+            slope_inherited = False
 
-            if e1 is not None and e2 is not None:
+            if seg_len < 2.0:
+                # 2m 미만: topology 보존을 위해 세그먼트를 유지하되, DEM 해상도(3m)
+                # 대비 너무 짧아 경사 계산이 폭주(오차 0.24m/1.5m ≈ 16%)한다.
+                # → 직전 세그먼트 경사를 상속. 0 으로 두면 라우터의 공짜 지름길이 됨.
+                slope_pct = prev_slope
+                slope_inherited = True
+                e1 = e1 if e1 is not None else 0.0
+                e2 = e2 if e2 is not None else 0.0
+                if not have_real_slope:
+                    backfill_idx.append(len(features))
+            elif e1 is not None and e2 is not None:
                 raw = (e2 - e1) / seg_len * 100
                 # 물리적 최대 경사도 클리핑: 보행로 최대 약 ±60%
                 slope_pct = round(max(-60.0, min(60.0, raw)), 3)
+                prev_slope = slope_pct
+                have_real_slope = True
             else:
                 slope_pct = 0.0
                 e1 = e1 or 0.0
                 e2 = e2 or 0.0
+                prev_slope = slope_pct
+                have_real_slope = True
+
+            props_out = {
+                "highway":         highway,
+                "name":            name,
+                "length_m":        round(seg_len, 2),
+                "slope_pct":       slope_pct,       # 부호 있음: + 오르막 / - 내리막
+                "elevation_start": round(e1, 2),
+                "elevation_end":   round(e2, 2),
+                "layer":           layer,
+                "bridge":          bridge,
+                "tunnel":          tunnel,
+            }
+            if slope_inherited:
+                props_out["slope_inherited"] = True
 
             features.append({
                 "type": "Feature",
@@ -201,15 +240,19 @@ def make_features(feat: dict, dem_data, transform, nodata, step_m: float,
                     "type": "LineString",
                     "coordinates": [[lon1, lat1], [lon2, lat2]],
                 },
-                "properties": {
-                    "highway":         highway,
-                    "name":            name,
-                    "length_m":        round(seg_len, 2),
-                    "slope_pct":       slope_pct,       # 부호 있음: + 오르막 / - 내리막
-                    "elevation_start": round(e1, 2),
-                    "elevation_end":   round(e2, 2),
-                },
+                "properties": props_out,
             })
+
+        # line 선두의 <2m 세그먼트들이 0 을 상속했으면 첫 유효 경사로 소급
+        if backfill_idx and len(features) > line_start:
+            first_real = next(
+                (features[j]["properties"]["slope_pct"]
+                 for j in range(line_start, len(features))
+                 if not features[j]["properties"].get("slope_inherited")),
+                0.0,
+            )
+            for j in backfill_idx:
+                features[j]["properties"]["slope_pct"] = first_real
     return features
 
 
@@ -294,6 +337,8 @@ def main():
             "step_m":         step_m,
             "smooth_window":  smooth_window,
             "total_features": len(out_features),
+            "keeps_short_segments": True,   # <2m 세그먼트 유지(경사 상속) — topology 보존
+            "structure_tags":       True,   # layer/bridge/tunnel 통과
         },
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)

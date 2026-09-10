@@ -7,6 +7,7 @@ app.py — Ando 접근성 경로 탐색 FastAPI 서버
 "로그인은 성공하는데 그 다음 백엔드 호출이 전부 실패하는" 원인이 된다.
 0.0.0.0 으로 띄워야 같은 네트워크의 다른 기기에서 접속할 수 있다.
 """
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Depends, Header
@@ -17,7 +18,8 @@ from pydantic import BaseModel
 
 from config import GEOJSON_PATH
 from routing import build_graph, find_route, USER_TYPES, classify_zone, precompute_edge_costs
-from routing.search import build_spatial_index
+from routing.search import build_spatial_index, nearest_node
+from routing.graph import haversine
 from routing.cch_engine import build_cch_engine, CCHEngine
 from routing.personal_cache import PersonalMetricCache
 from places.kakao import search_places, debug_raw
@@ -313,7 +315,9 @@ async def lifespan(app: FastAPI):
     if G.number_of_nodes() > 200_000:
         try:
             print(f"[CCH] 노드 {G.number_of_nodes():,}개 - CCH 전처리 시작 (1~5분 소요)")
-            _cch = build_cch_engine(G)
+            # inertial order 디스크 캐시 - 위상 동일 시 재부팅에서 ~146s 절약
+            _cch_order_cache = os.path.splitext(GEOJSON_PATH)[0] + ".cchorder.pkl"
+            _cch = build_cch_engine(G, order_cache_path=_cch_order_cache)
             print("[CCH] 준비 완료 - 이후 /route 요청은 CCH로 처리됩니다")
             # 개인 맞춤 metric 캐시 (⑧) - 시작 시엔 비어있음, 배치 스크립트(⑨)가
             # /personal/refresh 등으로 채워야 우선 채워짐. 요청 경로에서는
@@ -955,6 +959,33 @@ def api_debug_search(q: str = Query(...)):
 
 
 # ── 경로 탐색 ─────────────────────────────────────────────────────────────────
+def _snap_debug(tag: str, lon: float, lat: float) -> None:
+    """스냅 전 좌표 → 실제 매칭되는 그래프 노드와 그 사이 거리(m)를 로그로 남긴다.
+
+    CCH KDTree는 LCC(최대 연결성분)에서 살아남은 노드만 담고 있으므로,
+    거리가 수십~수백 m로 나오면 원래 가까운 도로가 그래프에서 잘려나갔다는
+    뜻이다(= _connect_components의 LCC 삭제가 원인).
+    """
+    try:
+        if _cch is not None:
+            idx  = _cch._nearest_id(lon, lat)
+            node = _cch.node_list[idx]
+            nlon = _cch.G.nodes[node]["lon"]
+            nlat = _cch.G.nodes[node]["lat"]
+            src  = "CCH"
+        else:
+            node, _ = nearest_node(G, lon, lat)   # (node, dist) 튜플 반환
+            nlon = G.nodes[node]["lon"]
+            nlat = G.nodes[node]["lat"]
+            src  = "NX"
+        d    = haversine(lon, lat, nlon, nlat)
+        flag = "  ⚠️ 원거리 스냅" if d > 50 else ""
+        print(f"[SNAP/{src}] {tag}: 입력=({lon:.6f},{lat:.6f}) "
+              f"→ 노드=({nlon:.6f},{nlat:.6f})  거리={d:.1f}m{flag}")
+    except Exception as e:
+        print(f"[SNAP] {tag} 스냅 로깅 실패: {e}")
+
+
 @app.post("/route")
 def _segments_payload(segments: list, user_type: str) -> list:
     """result['segments'] → FE(WalkContent/NavigationScreen) 호환 seg 배열.
@@ -1053,6 +1084,15 @@ def api_route(
                 if _hybrid is not None:
                     return _hybrid
                 # 하이브리드도 실패 → 아래 기존 흐름으로 떨어져 결국 에러 처리
+        # ── 진단 로그: 입력 좌표 + 실제 스냅되는 노드와의 거리 ────────────────
+        snapped = dest != (body.dest_lon, body.dest_lat)
+        print(f"[ROUTE] user_type={body.user_type}  mode={body.mode}  "
+              f"end_station={body.end_station_name!r}")
+        print(f"[ROUTE] origin=({origin[0]:.6f},{origin[1]:.6f})  "
+              f"dest=({dest[0]:.6f},{dest[1]:.6f})"
+              + (f"  (역출구 스냅 전=({body.dest_lon:.6f},{body.dest_lat:.6f}))" if snapped else ""))
+        _snap_debug("origin", origin[0], origin[1])
+        _snap_debug("dest",   dest[0],   dest[1])
 
         # CCH 우선 (서울 전역 그래프), fallback → NetworkX
         if _cch is not None and body.mode == "accessibility":

@@ -8,7 +8,7 @@ import pickle
 import warnings
 import networkx as nx
 
-from config import FLAT_THRESHOLD, STDDEV_THRESHOLD, BRIDGE_GAP_M
+from config import FLAT_THRESHOLD, STDDEV_THRESHOLD, BRIDGE_GAP_M, SNAP_TOL_M
 
 
 def haversine(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
@@ -119,6 +119,11 @@ def _build_graph_densified(data: dict) -> nx.DiGraph:
         elevation_end   = float(props.get("elevation_end",   0.0))
         highway        = props.get("highway") or ""
         name           = props.get("name") or ""
+        # 구조물 태그 통과 — Phase 2-a(교량·터널 DEM 보정)에서 세그먼트 식별에 필요.
+        # densify_slope.py 가 이미 전 feature 에 layer/bridge/tunnel 을 실어 보낸다.
+        layer          = props.get("layer", 0)
+        bridge         = props.get("bridge", "F")
+        tunnel         = props.get("tunnel", "F")
 
         if u not in G:
             G.add_node(u, lon=lon1, lat=lat1, elevation=elevation_start)
@@ -133,6 +138,7 @@ def _build_graph_densified(data: dict) -> nx.DiGraph:
             elevation_start=elevation_start,
             elevation_end=elevation_end,
             highway=highway, name=name,
+            layer=layer, bridge=bridge, tunnel=tunnel,
         )
         rev = dict(fwd,
             slope_pct=-slope_pct,
@@ -143,6 +149,7 @@ def _build_graph_densified(data: dict) -> nx.DiGraph:
         G.add_edge(v, u, **rev)
 
     print(f"[그래프 구성·densified] 노드: {G.number_of_nodes():,}  엣지: {G.number_of_edges():,}")
+    _snap_nearby_nodes(G, SNAP_TOL_M)
     return _connect_components(G, BRIDGE_GAP_M)
 
 
@@ -217,6 +224,83 @@ def _build_graph_legacy(data: dict) -> nx.DiGraph:
 
     print(f"[그래프 구성·legacy] 노드: {G.number_of_nodes():,}  엣지: {G.number_of_edges():,}")
     return _connect_components(G, BRIDGE_GAP_M)
+
+
+def _snap_nearby_nodes(G: nx.DiGraph, tol_m: float) -> int:
+    """tol_m 이내인데 엣지로 이어지지 않은 노드쌍에 짧은 보행 링크를 추가한다.
+
+    densify 이전 원본 OSM 의 노딩 틈(끝점이 미세하게 어긋나 노드를 공유하지 못하는
+    경우)을 메운다. 서울역 광장처럼 실제로는 이어진 보행로가 그래프상 수 km 떨어지는
+    문제(backend/README §104)를 해소. slope_pct 크기는 양 끝에 붙은 실제 엣지에서
+    상속하고(5m 링크에 DEM 직접 계산 금지 — densify 의 <2m 처리와 같은 원칙), 부호만
+    양 끝 노드 elevation 차이로 정한다.
+
+    _connect_components(50m 브리지) 앞단에서 돌린다 — 5m 급 실제 틈을 먼저 없애면
+    이후 브리지가 억지로 이을 대상이 크게 준다.
+
+    링크에 `highway="snap"`, `snap=True` 표식 — 인공 브리지(`highway="bridge"`)와 달리
+    실재 연결의 복원이므로 비용 페널티를 주지 않는다(cost.py 는 highway 를 안 봄).
+    """
+    if tol_m <= 0:
+        return 0
+    try:
+        from scipy.spatial import KDTree
+        import numpy as np
+    except ImportError:
+        print("[snap] scipy 없음 → snap 패스 건너뜀")
+        return 0
+
+    nodes = list(G.nodes)
+    n = len(nodes)
+    if n < 2:
+        return 0
+
+    mean_lat = sum(G.nodes[nd]["lat"] for nd in nodes) / n
+    lat_to_m = 111_320.0
+    lon_to_m = 111_320.0 * math.cos(math.radians(mean_lat))
+    coords_m = np.empty((n, 2), dtype=np.float64)
+    for i, nd in enumerate(nodes):
+        coords_m[i, 0] = G.nodes[nd]["lon"] * lon_to_m
+        coords_m[i, 1] = G.nodes[nd]["lat"] * lat_to_m
+
+    def _incident_slope_mag(nd):
+        """nd 에 붙은 실제(비-snap) 엣지들의 slope_abs 평균. 없으면 None."""
+        vals = [a.get("slope_abs", abs(a.get("slope_pct", 0.0)))
+                for _, _, a in G.out_edges(nd, data=True)
+                if not a.get("snap")]
+        return sum(vals) / len(vals) if vals else None
+
+    tree = KDTree(coords_m)
+    added = 0
+    for i, j in tree.query_pairs(tol_m):
+        u, v = nodes[i], nodes[j]
+        if u == v or G.has_edge(u, v):
+            continue
+        ud, vd = G.nodes[u], G.nodes[v]
+        d = haversine(ud["lon"], ud["lat"], vd["lon"], vd["lat"])
+        if d < 0.2:               # 사실상 동일 노드 (round 6dp 잔차) — 스킵
+            continue
+        eu = ud.get("elevation", 0.0) or 0.0
+        ev = vd.get("elevation", 0.0) or 0.0
+        # slope 크기는 인접 실제 엣지에서 상속한다. 5m 링크에 DEM 을 직접 계산하면
+        # 오차 0.24m/5m ≈ 5% 로 수동휠체어 금지 임계에 걸려, 방금 복원한 연결이
+        # 다시 막힌다(densify 의 <2m 처리와 같은 원칙). 부호만 elevation 으로.
+        mags = [m for m in (_incident_slope_mag(u), _incident_slope_mag(v))
+                if m is not None]
+        mag = round(sum(mags) / len(mags), 3) if mags else 0.0
+        sp = mag if (ev - eu) >= 0 else -mag
+        base = dict(length_m=round(d, 2), slope_abs=mag,
+                    highway="snap", name="", snap=True,
+                    layer=0, bridge="F", tunnel="F")
+        G.add_edge(u, v, slope_pct=sp,
+                   elevation_start=eu, elevation_end=ev, **base)
+        G.add_edge(v, u, slope_pct=-sp,
+                   elevation_start=ev, elevation_end=eu, **base)
+        added += 1
+
+    print(f"[snap] {tol_m:.0f}m 이내 미연결쌍 → 보행 링크 {added:,}개 추가 "
+          f"(노드 {n:,})")
+    return added
 
 
 def _connect_components(G: nx.DiGraph, bridge_gap_m: float) -> nx.DiGraph:
@@ -310,7 +394,8 @@ def _connect_components(G: nx.DiGraph, bridge_gap_m: float) -> nx.DiGraph:
             ev = G.nodes[best_v].get("elevation", 0.0)
             bd = dict(length_m=best_dist, slope_pct=0.0, slope_abs=0.0,
                       elevation_start=eu, elevation_end=ev,
-                      highway="bridge", name="")
+                      highway="bridge", name="",
+                      layer=0, bridge="F", tunnel="F")
             G.add_edge(best_u, best_v, **bd)
             G.add_edge(best_v, best_u, **dict(bd, elevation_start=ev, elevation_end=eu))
             main_set.update(small_list)

@@ -14,8 +14,10 @@ routingkit-cch v0.1.4 실제 API 기반
 build_cch_engine(G) → CCHEngine
 engine.find_route(origin_lonlat, dest_lonlat, user_type) → find_route()와 동일 형식
 """
+import hashlib
 import math
 import os
+import pickle
 import time
 
 import numpy as np
@@ -43,6 +45,53 @@ def is_forbidden_for_any_type(slope_pct: float) -> bool:
     return False
 
 WEIGHT_SCALE = 1_000   # slope_cost(float) → list[int] 변환 배율
+
+
+def _topology_key(n: int, tail_np: np.ndarray, head_np: np.ndarray) -> str:
+    """그래프 위상(노드수 + 방향엣지 tail/head)만으로 만든 해시.
+
+    inertial order 는 위상+좌표에만 의존하는데, 위상이 같으면 좌표도 같다
+    (같은 그래프). 가중치·비용은 무관하므로 프로파일이 바뀌어도 캐시 유효.
+    """
+    h = hashlib.sha1()
+    h.update(n.to_bytes(8, "little"))
+    h.update(np.ascontiguousarray(tail_np, dtype=np.uint32).tobytes())
+    h.update(np.ascontiguousarray(head_np, dtype=np.uint32).tobytes())
+    return h.hexdigest()
+
+
+def _load_or_compute_order(cache_path, key, n, compute_fn):
+    """order 캐시 로딩 시도 → 실패/불일치 시 compute_fn() 재계산 후 저장.
+
+    order 는 CCH 전처리에서 가장 무거운 단계(서울 1.7M 노드 기준 ~146s).
+    EC2 콜드 스타트를 줄이려면 디스크 캐시가 필수.
+    """
+    if cache_path and os.path.exists(cache_path):
+        try:
+            with open(cache_path, "rb") as f:
+                c = pickle.load(f)
+            if c.get("key") == key and len(c.get("order", ())) == n:
+                print(f"[CCH] order 캐시 적중: {cache_path}")
+                return list(c["order"])
+            print(f"[CCH] order 캐시 불일치(위상 변경) → 재계산: {cache_path}")
+        except Exception as e:
+            print(f"[CCH] order 캐시 로딩 실패({e!r}) → 재계산")
+
+    t = time.time()
+    order = compute_fn()
+    print(f"[CCH] inertial order 계산 완료 ({time.time() - t:.0f}s)")
+
+    if cache_path:
+        try:
+            tmp = f"{cache_path}.tmp{os.getpid()}"
+            with open(tmp, "wb") as f:
+                pickle.dump({"key": key, "n": n, "order": list(order)},
+                            f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp, cache_path)
+            print(f"[CCH] order 캐시 저장: {cache_path}")
+        except Exception as e:
+            print(f"[CCH] order 캐시 저장 실패({e!r}) — 무시")
+    return order
 
 
 class CCHEngine:
@@ -314,7 +363,7 @@ class CCHEngine:
         }
 
 
-def build_cch_engine(G) -> CCHEngine:
+def build_cch_engine(G, order_cache_path: str | None = None) -> CCHEngine:
     """
     NetworkX DiGraph → CCHEngine.
     서버 시작 시 1회 호출.
@@ -324,6 +373,9 @@ def build_cch_engine(G) -> CCHEngine:
       2. compute_order_inertial + CCH() 전처리
       3. CCHMetric × 8  (거리 1개 + 사용자 유형 6개 + 안전거리 1개, 6.2절)
       4. 개인화 기저 가중치(15열 sparse) 사전계산 + 디스크 캐시 (⑥, 7.3절)
+
+    order_cache_path: inertial order 를 저장/재사용할 파일 경로. 위상(노드수+
+      tail/head)이 같으면 재계산을 건너뛴다(콜드 스타트 ~146s 단축). None 이면 캐시 미사용.
     """
     try:
         from routingkit_cch import CCH, CCHMetric, compute_order_inertial
@@ -397,8 +449,11 @@ def build_cch_engine(G) -> CCHEngine:
     print(f"[CCH] 엣지 배열 완료 ({time.time() - t0:.1f}s)")
 
     # ── 3. CCH 위상 전처리 ───────────────────────────────────────────────────
-    print(f"[CCH] inertial flow ordering 계산 중...")
-    order = compute_order_inertial(n, tail_list, head_list, lat_list, lon_list)
+    key = _topology_key(n, tail_np, head_np)
+    order = _load_or_compute_order(
+        order_cache_path, key, n,
+        lambda: compute_order_inertial(n, tail_list, head_list, lat_list, lon_list),
+    )
     print(f"[CCH] CCH() 전처리 시작...")
     cch = CCH(order, tail_list, head_list, filter_always_inf_arcs=True)
     print(f"[CCH] 전처리 완료 ({time.time() - t0:.1f}s)")

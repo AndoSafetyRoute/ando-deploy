@@ -69,6 +69,8 @@ BUS_ROUTE_INFO_ENABLED = os.environ.get("BUS_ROUTE_INFO_ENABLED", "") == "1"
 # ── 라우팅 파라미터 ───────────────────────────────────────────────────────────
 FLAT_THRESHOLD    = 0.5    # elevation 차이 이 미만 → 평지 (%)
 STDDEV_THRESHOLD  = 1.0    # slope1_stddev 기준값
+SNAP_TOL_M        = 5.0    # 그래프 빌드 시 이 거리 이내 미연결 노드쌍에 보행 링크 추가
+                           # (원본 OSM 노딩 틈 메움 — 서울역 광장 15km 우회 해소, README §104)
 BRIDGE_GAP_M      = 50.0   # 연결 성분 브리지 최대 거리(m)
 MAX_DETOUR_RATIO  = 1.3    # 최단거리 대비 허용 최대 우회 배율
 FORBIDDEN_PENALTY = 15.0   # 금지 구간 거리 대비 패널티 배율 (1e6 → 15)
