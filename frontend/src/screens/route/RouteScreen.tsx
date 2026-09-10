@@ -387,22 +387,31 @@ export default function RouteScreen({ navigation, route }: Props) {
     }
   };
 
-  // 텍스트 입력 확정 → 카카오로 지오코딩 후 재탐색.
+  // 텍스트 입력 확정(엔터 or 포커스 아웃) → 카카오로 지오코딩 후 재탐색.
+  // onSubmitEditing 과 onBlur 가 연달아 부르므로 재진입을 ref 로 막는다.
+  const committingRef = useRef(false);
   const commitFieldEdit = async (field: "from" | "to") => {
+    if (committingRef.current) return;
     const typed = (field === "from" ? from : to).trim();
-    setEditingField(null);
     const prevName = field === "from" ? endpoints.startName : endpoints.endName;
+    setEditingField(null);
     if (!typed || typed === prevName) return;
-    setRouteLoading(true);
-    const geo = await geocodeKeyword(typed);
-    setRouteLoading(false);
-    if (!geo) {
-      Alert.alert("장소를 찾지 못했어요", `'${typed}' 검색 결과가 없어요. 다른 이름으로 시도해 주세요.`);
-      if (field === "from") setFrom(prevName ?? "");
-      else setTo(prevName ?? "");
-      return;
+
+    committingRef.current = true;
+    try {
+      setRouteLoading(true);
+      const geo = await geocodeKeyword(typed);
+      if (!geo) {
+        setRouteLoading(false);
+        Alert.alert("장소를 찾지 못했어요", `'${typed}' 검색 결과가 없어요. 다른 이름으로 시도해 주세요.`);
+        if (field === "from") setFrom(prevName ?? "");
+        else setTo(prevName ?? "");
+        return;
+      }
+      await applyEndpointAndReroute(field, geo); // 내부에서 setRouteLoading(false)
+    } finally {
+      committingRef.current = false;
     }
-    await applyEndpointAndReroute(field, geo);
   };
 
   // 각 칸의 현위치(GPS) 버튼 → 현 위치로 그 지점을 잡고 즉시 재탐색.
@@ -550,7 +559,7 @@ export default function RouteScreen({ navigation, route }: Props) {
                 style={styles.routeInput}
                 value={from}
                 onChangeText={setFrom}
-                onBlur={() => setEditingField(null)}
+                onBlur={() => commitFieldEdit("from")}
                 returnKeyType="search"
                 onSubmitEditing={() => commitFieldEdit("from")}
                 placeholder="출발지 입력 후 검색"
@@ -586,7 +595,7 @@ export default function RouteScreen({ navigation, route }: Props) {
                 style={styles.routeInput}
                 value={to}
                 onChangeText={setTo}
-                onBlur={() => setEditingField(null)}
+                onBlur={() => commitFieldEdit("to")}
                 returnKeyType="search"
                 onSubmitEditing={() => commitFieldEdit("to")}
                 placeholder="도착지 입력 후 검색"
