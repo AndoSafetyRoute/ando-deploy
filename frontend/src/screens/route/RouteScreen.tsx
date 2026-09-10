@@ -21,6 +21,36 @@ import WalkContent from "./WalkContent";
 import TransitContent, { useTransitRoutes } from "./TransitContent";
 import { requestRoute } from "../../api/routeApi";
 import { getUserType, toApiUserType, saveUserType, toKoreanUserType, getShowSlopeMarkers, setShowSlopeMarkers, formatMinutes } from "../../utils/storage";
+import { resolveCurrentLocation } from "../../utils/currentLocation";
+
+const KAKAO_REST_API_KEY = process.env.EXPO_PUBLIC_KAKAO_REST_API_KEY;
+
+// 텍스트 한 줄 → 좌표. 카카오 키워드 검색 첫 결과. 실패하면 null.
+async function geocodeKeyword(
+  query: string
+): Promise<{ name: string; address: string; latitude: string; longitude: string } | null> {
+  const q = query.trim();
+  if (!q || !KAKAO_REST_API_KEY) return null;
+  try {
+    const res = await fetch(
+      "https://dapi.kakao.com/v2/local/search/keyword.json?query=" +
+        encodeURIComponent(q) + "&size=1",
+      { headers: { Authorization: `KakaoAK ${KAKAO_REST_API_KEY}` } }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const d = data?.documents?.[0];
+    if (!d) return null;
+    return {
+      name: d.place_name || q,
+      address: d.road_address_name || d.address_name || "",
+      latitude: String(d.y),
+      longitude: String(d.x),
+    };
+  } catch {
+    return null;
+  }
+}
 
 type TransportKey = "transit" | "car" | "walk";
 
@@ -321,6 +351,83 @@ export default function RouteScreen({ navigation, route }: Props) {
     }
   };
 
+  // 출발/도착 한쪽의 좌표가 바뀌면 → 그 방향으로 경로를 다시 계산한다.
+  // 계산 동안 화면 가운데 "재탐색 중" 오버레이(routeLoading)가 뜬다.
+  const applyEndpointAndReroute = async (
+    field: "from" | "to",
+    ep: { name: string; address: string; latitude: string; longitude: string }
+  ) => {
+    if (routeLoading) return;
+    const next =
+      field === "from"
+        ? { ...endpoints, startName: ep.name, startAddress: ep.address, startLatitude: ep.latitude, startLongitude: ep.longitude }
+        : { ...endpoints, endName: ep.name, endAddress: ep.address, endLatitude: ep.latitude, endLongitude: ep.longitude };
+    setEndpoints(next);
+    if (field === "from") setFrom(ep.name);
+    else setTo(ep.name);
+    setEditingField(null);
+
+    if (!next.startLatitude || !next.startLongitude || !next.endLatitude || !next.endLongitude) return;
+    try {
+      setRouteLoading(true);
+      const routeResult = await requestRoute({
+        startLatitude: next.startLatitude!,
+        startLongitude: next.startLongitude!,
+        endLatitude: next.endLatitude!,
+        endLongitude: next.endLongitude!,
+        userType: walkerType,
+        endStationName: next.endName,
+      });
+      setParsedRouteData(routeResult);
+    } catch (error) {
+      console.log("endpoint re-route error:", error);
+      Alert.alert("경로 재탐색 실패", "바뀐 지점으로 경로를 계산하지 못했습니다. 잠시 후 다시 시도해주세요.");
+    } finally {
+      setRouteLoading(false);
+    }
+  };
+
+  // 텍스트 입력 확정 → 카카오로 지오코딩 후 재탐색.
+  const commitFieldEdit = async (field: "from" | "to") => {
+    const typed = (field === "from" ? from : to).trim();
+    setEditingField(null);
+    const prevName = field === "from" ? endpoints.startName : endpoints.endName;
+    if (!typed || typed === prevName) return;
+    setRouteLoading(true);
+    const geo = await geocodeKeyword(typed);
+    setRouteLoading(false);
+    if (!geo) {
+      Alert.alert("장소를 찾지 못했어요", `'${typed}' 검색 결과가 없어요. 다른 이름으로 시도해 주세요.`);
+      if (field === "from") setFrom(prevName ?? "");
+      else setTo(prevName ?? "");
+      return;
+    }
+    await applyEndpointAndReroute(field, geo);
+  };
+
+  // 각 칸의 현위치(GPS) 버튼 → 현 위치로 그 지점을 잡고 즉시 재탐색.
+  const useGpsForField = async (field: "from" | "to") => {
+    if (routeLoading) return;
+    setRouteLoading(true);
+    const r = await resolveCurrentLocation();
+    setRouteLoading(false);
+    if (!r.ok || !r.location) {
+      Alert.alert(
+        r.reason === "permission" ? "위치 권한 필요" : "위치 확인 실패",
+        r.reason === "permission"
+          ? "현위치를 쓰려면 위치 권한을 허용해 주세요."
+          : "현재 위치를 가져오지 못했습니다. 잠시 후 다시 시도해 주세요."
+      );
+      return;
+    }
+    await applyEndpointAndReroute(field, {
+      name: r.location.name,
+      address: r.location.address,
+      latitude: String(r.location.latitude),
+      longitude: String(r.location.longitude),
+    });
+  };
+
   const openWalkerModal = () => {
     setTempWalkerType(walkerType);
     setShowWalkerModal(true);
@@ -444,9 +551,9 @@ export default function RouteScreen({ navigation, route }: Props) {
                 value={from}
                 onChangeText={setFrom}
                 onBlur={() => setEditingField(null)}
-                returnKeyType="done"
-                onSubmitEditing={() => setEditingField(null)}
-                placeholder="출발지 입력"
+                returnKeyType="search"
+                onSubmitEditing={() => commitFieldEdit("from")}
+                placeholder="출발지 입력 후 검색"
                 placeholderTextColor={C.textMute}
               />
             ) : (
@@ -454,6 +561,14 @@ export default function RouteScreen({ navigation, route }: Props) {
                 {from || "출발지를 입력하세요"}
               </Text>
             )}
+            <TouchableOpacity
+              onPress={() => useGpsForField("from")}
+              disabled={routeLoading}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              accessibilityLabel="현위치를 출발지로"
+            >
+              <Ionicons name="locate" size={18} color={routeLoading ? C.textMute : NAVY} />
+            </TouchableOpacity>
           </TouchableOpacity>
 
           <View style={styles.divider} />
@@ -472,9 +587,9 @@ export default function RouteScreen({ navigation, route }: Props) {
                 value={to}
                 onChangeText={setTo}
                 onBlur={() => setEditingField(null)}
-                returnKeyType="done"
-                onSubmitEditing={() => setEditingField(null)}
-                placeholder="도착지 입력"
+                returnKeyType="search"
+                onSubmitEditing={() => commitFieldEdit("to")}
+                placeholder="도착지 입력 후 검색"
                 placeholderTextColor={C.textMute}
               />
             ) : (
@@ -482,6 +597,14 @@ export default function RouteScreen({ navigation, route }: Props) {
                 {to || "도착지를 입력하세요"}
               </Text>
             )}
+            <TouchableOpacity
+              onPress={() => useGpsForField("to")}
+              disabled={routeLoading}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              accessibilityLabel="현위치를 도착지로"
+            >
+              <Ionicons name="locate" size={18} color={routeLoading ? C.textMute : NAVY} />
+            </TouchableOpacity>
           </TouchableOpacity>
         </View>
 
