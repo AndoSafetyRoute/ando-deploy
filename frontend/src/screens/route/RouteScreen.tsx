@@ -729,15 +729,6 @@ export default function RouteScreen({ navigation, route }: Props) {
       {/* 컨텐츠 */}
       <View style={styles.contentArea}>
         {renderContent()}
-
-        {routeLoading && (
-          <View style={styles.routeLoadingOverlay}>
-            <ActivityIndicator size="large" color={NAVY} />
-            <Text style={styles.routeLoadingText}>
-              선택한 유형에 맞춰 경로를 다시 계산하고 있어요
-            </Text>
-          </View>
-        )}
       </View>
 
       {/* 이동 유형 선택 모달 */}
@@ -814,6 +805,16 @@ export default function RouteScreen({ navigation, route }: Props) {
           </TouchableOpacity>
         </TouchableOpacity>
       </Modal>
+
+      {/* 재탐색 오버레이 — 헤더까지 화면 전체를 덮어 현재 경로를 고정한 채 로딩 표시 */}
+      {routeLoading && (
+        <View style={styles.routeLoadingOverlay} pointerEvents="auto">
+          <ActivityIndicator size="large" color={NAVY} />
+          <Text style={styles.routeLoadingText}>
+            경로를 다시 계산하고 있어요
+          </Text>
+        </View>
+      )}
     </SafeAreaView>
   );
 }
