@@ -281,11 +281,11 @@ export default function HomeScreen() {
 
             var map = new kakao.maps.Map(container, options);
 
-            var marker = new kakao.maps.Marker({
-              position: center
-            });
-
-            marker.setMap(map);
+            // (이전엔 여기 center(서울역) 고정 마커를 심어뒀었다 — GPS로 지도
+            // 중심이 실제 위치로 옮겨간 뒤에도 이 마커는 안 움직이고 서울역에
+            // 그대로 남아 "위치가 서울역에 고정된 것처럼" 보이는 원인이었다.
+            // moveToLocation 이 자기 마커(myLocationMarker)를 따로 그리므로
+            // 여기선 지도만 띄운다.)
 
             // ── 카테고리 마커: React 쪽에서 injectJavaScript 로 호출한다 ──
             var categoryMarkers = [];

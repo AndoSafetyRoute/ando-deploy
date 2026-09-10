@@ -956,6 +956,61 @@ def api_debug_search(q: str = Query(...)):
 
 # ── 경로 탐색 ─────────────────────────────────────────────────────────────────
 @app.post("/route")
+def _segments_payload(segments: list, user_type: str) -> list:
+    """result['segments'] → FE(WalkContent/NavigationScreen) 호환 seg 배열.
+
+    유형별 경로와 '최단 거리' 경로가 같은 형식을 쓰므로 한 곳으로 뺐다.
+    """
+    out = []
+    for s in segments:
+        direction = s["direction"]
+        slope_pct = s["slope_pct"]
+        u_lon = G.nodes[s["u"]]["lon"]; u_lat = G.nodes[s["u"]]["lat"]
+        v_lon = G.nodes[s["v"]]["lon"]; v_lat = G.nodes[s["v"]]["lat"]
+        out.append({
+            "name":      s.get("name", ""),
+            "direction": direction,
+            "slope_pct": round(slope_pct, 2),
+            "length_m":  round(s["length_m"], 1),
+            "score":     round(s["score_by_type"].get(user_type, 0), 1),
+            "zone":      classify_zone(slope_pct, direction, user_type),
+            "coords": [[u_lon, u_lat], [v_lon, v_lat]],
+            "start": {"latitude": u_lat, "longitude": u_lon},
+            "end":   {"latitude": v_lat, "longitude": v_lon},
+            "slope":  round(slope_pct, 2),
+            "length": round(s["length_m"], 1),
+        })
+    return out
+
+
+def _shortest_route_card(origin: tuple, dest: tuple, user_type: str,
+                         type_len_m: float, speed_profile: dict) -> dict | None:
+    """유형별 경로 옆에 함께 보여줄 '최단 거리'(순수 다익스트라) 카드.
+
+    유형별 경로와 거의 같으면(≤3% 차) 카드 2장이 중복돼 보이므로 None 을 반환한다.
+    실패해도 메인 응답을 막지 않게 호출부에서 감싼다.
+    """
+    if _cch is not None:
+        sr = _cch.find_distance_route(origin, dest)
+    else:
+        sr = find_route(G, origin, dest, user_type, mode="shortest")
+    s_len = round(sr["total_length_m"], 1)
+    if s_len <= 0 or abs(s_len - type_len_m) / max(type_len_m, 1.0) <= 0.03:
+        return None
+    s_segs = _segments_payload(sr["segments"], user_type)
+    return {
+        "id":             "shortest",
+        "tag":            "최단 거리",
+        "color":          "#8A8FA3",
+        "coordinates":    [[G.nodes[n]["lon"], G.nodes[n]["lat"]] for n in sr["path_nodes"]],
+        "totalDistance":  s_len,
+        "totalCost":      round(sr["total_cost"], 2),
+        "avgSlope":       round(sr["avg_slope_pct"], 2),
+        "routeSegments":  s_segs,
+        "estimatedTimeS": estimate_route_time(s_segs, user_type, speed_profile),
+    }
+
+
 def api_route(
     body: RouteRequest,
     db: Session = Depends(get_db),
@@ -1016,30 +1071,7 @@ def api_route(
             for n in result["path_nodes"]
         ]
 
-        segs = []
-        for s in result["segments"]:
-            direction = s["direction"]
-            slope_pct = s["slope_pct"]
-            u_lon = G.nodes[s["u"]]["lon"]
-            u_lat = G.nodes[s["u"]]["lat"]
-            v_lon = G.nodes[s["v"]]["lon"]
-            v_lat = G.nodes[s["v"]]["lat"]
-            segs.append({
-                "name":      s.get("name", ""),
-                "direction": direction,
-                "slope_pct": round(slope_pct, 2),
-                "length_m":  round(s["length_m"], 1),
-                "score":     round(s["score_by_type"].get(body.user_type, 0), 1),
-                "zone":      classify_zone(slope_pct, direction, body.user_type),
-                # coords: GeoJSON [lon, lat] 쌍 (기존 호환)
-                "coords": [[u_lon, u_lat], [v_lon, v_lat]],
-                # FE NavigationScreen normalizeSegments 호환 형식
-                "start": {"latitude": u_lat, "longitude": u_lon},
-                "end":   {"latitude": v_lat, "longitude": v_lon},
-                # slope / length 별칭 (normalizeSegments fallback 대응)
-                "slope":  round(slope_pct, 2),
-                "length": round(s["length_m"], 1),
-            })
+        segs = _segments_payload(result["segments"], body.user_type)
 
         total_length_m = round(result["total_length_m"], 1)
         total_cost     = round(result["total_cost"], 2)
@@ -1067,6 +1099,17 @@ def api_route(
             "routeSegments":   segs,
             "estimatedTimeS":  estimated_time_s,
         }
+
+        # '최단 거리' 카드 — 유형별 경로와 나란히 WalkContent 2번째 탭으로.
+        # light(대중교통 대량 조회) / compare(개인화 3경로)엔 붙이지 않는다.
+        shortest_obj = None
+        if not body.light and body.candidates != "compare":
+            try:
+                shortest_obj = _shortest_route_card(
+                    origin, dest, body.user_type, total_length_m, speed_profile
+                )
+            except Exception as _se:
+                print(f"[ROUTE] 최단 경로 카드 생성 실패 (무시): {_se}")
 
         # ── 교차로 기반 네비게이션 구간 + 음성안내 + 소요시간 ───────────────────
         # nav_segs(구간별 경사 zone)는 대중교통 탭 후보 경로들의 지도 미리보기
@@ -1119,8 +1162,8 @@ def api_route(
             print(f"[NAV] 네비게이션 구간 생성 실패 (무시): {_nav_err}")
 
         response = {
-            # FE WalkContent 호환 필드
-            "routes":           [route_obj],
+            # FE WalkContent 호환 필드 — 유형별 + (다르면) 최단 거리
+            "routes":           [route_obj] if shortest_obj is None else [route_obj, shortest_obj],
             "coordinates":      coords,
             "routeSegments":    segs,
             # 원본 필드 유지 (하위 호환)

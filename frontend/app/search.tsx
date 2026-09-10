@@ -16,6 +16,7 @@ import { Ionicons, Feather, MaterialCommunityIcons } from "@expo/vector-icons";
 import { router, useLocalSearchParams } from "expo-router";
 import { createClient } from "@supabase/supabase-js";
 import * as Location from "expo-location";
+import { resolveCurrentLocation } from "../src/utils/currentLocation";
 import { getBookmarks, addBookmark, removeBookmark, BookmarkItem } from "../src/utils/storage";
 import { getAuthToken } from "../src/api";
 import { getSearchHistory, saveSearchHistory, SearchHistoryItem } from "../src/api";
@@ -502,43 +503,22 @@ export default function SearchScreen() {
   };
 
   // "내 위치" — GPS 좌표를 그 자리에서 출발지/도착지로 확정한다.
+  // GPS 해석 로직은 src/utils/currentLocation.ts 에 공유(route-select.tsx 도 사용).
   const useMyLocation = async () => {
     if (gpsLoading) return;
     setGpsLoading(true);
     try {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== "granted") {
-        Alert.alert("위치 권한 필요", "내 위치를 출발지·도착지로 쓰려면 위치 권한을 허용해 주세요.");
+      const r = await resolveCurrentLocation();
+      if (!r.ok || !r.location) {
+        Alert.alert(
+          r.reason === "permission" ? "위치 권한 필요" : "위치 확인 실패",
+          r.reason === "permission"
+            ? "내 위치를 출발지·도착지로 쓰려면 위치 권한을 허용해 주세요."
+            : "현재 위치를 가져오지 못했습니다. 잠시 후 다시 시도해 주세요."
+        );
         return;
       }
-
-      let loc: any;
-      try {
-        loc = await Promise.race([
-          Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 8000)),
-        ]);
-      } catch {
-        // 콜드 GPS(에뮬레이터/실내)에서 현재 위치가 안 잡히면 마지막으로 알려진 위치로 폴백.
-        loc = await Location.getLastKnownPositionAsync({});
-      }
-      if (!loc?.coords) throw new Error("no-fix");
-      const { latitude, longitude } = loc.coords;
-
-      // 역지오코딩은 실패해도 좌표만으로 진행한다.
-      let name = "내 위치";
-      let address = "현재 위치";
-      try {
-        const [geo] = await Location.reverseGeocodeAsync({ latitude, longitude });
-        if (geo) {
-          const full = [geo.region, geo.city, geo.district, geo.street, geo.name]
-            .filter(Boolean)
-            .join(" ");
-          if (full) address = full;
-          name = geo.name || geo.street || geo.district || "내 위치";
-        }
-      } catch {}
-
+      const { latitude, longitude, name, address } = r.location;
       moveToPlaceInfo({
         id: `my-location-${Date.now()}`,
         name,
