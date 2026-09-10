@@ -724,8 +724,10 @@ export default function RouteScreen({ navigation, route }: Props) {
           <View style={styles.summaryCard}>
             <View>
               <Text style={styles.summaryLabel}>보행약자 맞춤 경로</Text>
+              {/* 입력 중 텍스트(from/to)가 아니라 "검색 완료된" 값(endpoints)을 보여준다 —
+                  글자 칠 때마다 여기가 흔들리지 않게. */}
               <Text style={styles.summaryTitle} numberOfLines={1}>
-                {from} → {to}
+                {(endpoints.startName || from)} → {(endpoints.endName || to)}
               </Text>
             </View>
 
