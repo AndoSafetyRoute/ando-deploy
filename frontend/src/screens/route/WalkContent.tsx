@@ -42,6 +42,41 @@ function fmtTimeS(s: number | null | undefined) {
 
 const { height: H } = Dimensions.get('window');
 
+// 하이브리드(서울 안팎) 응답에서 서울 밖 구간(경사 데이터 없음)을 회색 직선으로.
+type MapSeg = {
+  coordinates: { latitude: number; longitude: number }[];
+  color: string;
+  zone?: string;
+  slopeMean?: number;
+};
+function buildExternalSegments(routeSegments: any[] | undefined): MapSeg[] {
+  if (!Array.isArray(routeSegments)) return [];
+  const out: MapSeg[] = [];
+  let run: { latitude: number; longitude: number }[] = [];
+  const flush = () => {
+    if (run.length >= 2) out.push({ coordinates: run, color: '#9AA0AE', zone: 'flat', slopeMean: 0 });
+    run = [];
+  };
+  for (const s of routeSegments) {
+    if (!s?.outside_seoul) { flush(); continue; }
+    const c = Array.isArray(s.coords) ? s.coords : null;
+    const a = c?.[0] ?? (s.start ? [s.start.longitude, s.start.latitude] : null);
+    const b = c?.[1] ?? (s.end ? [s.end.longitude, s.end.latitude] : null);
+    if (a && b && Number.isFinite(a[0]) && Number.isFinite(b[0])) {
+      if (run.length === 0) run.push({ latitude: a[1], longitude: a[0] });
+      run.push({ latitude: b[1], longitude: b[0] });
+    }
+  }
+  flush();
+  return out;
+}
+
+function fmtExtLen(m: number | null | undefined) {
+  const n = Number(m);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  return n >= 1000 ? ` 약 ${(n / 1000).toFixed(1)}km` : ` 약 ${Math.round(n)}m`;
+}
+
 type WalkContentProps = {
   navigation: any;
   walkerType?: string;
@@ -174,6 +209,13 @@ export default function WalkContent({
   // 경로 선택 계측 세션(동의 시에만 생성 — 미동의면 전부 no-op).
   const collectRef = useRef<CollectSession | null>(null);
 
+  // 하이브리드(서울 안팎 경계) 응답 — RouteScreen 이 넘겨준 routeData(단일 /route 호출)
+  // 에 algorithm:'hybrid' / service_area.partial_coverage 가 있으면 compare 대신 이걸 쓴다.
+  // (백엔드는 candidates=compare 일 때 하이브리드를 만들지 않는다.)
+  const serviceArea = routeData?.service_area ?? null;
+  const isHybrid =
+    routeData?.algorithm === 'hybrid' || !!serviceArea?.partial_coverage;
+
   const hasCoords =
     !!startLatitude && !!startLongitude && !!endLatitude && !!endLongitude;
 
@@ -201,6 +243,35 @@ export default function WalkContent({
         return;
       }
 
+      // 하이브리드: compare 재호출 없이 routeData.routes(유형별/최단) 를 카드로 변환.
+      if (isHybrid) {
+        const hr: any[] = Array.isArray(routeData?.routes) ? routeData.routes : [];
+        const src = hr.length ? hr : [routeData];
+        const s = src.map((r: any, i: number) => {
+          const isDist = r?.id === 'shortest' || r?.tag === '최단 거리';
+          return {
+            shownPos: i,
+            label: isDist ? '거리우선' : '유형별 경로',
+            mergedKinds: [isDist ? 'distance' : 'type'] as any,
+            route: {
+              coordinates: r?.coordinates ?? routeData?.coordinates ?? [],
+              routeSegments: r?.routeSegments ?? routeData?.routeSegments ?? [],
+              navigation_segments: r?.navigation_segments ?? routeData?.navigation_segments ?? [],
+              waypoints: r?.waypoints ?? routeData?.waypoints ?? [],
+              totalDistance: r?.totalDistance ?? routeData?.total_length_m ?? null,
+              avgSlope: r?.avgSlope ?? routeData?.avg_slope_pct ?? 0,
+              estimatedTimeS: r?.estimatedTimeS ?? routeData?.estimatedTimeS ?? null,
+            },
+          } as unknown as ShownCandidate;
+        });
+        if (alive) {
+          setShown(s);
+          setSelectedPos(0);
+          setLoading(false);
+        }
+        return;
+      }
+
       try {
         const res = await requestRouteCandidates({
           startLatitude: startLatitude!,
@@ -223,7 +294,7 @@ export default function WalkContent({
     return () => {
       alive = false;
     };
-  }, [startLatitude, startLongitude, endLatitude, endLongitude, walkerType, reloadKey]);
+  }, [startLatitude, startLongitude, endLatitude, endLongitude, walkerType, reloadKey, isHybrid, routeData]);
 
   // 화면을 완전히 떠날 때 계측 세션 정리(빈 배치는 안 나감).
   useEffect(
@@ -237,6 +308,12 @@ export default function WalkContent({
   const selectedCand = shown[selectedPos] ?? shown[0];
   const selectedId = selectedCand ? String(selectedCand.shownPos) : '';
 
+  // 하이브리드일 때만: 선택된 경로의 서울 밖 구간을 회색 직선으로 지도에 얹는다.
+  const externalSegs = useMemo(
+    () => (isHybrid ? buildExternalSegments((selectedCand as any)?.route?.routeSegments) : []),
+    [isHybrid, selectedCand]
+  );
+
   // routes가 실제로 바뀔 때만 새 배열을 만든다(지도 깜빡임/줌 초기화 방지).
   const mapRoutes = useMemo(
     () =>
@@ -247,8 +324,9 @@ export default function WalkContent({
           latitude: lat,
           longitude: lng,
         })),
+        segments: String(s.shownPos) === selectedId ? externalSegs : undefined,
       })),
-    [shown]
+    [shown, selectedId, externalSegs]
   );
 
   const { sheetExpanded, sheetHeight, toggleSheet, panHandlers } = useDraggableSheet(
@@ -308,6 +386,11 @@ export default function WalkContent({
         selectedRouteTag: selectedCand.label,
         selectedRouteTitle: selectedCand.label,
         selectedRouteColor: color,
+        // 하이브리드: 서울 밖(경사 데이터 없음) 구간 정보를 그대로 넘겨 NavigationScreen 이
+        // 회색 표시 + 소요시간 측정/구간 피드백에서 제외하도록 한다.
+        ...(isHybrid
+          ? { algorithm: 'hybrid', service_area: serviceArea }
+          : {}),
       }),
     });
   };
@@ -339,6 +422,19 @@ export default function WalkContent({
             <Text style={ss.sheetExpandIcon}>{sheetExpanded ? '▼' : '▲'}</Text>
           </View>
         </View>
+
+        {isHybrid && (
+          <View style={ss.svcBanner}>
+            <Text style={ss.svcBannerIcon}>ℹ️</Text>
+            <Text style={ss.svcBannerText}>
+              {serviceArea?.origin_in_seoul === false && serviceArea?.dest_in_seoul === false
+                ? '출발·도착이 모두 서울 밖이에요. '
+                : '경로에 서울 밖 구간이 있어요. '}
+              밖 구간{fmtExtLen(serviceArea?.external_length_m)}은 경사 데이터가 없어 최단(직선)
+              안내만 제공돼요. 소요시간은 서울 안팎을 합쳐 계산했고, 구간 피드백/측정에서는 밖 구간을 제외해요.
+            </Text>
+          </View>
+        )}
 
         <ScrollView
           style={ss.sheetScroll}
@@ -891,4 +987,20 @@ const ss = StyleSheet.create({
     fontSize: 18,
     color: 'rgba(255,255,255,0.7)',
   },
+
+  svcBanner: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 6,
+    marginHorizontal: 16,
+    marginTop: 4,
+    marginBottom: 2,
+    padding: 10,
+    borderRadius: 10,
+    backgroundColor: '#FFF4E2',
+    borderWidth: 1,
+    borderColor: C.warn + '55',
+  },
+  svcBannerIcon: { fontSize: 13, lineHeight: 18 },
+  svcBannerText: { flex: 1, fontSize: 11.5, lineHeight: 17, color: '#7A5B12', fontWeight: '600' },
 });
