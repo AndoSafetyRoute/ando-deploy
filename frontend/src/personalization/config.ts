@@ -59,6 +59,16 @@ export const CANDIDATE_FIELD = {
   routeSegments:  "routeSegments",
 } as const;
 
+// ── 측정 파이프라인 v2 — 세션(sessions 테이블) 계약 ─────────────────────────
+// /navigation/start 에 session_id 와 함께 실어 보내는 두 값. app.json/package.json
+// 의 semver 릴리스 버전과는 별개로, MEASUREMENT_SCHEMA_VERSION 은 "이 클라이언트가
+// session_id/measurement_units/gps-batch 등 이 파이프라인 자체를 어떤 모양으로
+// 보내는지"의 버전이다 — 앱 배포 없이 프로토콜만 바뀌는 일은 없지만, 나중에 BE가
+// schema_ver 로 옛 클라이언트를 분기 처리해야 할 때를 대비해 앱 버전과 분리해 둔다.
+// 이 파이프라인의 필드·엔드포인트가 하위호환 없이 바뀔 때만 올린다(패치 배포마다 X).
+export const APP_VERSION = "1.0.0";               // package.json/app.json version과 동일하게 유지
+export const MEASUREMENT_SCHEMA_VERSION = 1;
+
 // ── 계측 상수 (문서 §3.4 / §4, 팀 Q&A #5) ──────────────────────────────────
 // 전부 C등급(근거 없음) — 이 값으로 시작하고 파일럿 로그로 사후 조정한다.
 export const SLOPE_BIN_WIDTH_PCT = 0.5;   // ando_ml_plan_v2 §4 설계상수 — 고정

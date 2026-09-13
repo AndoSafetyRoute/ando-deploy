@@ -40,15 +40,26 @@ export function goToRouteCompareIfEnabled(
  */
 export function routeAfterRating(
   navigation: Nav | undefined,
-  args: { serverRouteId: number | null; routeSegments: any[]; nextRouteId: string; sessionId?: string | null },
+  args: {
+    serverRouteId: number | null;
+    routeSegments: any[];
+    // 측정 파이프라인 v2 — pace 상위 구간 지도 하이라이트용. BE의
+    // route_slow_segments.seg_index가 이제 unit_index를 가리키므로(레거시
+    // 엣지 인덱스 아님), SlowSegmentFeedbackScreen은 routeSegments가 아니라
+    // 이 배열을 unit_index로 직접 찾아 하이라이트해야 한다.
+    measurementUnits: any[];
+    nextRouteId: string;
+    sessionId?: string | null;
+  },
 ): void {
   if (!navigation) return;
   if (SLOW_SEGMENT_FEEDBACK_ENABLED && args.serverRouteId != null) {
     navigation.navigate("SlowSegmentFeedback", {
-      routeSegments: JSON.stringify(args.routeSegments ?? []),
-      serverRouteId: String(args.serverRouteId),
-      nextRouteId:   args.nextRouteId,
-      sessionId:     args.sessionId ?? "",
+      routeSegments:     JSON.stringify(args.routeSegments ?? []),
+      measurementUnits:  JSON.stringify(args.measurementUnits ?? []),
+      serverRouteId:     String(args.serverRouteId),
+      nextRouteId:       args.nextRouteId,
+      sessionId:         args.sessionId ?? "",
     });
   } else {
     navigation.navigate("RouteDetail", { routeId: args.nextRouteId });

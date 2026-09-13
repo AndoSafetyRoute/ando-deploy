@@ -38,9 +38,11 @@ import {
   startNavigation,
   submitSegment,
   completeNavigation,
+  type MeasurementSegmentPayload,
 } from "../api";
-import type { NavSegment, Waypoint } from "../api/routeApi";
+import type { NavSegment, Waypoint, MeasurementUnit } from "../api/routeApi";
 import { CollectSession, drainCollectQueue } from "../utils/collectQueue";
+import { GpsTraceBuffer } from "../utils/gpsTraceBuffer";
 import { SlopeBinTracker } from "../utils/slopeBinTracker";
 import {
   SPEED_SAMPLE_MAX_GAP_S,
@@ -48,6 +50,7 @@ import {
   NEAR_STOP_SPEED_MS,
 } from "../personalization/config";
 import { routeAfterRating } from "../personalization/entry";
+import { APP_VERSION, MEASUREMENT_SCHEMA_VERSION } from "../personalization/config";
 import RoundtripHintBanner from "../personalization/RoundtripHintBanner";
 import { getCollectConsent, setCollectConsent } from "../personalization/collectConsent";
 import CollectConsentModal from "../personalization/CollectConsentModal";
@@ -577,17 +580,28 @@ function makeKakaoMapHtml({
               }).setMap(map);
             }
 
-            if (currentData) {
-              new kakao.maps.CustomOverlay({
-                position: new kakao.maps.LatLng(currentData.lat, currentData.lng),
+            // 현재 위치 마커 — GPS가 움직일 때마다 지도를 통째로 다시 그리면
+            // (HTML 재생성 → WebView reload) 매번 경로 bounds로 재축소되고
+            // 반응도 느려진다. 그래서 이 마커는 bridge(window.updateCurrentLocation)로만
+            // 옮기고, mapHtml 자체는 현위치가 바뀌어도 다시 생성하지 않는다.
+            var currentOverlay = null;
+            function setCurrentOverlay(lat, lng) {
+              if (currentOverlay) currentOverlay.setMap(null);
+              currentOverlay = new kakao.maps.CustomOverlay({
+                position: new kakao.maps.LatLng(lat, lng),
                 content:
                   '<div class="current-wrap">' +
                     '<div class="current-dot"></div>' +
                     '<div class="current-label">현재 위치</div>' +
                   '</div>',
                 yAnchor: 0.5
-              }).setMap(map);
+              });
+              currentOverlay.setMap(map);
             }
+            if (currentData) setCurrentOverlay(currentData.lat, currentData.lng);
+            window.updateCurrentLocation = function (lat, lng) {
+              setCurrentOverlay(lat, lng);
+            };
 
             if (pathData.length > 0) {
               // 패딩(top, bottom, left, right) 충분히 줘서 경로가 화면 안에 들어오게
@@ -711,6 +725,33 @@ export default function NavigationScreen({ navigation, route }: Props) {
     [routeData]
   );
 
+  // 측정 파이프라인 v2 — GPS 실측(submitSegment) 제출 단위. navSegData(지도색)/
+  // waypoints(안내문구)/routeSegments(신호 A)와 완전히 별개 배열 — ⑤ 완료:
+  // GPS 콜백 안에 unitStartTimesRef/currentUnitIdxRef 기준의 독립된 도착판정
+  // 루프가 따로 있다(routeSegments 루프 바로 아래). SlowSegmentFeedbackScreen에도
+  // 그대로 전달되어 unit_index 기반 하이라이트에 쓰인다(②, routeAfterRating 경유).
+  const measurementUnits: MeasurementUnit[] = useMemo(
+    () => (routeData?.measurement_units ?? []) as MeasurementUnit[],
+    [routeData]
+  );
+
+  useEffect(() => {
+    // routeSegments(경로 자체)는 있는데 measurementUnits가 비어 있으면 BE의
+    // build_measurement_units가 실패했다는 뜻(app.py가 예외를 삼키고 빈 배열로
+    // 응답함) — 안내는 그대로 되지만 navigation_measurements가 0행이라
+    // 총 소요시간·느린 구간 피드백이 통째로 빈다. __DEV__ 게이트 없이 남긴다
+    // (실기기/배포본에서도 원인 추적 가능해야 함) — 사용자에게는 알리지 않는다.
+    // 안내 기능 자체엔 지장이 없고, 이 코드베이스는 이런 부가 데이터 파이프라인
+    // 실패를 이미 전부 콘솔 로그 + 무시로 다뤄왔다(백엔드 print, submitSegment
+    // catch(()=>{}) 등과 동일 수준 — 사용자를 막는 얼럿을 새로 만들 이유가 없다).
+    if (routeSegments.length > 0 && measurementUnits.length === 0) {
+      console.warn(
+        `[NAV] measurement_units 비어있음(routeSegments ${routeSegments.length}개) — ` +
+        `BE build_measurement_units 실패 추정. navigation_measurements 0행 예상.`
+      );
+    }
+  }, [routeSegments.length, measurementUnits.length]);
+
   const [currentLocation, setCurrentLocation] = useState<Coordinate | null>(null);
   const [locationError,   setLocationError]   = useState("");
   const [savedRouteId,    setSavedRouteId]     = useState("");
@@ -775,12 +816,35 @@ export default function NavigationScreen({ navigation, route }: Props) {
   const measuredMsRef        = useRef<(number | null)[]>([]); // [i] = 구간 i 소요시간, 미측정은 null
   const gpsCallbackCountRef  = useRef<number>(0); // 세그먼트 0 시작 시각 보정용 (2번째 콜백 = 실제 이동 시작)
 
+  // 측정 파이프라인 v2 — submitSegment(BE navigation_measurements) 전용, 위
+  // segmentStartTimesRef/currentSegIdxRef(routeSegments=raw edge, 신호 A·안내용)
+  // 와 완전히 별개 트래킹이다. measurementUnits(≥30m)는 목적이 다른 별도
+  // 분할이라 GPS 도착판정을 독립적으로 다시 돈다 — 하나가 밀려도 다른 하나(신호
+  // A)의 해상도에 영향을 주지 않는다. (측정값 자체는 submitSegment 호출 시점에
+  // 곧장 서버로 나가 서버 DB가 진실 소스다 — routeSegments 쪽의 measuredMsRef
+  // 같은 로컬 보관용 배열은 여기선 필요 없어 두지 않는다.)
+  const unitStartTimesRef = useRef<number[]>([]); // [i] = unit i 시작 시각 (ms)
+  const currentUnitIdxRef = useRef<number>(0);    // 현재 진행 중인 unit 인덱스
+  // ⑥(조기종료 reached_destination 판정) 구현 시 주의: currentUnitIdxRef.current
+  // >= measurementUnits.length 로 "도착"을 판정하면, measurementUnits가 빈
+  // 배열일 때 0 >= 0 이 참이 되어 BE 실패(위 경고 로그 참고) 케이스를 도착으로
+  // 오판한다. measurementUnits.length > 0 && ... 가드를 반드시 먼저 검사할 것.
+  // GPS 공백/장시간 점프 직후 닫히는 unit 하나를 오염 처리하기 위한 플래그.
+  // 신호 B 블록(dt/거리 임계 초과)과 AppState 백그라운드 복귀 핸들러 양쪽에서
+  // true로 세팅되고, unit 루프가 그 다음으로 닫는 unit 하나에 소비한 뒤 리셋한다
+  // (SlopeBinTracker.invalidateCurrent와 같은 목적, 별도 트래킹이라 별도 플래그).
+  const unitGapPendingRef = useRef<boolean>(false);
+
   // ── 개인화 계측 (인계 §5 ⑪, ando_ml_plan_v2 §3.2 신호 A) ────────────────────
   // zone(3단계 안전 분류) 단위로 뭉치면 경사 축 해상도가 파괴된다(§3.1). 대신
   // 0.5% 폭 bin 이 바뀌는 시점을 경계로 관측 1행씩 만든다 — 로직은 SlopeBinTracker
   // (순수 클래스, 단위 검증됨), 이 컴포넌트는 GPS 이벤트만 넣어준다. 전송은 배치만.
   const collectSessionRef = useRef<CollectSession | null>(null);
   const binTrackerRef     = useRef<SlopeBinTracker | null>(null);
+  // GPS 원본 궤적(gps_traces) 배치 큐 — 측정 파이프라인 v2. collectSessionRef와
+  // 같은 session_id를 쓰고(beginCollection에서 함께 생성) 같은 동의 게이트를
+  // 따른다 — 위치 원본이라 신호 A~D보다 민감도가 낮지 않다.
+  const gpsTraceBufferRef = useRef<GpsTraceBuffer | null>(null);
   // 신호 B(순간속도) 계산용 — 직전 GPS 픽스
   const lastGpsPosRef   = useRef<Coordinate | null>(null);
   const lastGpsTimeRef  = useRef<number>(0);
@@ -800,6 +864,11 @@ export default function NavigationScreen({ navigation, route }: Props) {
     // 세션이 안내 종료 시 null 로 비워진 뒤에도 구간평가(신호 D) POST 가 session_id 를
     // 실을 수 있도록 문자열만 따로 보존한다 (신호 A/B 와 조인용).
     collectSessionIdRef.current = collectSessionRef.current.sessionId;
+    // GPS 원본 궤적도 같은 session_id·같은 동의 게이트로 시작 — sessions 테이블
+    // 행은 /navigation/start가 이미(동의 여부와 무관하게) 만들어 뒀을 수도, 아직
+    // 안 만들어졌을 수도 있다(레이스). gps-batch는 BE가 sessions 존재 여부로
+    // 조용히 no-op 처리하니 여기서 별도로 기다리지 않는다.
+    gpsTraceBufferRef.current = new GpsTraceBuffer(collectSessionRef.current.sessionId);
     binTrackerRef.current = new SlopeBinTracker(routeSegments[0]?.slope ?? 0, initTime);
     try {
       collectSessionRef.current.setRouteProfile({
@@ -881,6 +950,12 @@ export default function NavigationScreen({ navigation, route }: Props) {
       segmentStartTimesRef.current = Array(routeSegments.length).fill(initTime);
       measuredMsRef.current        = Array(routeSegments.length).fill(null);
       currentSegIdxRef.current     = 0;
+      // measurementUnits(30m+ 단위)도 대칭으로 초기화 — 채우지 않으면 첫 콜백에
+      // unit이 닫힐 때 now - undefined = NaN 이 그대로 submitSegment로 나가
+      // BE 400 → catch(()=>{})로 조용히 유실된다(인덱스는 이미 전진해 재시도도 없음).
+      unitStartTimesRef.current = Array(measurementUnits.length).fill(initTime);
+      currentUnitIdxRef.current = 0;
+      unitGapPendingRef.current = false;
 
       // 이전 세션에서 전송 못 하고 큐에 남은 배치는 동의 여부와 무관하게 재시도한다
       // (그 배치들은 당시 동의 상태에서 쌓인 것).
@@ -888,41 +963,58 @@ export default function NavigationScreen({ navigation, route }: Props) {
       lastGpsPosRef.current   = null;
       lastGpsTimeRef.current  = 0;
 
-      // 개인화 계측은 명시적 동의가 있을 때만 시작한다 (이슈 #1).
-      //   granted  → 바로 시작
-      //   unknown  → 도보 안내면 모달을 띄우고, 동의 시 beginCollection 호출
-      //   denied   → 세션을 만들지 않음(모든 collectSessionRef?. 호출이 no-op)
-      getCollectConsent().then((consent) => {
-        if (!mounted) return;
-        if (consent === "granted") beginCollection(initTime);
-        else if (consent === "unknown" && (mode ?? "walk") === "walk") setConsentPrompt(true);
-      }).catch(() => {});
-
       speak(
         `${to}까지 안내를 시작합니다. 총 거리 ${formatDistance(routeData?.totalDistance)}, ` +
         `예상 시간 ${formatTime(routeData?.totalDistance, walkerType, routeData?.estimatedTimeS ?? routeData?.routes?.[0]?.estimatedTimeS)}.`
       );
 
-      // 서버 내비게이션 세션 시작 (best-effort)
-      getAuthToken().then(async (token) => {
-        if (!token) return;
-        try {
-          const { route_id } = await startNavigation(token, {
-            from_name:      from,
-            to_name:        to,
-            mode:           mode ?? "walk",
-            walker_type:    walkerType,
-            total_segments: routeSegments.length,
-            origin_lat:     originLat,
-            origin_lon:     originLon,
-            dest_lat:       destLat,
-            dest_lon:       destLon,
-          });
-          serverRouteIdRef.current = route_id;
-        } catch (e) {
-          console.log("[FE] 내비게이션 세션 시작 실패 (로컬만 유지):", e);
-        }
-      }).catch(() => {});
+      // 개인화 계측은 명시적 동의가 있을 때만 시작한다 (이슈 #1). 측정 파이프라인
+      // v2(sessions/navigation_measurements/gps_traces)도 동의 범위 **안**이다 —
+      // CONSENT_BODY(collectConsent.ts)가 "구간별 경사도와 통과 시간·속도(GPS
+      // 기반)"을 동의 항목으로 명시한다. 그래서 session_id는 consent가 확정된
+      // 뒤(=collectSessionIdRef.current가 채워진 뒤)에만 /navigation/start에
+      // 실어 보낸다 — route.params.collectSessionId를 동의와 무관하게 직접 쓰던
+      // 이전 버전은 동의 없이도 서버에 session_id를 보내 sessions 행을 만들어
+      // 버려 동의 문구와 어긋났다(session_id가 없으면 submitSegment도 이후
+      // 아예 전송하지 않음 — 아래 GPS 콜백의 unit 루프 참고).
+      //   granted  → beginCollection으로 세션 확정 후 이어서 /navigation/start
+      //   unknown  → 도보 안내면 모달을 띄운다. 사용자 응답을 무한정 기다릴 수
+      //              없으므로 이번 /navigation/start는 세션 없이 나간다 — 모달에서
+      //              뒤늦게 동의해도 이번 경로의 navigation_measurements는 유실
+      //              (sessions 행 자체가 없어 BE가 404/no-op — gps-batch가 이미
+      //              감내하던 것과 동일한 트레이드오프).
+      //   denied   → 세션 없이 진행(기존과 동일)
+      getCollectConsent().then((consent) => {
+        if (!mounted) return;
+        if (consent === "granted") beginCollection(initTime);
+        else if (consent === "unknown" && (mode ?? "walk") === "walk") setConsentPrompt(true);
+      }).catch(() => {}).finally(() => {
+        if (!mounted) return;
+        // 서버 내비게이션 세션 시작 (best-effort)
+        getAuthToken().then(async (token) => {
+          if (!token) return;
+          try {
+            const sid = collectSessionIdRef.current ?? undefined;
+            const { route_id } = await startNavigation(token, {
+              from_name:      from,
+              to_name:        to,
+              mode:           mode ?? "walk",
+              walker_type:    walkerType,
+              total_segments: routeSegments.length,
+              origin_lat:     originLat,
+              origin_lon:     originLon,
+              dest_lat:       destLat,
+              dest_lon:       destLon,
+              session_id:     sid,
+              app_version:    sid ? APP_VERSION : undefined,
+              schema_ver:     sid ? MEASUREMENT_SCHEMA_VERSION : undefined,
+            });
+            serverRouteIdRef.current = route_id;
+          } catch (e) {
+            console.log("[FE] 내비게이션 세션 시작 실패 (로컬만 유지):", e);
+          }
+        }).catch(() => {});
+      });
 
       const last = await Location.getLastKnownPositionAsync({});
       if (last && mounted) {
@@ -942,6 +1034,20 @@ export default function NavigationScreen({ navigation, route }: Props) {
 
           setCurrentLocation({ latitude: loc.coords.latitude, longitude: loc.coords.longitude });
 
+          const now = Date.now();
+
+          // GPS 원본 궤적 로깅 — 정확도 필터(아래)보다 먼저 기록한다. 저정확도
+          // 픽스도 accuracy_m과 함께 원본으로 남겨야, 필터 때문에 판정에서 빠진
+          // 구간을 사후에 원본으로 들여다볼 수 있다. 판정 로직과 무관한 순수
+          // push라 이 아래 어떤 흐름에도 영향을 주지 않는다.
+          gpsTraceBufferRef.current?.push({
+            t_ms:       now,
+            lat:        loc.coords.latitude,
+            lon:        loc.coords.longitude,
+            accuracy_m: loc.coords.accuracy ?? null,
+            speed_mps:  loc.coords.speed ?? null,
+          });
+
           // GPS 콜백을 받았다는 것 자체가 "이 구간엔 GPS 커버리지가 있었다"는 신호다.
           // accuracy 필터(위치 신뢰도) 앞에서 세므로, 정확도 낮은 픽스도 gps_sample_n
           // 에는 반영된다 — validate_observation 의 _MIN_GPS_N 은 터널/무신호 관측을
@@ -950,14 +1056,18 @@ export default function NavigationScreen({ navigation, route }: Props) {
 
           if (loc.coords.accuracy && loc.coords.accuracy > 20) return;
 
-          const now = Date.now();
-
           gpsCallbackCountRef.current += 1;
           if (gpsCallbackCountRef.current === 2 && currentSegIdxRef.current === 0) {
             segmentStartTimesRef.current[0] = now;
             // 첫 bin 의 elapsed 도 "실제 이동 시작"에 맞춘다 — GPS 락 대기 시간이
             // 첫 bin 속도에 섞여 들어가지 않도록(§3.2 신호 A는 distance/elapsed 기반).
             binTrackerRef.current?.anchorStart(now);
+          }
+          // measurementUnits 트래킹도 같은 "실제 이동 시작" 시각으로 앵커한다 —
+          // routeSegments와 별개 배열이라 인덱스는 독립이지만, 기준 시각은 같아야
+          // GPS 락 대기 시간이 unit 0 소요시간에 섞이지 않는다.
+          if (gpsCallbackCountRef.current === 2 && currentUnitIdxRef.current === 0) {
+            unitStartTimesRef.current[0] = now;
           }
 
           // 신호 B — 순간속도 원본 저장 (판정 없음, §3.2 / §3.8).
@@ -982,6 +1092,11 @@ export default function NavigationScreen({ navigation, route }: Props) {
                 // GPS 점프/장시간 공백 — 이 표본만이 아니라 진행 중이던 bin 관측
                 // 전체를 버린다 (점프 앞뒤로 거리·시간 오염, Q&A #5).
                 binTrackerRef.current?.invalidateCurrent(now);
+                // measurementUnits 쪽도 같은 이유로 오염 — 지금 진행 중이던 unit이
+                // 다음에 닫힐 때 elapsed에 이 공백/점프 구간 전체가 섞여 들어간다
+                // (DB 분석에서 찾은 "9.9m 구간에 27700ms" 패턴). 그 unit이 닫히는
+                // 시점에 status='skipped'로 보내도록 표시만 해 둔다.
+                unitGapPendingRef.current = true;
                 if (__DEV__) console.warn(`[collect] GPS 점프/공백으로 bin 무효화 (dt=${dt.toFixed(1)}s d=${d.toFixed(0)}m)`);
               }
             }
@@ -1008,18 +1123,9 @@ export default function NavigationScreen({ navigation, route }: Props) {
             } else {
               measuredMsRef.current[curIdx] = elapsed;
 
-              const rid = serverRouteIdRef.current;
-              if (rid !== null) {
-                const segIdx = curIdx;
-                getAuthToken().then((token) => {
-                  if (!token) return;
-                  submitSegment(rid, {
-                    index: segIdx, distanceM: seg.length ?? 5,
-                    slopePercent: seg.slope ?? 0, elapsedMs: elapsed,
-                    measured: true, zone: seg.zone, direction: seg.direction,
-                  }, token).catch(() => {});
-                }).catch(() => {});
-              }
+              // BE 제출(submitSegment)은 더 이상 여기서 하지 않는다 — measurement_units
+              // 기준(아래 별도 while 루프)으로만 나간다. measuredMsRef는 로컬 기록
+              // (SegmentTime, 마이페이지 표시용)에만 계속 쓰인다.
 
               // 신호 A — 이 구간을 현재 bin 에 누적하고, bin 경계면 관측 1행을 돌려받는다.
               // (다음 구간이 서울 밖이면 그 경사(0)는 넘기지 않는다.)
@@ -1041,6 +1147,83 @@ export default function NavigationScreen({ navigation, route }: Props) {
             if (curIdx < routeSegments.length) {
               segmentStartTimesRef.current[curIdx] = now;
             }
+          }
+
+          // 측정 파이프라인 v2 — measurement_units(≥30m) 기준 GPS 도착판정. 위
+          // routeSegments 루프(신호 A/안내용)와 완전히 독립적으로 돈다 — 인덱스
+          // 체계도, 종료 좌표(end_coords)도 서로 다른 분할이라 하나의 루프로
+          // 합칠 수 없다(measurement_units.py 설계 메모 참고).
+          {
+            // session_id는 개인화 계측 동의가 확정된 뒤에만 채워지는
+            // collectSessionIdRef를 쓴다(동의 게이트 — 위 startLocationWatch의
+            // /navigation/start 결정과 동일 근거: CONSENT_BODY가 "구간별 경사도와
+            // 통과 시간·속도"를 명시적 동의 항목으로 적어뒀다). 세션이 없으면(동의
+            // 안 함/아직 모달 응답 전) submitSegment 자체를 호출하지 않는다.
+            const sid = collectSessionIdRef.current ?? undefined;
+            // 이 콜백 진입 시점의 오염 여부를 고정해 둔다 — 루프 도중 새로
+            // 세팅될 일은 없지만(신호 B/AppState 핸들러는 이 루프보다 먼저 돈다),
+            // 소비 후 리셋 타이밍을 이 tick 하나로 명확히 하기 위함.
+            const gapPendingAtStart = unitGapPendingRef.current;
+            let gapConsumed = false;
+            let curUnitIdx = currentUnitIdxRef.current;
+            let unitsThisTick = 0; // 이 콜백 안에서 이미 몇 개의 unit을 지났는지
+
+            while (curUnitIdx < measurementUnits.length) {
+              const unit = measurementUnits[curUnitIdx];
+              const [endLng, endLat] = unit.end_coords;
+              const distToUnitEnd = haversineDistance(
+                { latitude: loc.coords.latitude, longitude: loc.coords.longitude },
+                { latitude: endLat, longitude: endLng }
+              );
+              if (distToUnitEnd >= PROXIMITY_THRESHOLD) break;
+
+              // skip 사유 둘:
+              //  1) 이 콜백 한 번에 unit을 2개 이상 지났다(catch-up) — 두 번째
+              //     unit부터 elapsed가 사실상 0이라 실측이 아니다. BE는 갭을
+              //     추론하지 않으므로 이 판단은 FE 책임이다(app.py 참고).
+              //  2) 이 unit이 열려 있던 동안 GPS 공백/점프가 있었다(gapPendingAtStart)
+              //     — catch-up이 아니어도(1개만 닫혀도) elapsed에 그 공백 전체가
+              //     섞여 있다("9.9m 구간에 27700ms" 패턴). 이 콜백에서 처음 닫히는
+              //     unit 하나에만 적용하고 이후(같은 tick 안의 진짜 catch-up)는
+              //     이유 1로 이미 skip 처리된다.
+              const isCatchUp = unitsThisTick > 0 || gapPendingAtStart;
+              if (gapPendingAtStart && unitsThisTick === 0) gapConsumed = true;
+              const unitIdx = curUnitIdx;
+              const rid = serverRouteIdRef.current;
+
+              const payload: MeasurementSegmentPayload = isCatchUp
+                ? {
+                    sessionId: sid ?? "", unitIndex: unitIdx,
+                    distanceM: unit.distance_m, slopePercent: unit.slope_pct,
+                    status: "skipped",
+                  }
+                : {
+                    sessionId: sid ?? "", unitIndex: unitIdx,
+                    distanceM: unit.distance_m, slopePercent: unit.slope_pct,
+                    status: "measured", elapsedMs: now - unitStartTimesRef.current[unitIdx],
+                  };
+
+              // sid가 없으면(동의 없음/모달 응답 전) BE가 session_id를 필수로
+              // 요구하므로 애초에 보내지 않는다.
+              if (rid !== null && sid) {
+                getAuthToken().then((token) => {
+                  if (!token) return;
+                  submitSegment(rid, payload, token).catch(() => {});
+                }).catch(() => {});
+              }
+
+              unitsThisTick += 1;
+              curUnitIdx += 1;
+              currentUnitIdxRef.current = curUnitIdx;
+              if (curUnitIdx < measurementUnits.length) {
+                unitStartTimesRef.current[curUnitIdx] = now;
+              }
+            }
+
+            // 오염 플래그는 실제로 unit 하나를 닫는 데 소비했을 때만 리셋한다 —
+            // 아직 어떤 unit 경계도 안 지났다면(같은 tick에 도착판정 자체가 없었다면)
+            // 다음 콜백까지 계속 들고 있어야 그 다음에 닫히는 unit이 오염 처리된다.
+            if (gapConsumed) unitGapPendingRef.current = false;
           }
 
           // 도보1(승차 지점까지) 구간의 모든 세그먼트를 GPS로 실제 통과했으면
@@ -1065,6 +1248,14 @@ export default function NavigationScreen({ navigation, route }: Props) {
             speak(alightText);
             stopAlightReminder();
             alightReminderRef.current = setInterval(() => speak(alightText), 40_000);
+            // 알려진 이슈(별도 트래킹, 지금 안 고침): 여기서 새 NavigationScreen을
+            // 마운트하는 것 = 이전 leg는 completeNavigation을 절대 호출받지 못하고
+            // routes.status='in_progress'로 영구히 남는다(postWalkParams에
+            // serverRouteId/collectSessionId 이어받는 값이 없어 이전 leg를 닫을
+            // 방법 자체가 없음). 파일럿 전 DB에서 발견한 in_progress 방치 63건 중
+            // 일부는 "앱 종료/네트워크 유실"이 아니라 대중교통 정상 동작 중에도
+            // 구조적으로 이렇게 생겼을 가능성이 있음. 멀티레그 "완료"를 leg 단위로
+            // 볼지 여정 전체로 볼지 결정 필요 — 이번 측정 파이프라인 v2 작업 범위 밖.
             navigation?.navigate("Navigation", transitNextLeg.nextLegParams);
           }
 
@@ -1107,7 +1298,10 @@ export default function NavigationScreen({ navigation, route }: Props) {
           binTrackerRef.current?.invalidateCurrent(Date.now());
           lastGpsPosRef.current = null;
           lastGpsTimeRef.current = 0;
-          if (__DEV__) console.warn(`[collect] 백그라운드 복귀 공백 ${gapS.toFixed(0)}s — 진행 중 bin 무효화`);
+          // 진행 중이던 measurementUnit도 같은 공백을 그대로 삼킨다 — 다음에
+          // 닫힐 때 status='skipped'로 나가도록 표시(위 신호 B 블록과 동일 플래그).
+          unitGapPendingRef.current = true;
+          if (__DEV__) console.warn(`[collect] 백그라운드 복귀 공백 ${gapS.toFixed(0)}s — 진행 중 bin/unit 무효화`);
         }
       }
     });
@@ -1130,6 +1324,10 @@ export default function NavigationScreen({ navigation, route }: Props) {
         collectSessionRef.current = null;
         binTrackerRef.current = null;
       }
+      if (gpsTraceBufferRef.current) {
+        void gpsTraceBufferRef.current.flush({ final: true });
+        gpsTraceBufferRef.current = null;
+      }
     };
   }, []);
 
@@ -1138,6 +1336,11 @@ export default function NavigationScreen({ navigation, route }: Props) {
     return null;
   }, [currentLocation, coordinates]);
 
+  // currentLocationForMap을 의도적으로 deps에서 뺐다 — 포함시키면 GPS가 움직일
+  // 때마다(수 초 간격) 지도 HTML 전체가 재생성되어 WebView가 통째로 리로드되고,
+  // 그 결과 지도가 매번 경로 bounds로 재축소된다("즉각 반영 안 됨" + "축소되며
+  // 나타남" 원인). 최초 진입 시점의 위치만 initial overlay로 굽고, 그 다음부턴
+  // 아래 useEffect가 bridge(window.updateCurrentLocation)로 마커만 옮긴다.
   const mapHtml = useMemo(
     () =>
       makeKakaoMapHtml({
@@ -1153,8 +1356,17 @@ export default function NavigationScreen({ navigation, route }: Props) {
         finalDestinationName,
         finalOriginName,
       }),
-    [coordinates, navSegData, routeSegments, currentLocationForMap, from, to, showSlopeMarkers, journeyMapPath, journeyMapSegments, finalDestinationName, finalOriginName]
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [coordinates, navSegData, routeSegments, from, to, showSlopeMarkers, journeyMapPath, journeyMapSegments, finalDestinationName, finalOriginName]
   );
+
+  // 최초 진입 이후의 위치 갱신은 지도를 다시 그리지 않고 마커만 옮긴다.
+  useEffect(() => {
+    if (!currentLocationForMap) return;
+    webviewRef.current?.injectJavaScript(
+      `if (window.updateCurrentLocation) { window.updateCurrentLocation(${currentLocationForMap.latitude}, ${currentLocationForMap.longitude}); } true;`
+    );
+  }, [currentLocationForMap]);
 
   const mapKey = `${routeId}-${coordinates.length}-${navSegData.length}-${routeSegments.length}`;
 
@@ -1176,6 +1388,15 @@ export default function NavigationScreen({ navigation, route }: Props) {
           const now = Date.now();
           const totalDurationMs = now - startTimeRef.current;
 
+          // 측정 파이프라인 v2 — 마지막 measurementUnit까지 GPS로 실제 통과했는지.
+          // "안내 종료" 버튼은 도착 후에 눌러도 도중에 눌러도 항상 이 핸들러를
+          // 타므로(위 주석 참고), 도착 여부는 버튼을 누른 게 아니라 currentUnitIdxRef
+          // 가 끝까지 갔는지로 판정한다. measurementUnits가 비어 있으면(BE
+          // build_measurement_units 실패 — 위 경고 로그) 0 >= 0 이 참이 되어
+          // "도착"으로 오판하므로 length > 0 가드를 먼저 건다.
+          const reachedDestination =
+            measurementUnits.length > 0 && currentUnitIdxRef.current >= measurementUnits.length;
+
           // 개인화 계측 — 진행 중이던 마지막 bin(부분 통과)을 관측 1행으로 확정하고
           // 세션 종료 플러시. 개별 POST 없이 /collect/batch 로만 나간다(인계 §5 ⑫).
           const cs = collectSessionRef.current;
@@ -1185,6 +1406,10 @@ export default function NavigationScreen({ navigation, route }: Props) {
             cs.flush({ final: true }).catch(() => {});
             collectSessionRef.current = null;
             binTrackerRef.current = null;
+          }
+          if (gpsTraceBufferRef.current) {
+            gpsTraceBufferRef.current.flush({ final: true }).catch(() => {});
+            gpsTraceBufferRef.current = null;
           }
 
           // 도중에 종료해도, 실제로 GPS 로 끝점까지 통과한 구간만 저장한다(옵션 b).
@@ -1225,7 +1450,10 @@ export default function NavigationScreen({ navigation, route }: Props) {
               if (token && rid !== null) {
                 // 통과한 구간은 지나는 시점에 이미 실시간 업로드됨(submitSegment).
                 // 여기선 완료 처리만 — 안 지나온 구간은 서버에도 올리지 않는다.
-                await completeNavigation(rid, totalDurationMs, token);
+                await completeNavigation(rid, token, {
+                  sessionId: collectSessionIdRef.current ?? collectSessionRef.current?.sessionId,
+                  reachedDestination,
+                });
                 await updateServerRouteId(newId, rid);
               }
             } catch (e) {
@@ -1252,6 +1480,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
     routeAfterRating(navigation, {
       serverRouteId: serverRouteIdRef.current,
       routeSegments,
+      measurementUnits,
       // state(savedRouteId)는 이 tick 에 아직 "" — ref 를 우선 사용
       nextRouteId: savedRouteIdRef.current || savedRouteId,
       sessionId: collectSessionIdRef.current ?? collectSessionRef.current?.sessionId,

@@ -33,9 +33,11 @@ from database import (
     save_zone_observation, get_user_speed_profile, save_collect_batch,
     delete_user_account, get_personalization_status,
     get_slow_segments, save_segment_hardship_feedback,
+    start_session, add_navigation_measurement, save_gps_batch,
 )
 from routing.speed import get_zone_key, estimate_route_time, get_default_speed
 from routing.segments import build_navigation_segments, extract_waypoints
+from routing.measurement_units import build_measurement_units
 from routing.voice_guidance import calculate_bearing, get_turn_direction, generate_guidance_text
 from routing.travel_time import estimate_route_time as estimate_nav_time
 from firebase import verify_token, delete_firebase_user
@@ -630,6 +632,14 @@ class NavigationStartRequest(BaseModel):
     dest_lat:       float | None = None
     dest_lon:       float | None = None
     date:           str | None = None
+    # ── 측정 파이프라인 v2 세션 발급 (인터페이스만 우선 도입) ────────────────
+    # FE는 아직 이 필드들을 보내지 않는다(FE 연동은 다음 턴) — 그때까지는
+    # 전부 생략된 채로 오고, 기존과 동일하게 route_id만 발급된다(세션 없음).
+    # session_id는 BE가 발급하지 않는다 — 기존 CollectSession과 같은 포맷으로
+    # FE가 만들어 보낸 값을 그대로 신뢰해 저장한다(발급 체계 이원화 방지).
+    session_id:     str | None = None
+    app_version:    str | None = None
+    schema_ver:     int | None = None
 
 
 @app.post("/navigation/start")
@@ -637,10 +647,19 @@ def api_navigation_start(
     body: NavigationStartRequest,
     db: Session = Depends(get_db),
     decoded: dict = Depends(_verified),
+    x_app_version: str = Header(default=""),
+    x_schema_version: str = Header(default=""),
 ):
-    """안내 시작 — routes에 in_progress 행 생성, route_id 반환"""
+    """안내 시작 — routes에 in_progress 행 생성 + (session_id가 있으면) sessions
+    행도 함께 생성, route_id 반환.
+
+    app_version/schema_ver는 바디 필드를 우선하고, 없으면 X-App-Version /
+    X-Schema-Version 헤더를 본다 — FE가 아직 어느 쪽으로도 안 보내면(현재)
+    세션 없이 route_id만 발급하던 기존 동작 그대로 유지된다.
+    """
     if body.walker_type not in USER_TYPES:
         raise HTTPException(400, f"유효하지 않은 walker_type: {body.walker_type}")
+
     route_id = start_navigation(
         db,
         uid=decoded["uid"],
@@ -656,15 +675,45 @@ def api_navigation_start(
     )
     if route_id is None:
         raise HTTPException(503, "DB 미설정")
+
+    if body.session_id:
+        app_version = body.app_version or x_app_version or None
+        schema_ver  = body.schema_ver
+        if schema_ver is None and x_schema_version:
+            try:
+                schema_ver = int(x_schema_version)
+            except ValueError:
+                schema_ver = None
+        if not app_version or schema_ver is None:
+            raise HTTPException(400, "session_id를 보낼 땐 app_version과 schema_ver도 함께 필요합니다")
+        start_session(
+            db,
+            session_id=body.session_id,
+            uid=decoded["uid"],
+            user_type=body.walker_type,
+            app_version=app_version,
+            schema_ver=schema_ver,
+        )
+
     return {"route_id": route_id}
 
 
 class NavigationSegmentRequest(BaseModel):
-    index:      int
+    # ── 측정 파이프라인 v2 ── navigation_measurements 대상 필드.
+    # session_id는 필수다 — 없는 요청은 (하위호환을 위해 조용히 무시하지 않고)
+    # 400으로 즉시 드러낸다. 이 프로젝트는 결측을 거리비례 추정 등으로 조용히
+    # 메우다 데이터가 오염된 전례가 있어, "실패는 조용히 감추지 말고 드러내라"가
+    # 원칙이다. 구버전 FE(이 필드가 아예 없는 요청 본문)는 이 시점부터 이
+    # 엔드포인트가 전부 실패하는데, 이는 의도된 동작 — BE·FE는 같은 시점에
+    # 배포하는 걸 전제로 하고, 배포 틈에는 조용한 데이터 유실보다 드러난 실패를
+    # 택한다(테스터 소수 규모라 재빌드 배포로 충분히 대응 가능).
+    session_id: str
+    unit_index: int             # routing/measurement_units.py의 MeasurementUnit.unit_index
     distance_m: float
-    slope_pct:  float          # 부호 있는 값 (양수=오르막, 음수=내리막)
-    elapsed_ms: int            # 이 구간 단독 이동 시간(ms), 정지 대기 제외
-    measured:   bool  = False  # True=GPS 실측, False=거리비례 추정
+    slope_pct:  float           # 부호 있는 값 (양수=오르막, 음수=내리막), 거리가중평균
+    status:     str             # 'measured' | 'skipped'
+    elapsed_ms: int | None = None   # status='measured'일 때만 필수, 'skipped'면 반드시 None
+    # ── 레거시 navigation_segments(마이페이지 표시용) 병행 기록에만 쓰는 필드 ──
     zone:       str | None = None
     direction:  str | None = None
 
@@ -676,21 +725,61 @@ def api_add_segment(
     db: Session = Depends(get_db),
     decoded: dict = Depends(_verified),
 ):
-    """구간 완료 시 호출 — navigation_segments에 실측 데이터 저장"""
-    ok = add_navigation_segment(
+    """구간(측정 단위) 완료/스킵 시 호출 — navigation_measurements에 실측 데이터
+    저장(주 기록) + navigation_segments에도 병행 기록(마이페이지 표시용, 레거시).
+
+    catch-up(한 번에 여러 unit을 건너뜀) 판정과 그 결과 status='skipped' 행
+    생성은 이제 FE 책임이다 — BE는 건너뛴 unit의 실제 distance_m/slope_pct를
+    모르고(경로 재계산 없이는 알 수 없음), FE는 /route 응답으로 이미 전체
+    unit 배열을 갖고 있어 건너뛴 unit도 그대로 제출할 수 있다. BE는 들어오는
+    대로 UNIQUE(route_id, unit_index) 기준 upsert(ON CONFLICT DO NOTHING)만
+    한다 — 갭을 추론해서 채우지 않는다.
+    """
+    if body.status not in ("measured", "skipped"):
+        raise HTTPException(400, "status는 'measured' 또는 'skipped'여야 합니다")
+    if body.status == "measured" and body.elapsed_ms is None:
+        raise HTTPException(400, "status='measured'는 elapsed_ms가 필요합니다")
+    if body.status == "skipped" and body.elapsed_ms is not None:
+        raise HTTPException(400, "status='skipped'는 elapsed_ms를 보내면 안 됩니다")
+
+    ok = add_navigation_measurement(
         db,
         route_id=route_id,
         uid=decoded["uid"],
-        index=body.index,
+        session_id=body.session_id,
+        unit_index=body.unit_index,
         distance_m=body.distance_m,
         slope_pct=body.slope_pct,
         elapsed_ms=body.elapsed_ms,
-        measured=body.measured,
-        zone=body.zone,
-        direction=body.direction,
+        status=body.status,
     )
     if not ok:
-        raise HTTPException(404, "진행 중인 경로를 찾을 수 없거나 권한이 없습니다")
+        raise HTTPException(
+            404,
+            "진행 중인 경로를 찾을 수 없거나 권한이 없거나, session_id가 유효하지 않습니다",
+        )
+
+    # 레거시 navigation_segments — 마이페이지 표시용으로 그대로 유지(범위 밖,
+    # 코드 변경 없음). 단 'skipped'는 이 구 테이블에 없던 개념이라 elapsed_ms가
+    # NOT NULL이므로, 실측된 unit만 병행 기록한다. 이 병행 기록 실패가 위
+    # navigation_measurements(주 기록) 성공까지 무효로 만들진 않는다.
+    if body.status == "measured":
+        try:
+            add_navigation_segment(
+                db,
+                route_id=route_id,
+                uid=decoded["uid"],
+                index=body.unit_index,
+                distance_m=body.distance_m,
+                slope_pct=body.slope_pct,
+                elapsed_ms=body.elapsed_ms,
+                measured=True,
+                zone=body.zone,
+                direction=body.direction,
+            )
+        except Exception as e:
+            print(f"[NAV] 레거시 navigation_segments 병행 기록 실패 (무시): {e}")
+
     return {"ok": True}
 
 
@@ -739,7 +828,19 @@ def api_zone_observation(
 
 
 class NavigationCompleteRequest(BaseModel):
-    total_duration_ms: int
+    # total_duration_ms 필드는 제거했다 — BE가 navigation_measurements 집계로
+    # 직접 계산한다(complete_navigation() 참고). FE가 옛 필드를 계속 보내도
+    # Pydantic이 무시하므로(BaseModel 기본 동작) 구버전 요청도 400 없이 통과한다.
+    #
+    # reached_destination: 목적지까지 정상 도달했는지. FE는 아직 이 필드를 안
+    # 보낸다(다음 턴 연동 예정) — 그때까지는 None으로 들어와 기존과 동일하게
+    # status='completed'로 확정된다("조기 종료"와 "정상 도착"을 구분 못 하는
+    # 구버전 FE의 한계를 그대로 반영한 임시 fallback — 데이터를 지어내는 게
+    # 아니라 "이 필드가 없던 시절과 동일하게" 처리하는 것뿐이다).
+    reached_destination: bool | None = None
+    # session_id: 있으면 sessions.ended_at/end_reason도 함께 닫는다(Optional —
+    # 구버전 FE 호환. /navigation/start에서 세션을 안 열었으면 애초에 없는 값).
+    session_id: str | None = None
 
 
 @app.patch("/navigation/{route_id}/complete")
@@ -749,12 +850,16 @@ def api_complete_navigation(
     db: Session = Depends(get_db),
     decoded: dict = Depends(_verified),
 ):
-    """안내 종료 — 구간 집계 후 status=completed 확정"""
+    """안내 종료 — navigation_measurements 집계로 총 거리·평균 경사·총 소요시간을
+    확정하고, reached_destination에 따라 routes.status를
+    'completed'/'completed_partial'로 나눠 확정한다. session_id가 있으면 해당
+    세션도 같은 값으로 종료 처리한다."""
     result = complete_navigation(
         db,
         route_id=route_id,
         uid=decoded["uid"],
-        total_duration_ms=body.total_duration_ms,
+        reached_destination=body.reached_destination,
+        session_id=body.session_id,
     )
     if result is None:
         raise HTTPException(404, "진행 중인 경로를 찾을 수 없거나 권한이 없습니다")
@@ -908,6 +1013,44 @@ def api_collect_batch(
         route_profile=body.route_profile.model_dump() if body.route_profile else None,
     )
     return result
+
+
+class GpsPointPayload(BaseModel):
+    seq:        int
+    t_ms:       int
+    lat:        float
+    lon:        float
+    accuracy_m: float | None = None
+    speed_mps:  float | None = None
+
+
+class GpsBatchRequest(BaseModel):
+    session_id: str
+    points:     list[GpsPointPayload] = []
+
+
+@app.post("/collect/gps-batch")
+def api_collect_gps_batch(
+    body: GpsBatchRequest,
+    db: Session = Depends(get_db),
+    decoded: dict = Depends(_verified),
+):
+    """GPS 원본 궤적 배치 저장 (gps_traces) — 측정 파이프라인 v2 전용.
+
+    기존 /collect/batch(신호 A~D, CollectBatchRequest)와 완전히 독립된
+    엔드포인트다 — session_id 문자열 포맷은 같은 걸 공유하지만(FE가 동일하게
+    발급) 저장 대상 테이블도, 멱등 키도 서로 무관하다. (session_id, seq) 기준
+    멱등 — 같은 배치를 재전송해도 중복 저장되지 않는다.
+    """
+    if not body.points:
+        return {"ok": True, "saved": 0}
+    saved = save_gps_batch(
+        db,
+        uid=decoded["uid"],
+        session_id=body.session_id,
+        points=[p.model_dump() for p in body.points],
+    )
+    return {"ok": True, "saved": saved}
 
 
 @app.get("/user/personalization-status")
@@ -1157,6 +1300,7 @@ def api_route(
         # 회전 음성안내)는 실제 GPS 안내를 시작한 경로에서만 쓰이므로, light=True
         # (아직 선택 전인 후보 경로 조회)면 이 부분만 건너뛴다.
         nav_segs, waypoints, nav_time = [], [], {}
+        measurement_units = []
         _node_to_path_idx: dict = {}
         try:
             nav_segs = build_navigation_segments(
@@ -1169,6 +1313,30 @@ def api_route(
                 for _i, _n in enumerate(result["path_nodes"]):
                     if _n not in _node_to_path_idx:
                         _node_to_path_idx[_n] = _i
+
+                # 측정 파이프라인 v2 — GPS 실측(navigation_measurements) 제출 단위.
+                # nav_segs(교차로 기준, 지도색/안내용)와 목적이 다른 완전히 별개의
+                # 분할이라 독립적으로 계산한다(하나가 실패해도 다른 하나는 살아있게
+                # try를 나눈다). light 모드(후보 대량 조회)에선 waypoints와 마찬가지로
+                # 건너뛴다 — 실제로 GPS 안내를 시작하는 경로에서만 의미가 있다.
+                try:
+                    units = build_measurement_units(G, result["path_nodes"])
+                    measurement_units = [
+                        {
+                            "unit_index":      u.unit_index,
+                            "distance_m":      u.distance_m,
+                            "slope_pct":       u.slope_pct,
+                            "coord_start_idx": _node_to_path_idx.get(u.start_node, 0),
+                            "coord_end_idx":   _node_to_path_idx.get(u.end_node, 0),
+                            "start_coords":    [round(G.nodes[u.start_node]["lon"], 7),
+                                                round(G.nodes[u.start_node]["lat"], 7)],
+                            "end_coords":      [round(G.nodes[u.end_node]["lon"], 7),
+                                                round(G.nodes[u.end_node]["lat"], 7)],
+                        }
+                        for u in units
+                    ]
+                except Exception as _mu_err:
+                    print(f"[NAV] measurement_units 생성 실패 (무시): {_mu_err}")
 
                 for i, seg in enumerate(nav_segs[:-1]):
                     wp = G.nodes[seg.end_node]
@@ -1237,6 +1405,10 @@ def api_route(
                 for i, s in enumerate(nav_segs)
             ],
             "waypoints": waypoints,
+            # 측정 파이프라인 v2 — POST /navigation/{route_id}/segment 제출용
+            # (unit_index, distance_m, slope_pct는 그대로, start_coords/end_coords는
+            # FE의 PROXIMITY_THRESHOLD 도착판정·D신호 지도 하이라이트용).
+            "measurement_units": measurement_units,
         }
 
         if body.candidates == "compare":
@@ -1260,6 +1432,7 @@ def api_route(
                     # 보통 light 없이 호출) waypoints 가 비어 있을 수 있음.
                     "navigation_segments": response["navigation_segments"],
                     "waypoints":     response["waypoints"],
+                    "measurement_units": response["measurement_units"],
                 },
             ]
 

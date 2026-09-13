@@ -30,6 +30,7 @@ import {
   type SlowSegmentsResponse,
 } from "../../utils/slowSegmentModel";
 import { describeSegment } from "../../utils/segmentDescription";
+import type { MeasurementUnit } from "../../api/routeApi";
 
 type RawSeg = {
   start?: { latitude?: number; longitude?: number };
@@ -62,7 +63,12 @@ type Props = {
   navigation: any;
   route?: {
     params?: {
-      routeSegments?: string;   // JSON 배열 (NavigationScreen normalizeSegments 결과)
+      routeSegments?: string;   // JSON 배열 (NavigationScreen normalizeSegments 결과) — 회색 전체 경로선용
+      // 측정 파이프라인 v2 — BE route_slow_segments.seg_index가 이제 unit_index를
+      // 가리키므로, 하이라이트·위치설명 둘 다 이 배열을 seg_index로 직접 찾아
+      // 써야 한다(routeSegments를 seg_index로 슬라이스하면 완전히 다른 지점을
+      // 가리킨다 — raw edge 배열과 unit 배열은 인덱스 체계가 다름).
+      measurementUnits?: string;
       serverRouteId?: string;   // /navigation/start 의 route_id
       nextRouteId?:   string;   // 이어서 갈 RouteDetail 의 로컬 id
       sessionId?:     string;   // (선택) 수집 세션 id — 없으면 null 저장
@@ -77,6 +83,25 @@ export default function SlowSegmentFeedbackScreen({ navigation, route }: Props) 
   const segsRaw: RawSeg[] = useMemo(() => {
     try { return JSON.parse(p.routeSegments ?? "[]"); } catch { return []; }
   }, [p.routeSegments]);
+
+  // unit_index로 직접 인덱싱한다 — BE(build_measurement_units)가 unit_index를
+  // 배열 순서 그대로(0,1,2…) 매기므로, 필터링 없이 그대로 두면 위치가 안 어긋난다.
+  const measurementUnits: MeasurementUnit[] = useMemo(() => {
+    try { return JSON.parse(p.measurementUnits ?? "[]"); } catch { return []; }
+  }, [p.measurementUnits]);
+
+  // describeSegment()(segmentDescription.ts)가 기대하는 필드명(length_m)으로
+  // 변환 — "출발 후 몇 m 지점"을 measurement_units(unit_index 배열) 기준으로
+  // 계산하기 위함. routeSegments(raw edge)로 계산하면 같은 인덱스 불일치로
+  // 위치 설명 자체가 틀어진다(하이라이트와 동일한 문제).
+  // 알려진 이슈(사소, 지금 안 고침): measurementUnits는 서울 밖 직선 구간
+  // (outside_seoul)을 포함하지 않으므로, 하이브리드 경로(출발/도착이 서울 밖)에서
+  // locateSegment()의 totalM(분모)이 실제 전체 여정보다 짧게 잡혀 "몇 % 지점"
+  // 진행률 텍스트가 약간 어긋날 수 있다 — 하이라이트 위치 자체는 영향 없음.
+  const descSegs = useMemo(
+    () => measurementUnits.map((u) => ({ slope_pct: u.slope_pct, length_m: u.distance_m })),
+    [measurementUnits]
+  );
 
   const serverRouteId = p.serverRouteId ? Number(p.serverRouteId) : null;
 
@@ -131,9 +156,21 @@ export default function SlowSegmentFeedbackScreen({ navigation, route }: Props) 
   const allComplete = segments.every(isComplete);
   const doneCount = segments.filter(isComplete).length;
 
-  // 묶인 구간 전체(seg_index ~ seg_index_end)의 좌표열을 지도 강조용으로 뽑는다.
-  const highlightFor = (s: SlowSegment) =>
-    toCoordList(segsRaw.slice(s.seg_index, (s.seg_index_end ?? s.seg_index) + 1) as RawSeg[]);
+  // seg_index(=unit_index)로 measurement_units 배열에서 그 unit을 직접 찾아
+  // 시작~끝 좌표로 지도 강조 범위를 만든다. 레거시(routeSegments를 seg_index로
+  // 슬라이스하던 방식)는 unit_index와 raw edge 인덱스 체계가 달라 더 이상 맞지
+  // 않는다 — seg_index_end도 이제 항상 seg_index와 같다(BE가 그렇게 채움, 병합
+  // 구간 개념 없음).
+  const highlightFor = (s: SlowSegment) => {
+    const unit = measurementUnits[s.seg_index];
+    if (!unit) return [];
+    const [startLng, startLat] = unit.start_coords;
+    const [endLng, endLat] = unit.end_coords;
+    return [
+      { latitude: startLat, longitude: startLng },
+      { latitude: endLat,   longitude: endLng },
+    ];
+  };
 
   const mapModalRoutes: MapRoute[] | null =
     mapSegIdx === null
@@ -180,7 +217,7 @@ export default function SlowSegmentFeedbackScreen({ navigation, route }: Props) 
       >
         {segments.map((s, i) => {
           const d = describeSegment({
-            segs: segsRaw,
+            segs: descSegs,
             startIdx: s.seg_index,
             endIdx: s.seg_index_end ?? s.seg_index,
             slopePct: s.slope_pct,

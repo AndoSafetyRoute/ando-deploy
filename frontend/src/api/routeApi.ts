@@ -17,6 +17,20 @@ export type NavSegment = {
   end_coords:       [number, number];
 };
 
+// 측정 파이프라인 v2 — GPS 실측(POST /navigation/{route_id}/segment) 제출 단위.
+// nav_segs(NavSegment, 교차로 기준·지도색/안내용)와 목적이 다른 별개의 분할 —
+// CCH raw edge(5~10m)를 누적거리 30m+ 로 묶은 것으로, GPS 통과판정(15m)보다
+// 확실히 커야 하는 실측 단위다. routing/measurement_units.py 참고.
+export type MeasurementUnit = {
+  unit_index:       number;
+  distance_m:       number;
+  slope_pct:        number;
+  coord_start_idx:  number;
+  coord_end_idx:    number;
+  start_coords:     [number, number];
+  end_coords:       [number, number];
+};
+
 export type Waypoint = {
   lat:              number;
   lon:              number;
@@ -44,6 +58,7 @@ export type RouteResponse = {
   estimated_time_min:   number;
   navigation_segments:  NavSegment[];
   waypoints:            Waypoint[];
+  measurement_units:    MeasurementUnit[];
 };
 
 export type RouteRequest = {

@@ -152,7 +152,9 @@ export async function drainCollectQueue(idToken?: string): Promise<void> {
   }
 }
 
-function newSessionId(): string {
+// export — 측정 파이프라인 v2가 session_id를 개인화 동의와 무관하게 미리 발급해야
+// 해서(WalkContent/RouteCompareScreen), CollectSession 생성 시점과 분리해 재사용한다.
+export function newSessionId(): string {
   return `sess-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 

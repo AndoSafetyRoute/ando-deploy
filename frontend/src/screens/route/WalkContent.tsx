@@ -21,7 +21,7 @@ import {
   primaryKind,
   type ShownCandidate,
 } from '../../utils/routeChoiceModel';
-import { CollectSession } from '../../utils/collectQueue';
+import { CollectSession, newSessionId } from '../../utils/collectQueue';
 import { getCollectConsent } from '../../personalization/collectConsent';
 
 // 도보 탭 경로 선택에 그대로 노출되는 2개 후보 — 거리우선 / 유형별 경로.
@@ -258,6 +258,7 @@ export default function WalkContent({
               routeSegments: r?.routeSegments ?? routeData?.routeSegments ?? [],
               navigation_segments: r?.navigation_segments ?? routeData?.navigation_segments ?? [],
               waypoints: r?.waypoints ?? routeData?.waypoints ?? [],
+              measurement_units: r?.measurement_units ?? routeData?.measurement_units ?? [],
               totalDistance: r?.totalDistance ?? routeData?.total_length_m ?? null,
               avgSlope: r?.avgSlope ?? routeData?.avg_slope_pct ?? 0,
               estimatedTimeS: r?.estimatedTimeS ?? routeData?.estimatedTimeS ?? null,
@@ -378,6 +379,7 @@ export default function WalkContent({
         coordinates: selectedCand.route.coordinates,
         routeSegments: selectedCand.route.routeSegments,
         navigation_segments: selectedCand.route.navigation_segments ?? [],
+        measurement_units: selectedCand.route.measurement_units ?? [],
         waypoints: selectedCand.route.waypoints ?? [],
         totalDistance: selectedCand.route.totalDistance,
         avgSlope: selectedCand.route.avgSlope,

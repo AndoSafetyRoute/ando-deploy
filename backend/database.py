@@ -203,7 +203,6 @@ def init_db():
         # ── CHECK / FK 제약 추가 (이미 있으면 무시) ─────────────────────────
         _user_type_vals = "'manual_wheelchair','electric_wheelchair','walker','cane','leg_injury','elderly'"
         for tbl, name, definition in [
-            ("routes",              "chk_status",     "CHECK (status IN ('in_progress','completed','abandoned'))"),
             ("routes",              "chk_route_mode", "CHECK (mode IN ('walk','transit','car','accessibility'))"),
             ("users",               "chk_user_type",  f"CHECK (user_type IS NULL OR user_type IN ({_user_type_vals}))"),
             ("navigation_segments", "chk_zone",       "CHECK (zone IS NULL OR zone IN ('flat','optimal','warning','forbidden'))"),
@@ -220,6 +219,15 @@ def init_db():
                     END IF;
                 END $$
             """))
+
+        # chk_status는 위 루프와 달리 "없으면 추가"가 아니라 "있어도 정의를 갱신"해야
+        # 한다 — 'completed_partial'(조기 종료) 값을 새로 허용해야 하므로, 매번
+        # DROP 후 다시 ADD 한다(둘 다 IF EXISTS/그냥 재정의라 반복 실행해도 안전).
+        conn.execute(text("ALTER TABLE routes DROP CONSTRAINT IF EXISTS chk_status"))
+        conn.execute(text(
+            "ALTER TABLE routes ADD CONSTRAINT chk_status "
+            "CHECK (status IN ('in_progress','completed','completed_partial','abandoned'))"
+        ))
 
         # ── 부분 인덱스 ───────────────────────────────────────────────────────
         conn.execute(text("""
@@ -498,6 +506,72 @@ def init_db():
             ON segment_hardship_feedback (slope_pct, pace_s_per_m, was_uncomfortable)
         """))
 
+        # ── 측정 파이프라인 v2 (Supabase 콘솔에서 먼저 생성·검증한 스키마를 그대로
+        # 반영 — 이 프로젝트에서 라이브 DB 제약과 init_db()가 어긋난 전례가 있어
+        # 신규 테이블도 항상 여기 동기화한다) ──────────────────────────────────
+
+        # 측정 세션 — 안내 1회 = 세션 1개. session_id는 FE가 발급(기존
+        # CollectSession과 동일 포맷)해서 /navigation/start 요청에 실어 보낸다.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id   TEXT PRIMARY KEY,
+                uid          TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+                user_type    TEXT NOT NULL,
+                started_at   TIMESTAMPTZ NOT NULL,
+                ended_at     TIMESTAMPTZ,
+                end_reason   TEXT,
+                app_version  TEXT NOT NULL,
+                schema_ver   INT NOT NULL
+            )
+        """))
+
+        # 구간(측정 단위, routing/measurement_units.py) 별 실측/스킵 기록.
+        # 기존 navigation_segments를 대체하지 않는다 — navigation_segments는
+        # 마이페이지 표시용으로 그대로 유지, 이 테이블은 분석용 신뢰 데이터.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS navigation_measurements (
+                id             BIGSERIAL PRIMARY KEY,
+                route_id       INT NOT NULL REFERENCES routes(id) ON DELETE CASCADE,
+                session_id     TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                unit_index     INT NOT NULL,
+                distance_m     DOUBLE PRECISION NOT NULL,
+                slope_pct      DOUBLE PRECISION NOT NULL,
+                elapsed_ms     BIGINT,
+                status         TEXT NOT NULL,
+                gps_sample_n   INT DEFAULT 0,
+                submitted_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (route_id, unit_index),
+                CONSTRAINT chk_nav_measurement_status
+                    CHECK (status IN ('measured', 'skipped', 'in_progress'))
+            )
+        """))
+
+        # GPS 원본 궤적 — /collect/gps-batch 배치 삽입.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS gps_traces (
+                session_id  TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                seq         INT NOT NULL,
+                t_ms        BIGINT NOT NULL,
+                lat         DOUBLE PRECISION NOT NULL,
+                lon         DOUBLE PRECISION NOT NULL,
+                accuracy_m  REAL,
+                speed_mps   REAL,
+                PRIMARY KEY (session_id, seq)
+            )
+        """))
+
+        # /collect/gps-batch 수신 로그 — collect_batch_log와 동일한 멱등 패턴.
+        # ⚠️ 정확한 컬럼 목록을 Supabase 콘솔 실제 스키마와 대조 확인 필요.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS gps_batch_log (
+                uid         TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+                session_id  TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                seq         INT  NOT NULL,
+                received_at TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (uid, session_id, seq)
+            )
+        """))
+
         conn.commit()
     print("[DB] 테이블 초기화 완료")
 
@@ -612,7 +686,7 @@ def get_user_stats(db: Session, uid: str) -> dict:
             ROUND(CAST(AVG(f.rating)        AS NUMERIC), 2) AS avg_satisfaction
         FROM routes r
         LEFT JOIN feedback f ON f.route_id = r.id AND f.uid = :uid
-        WHERE r.uid = :uid AND r.status = 'completed'
+        WHERE r.uid = :uid AND r.status IN ('completed', 'completed_partial')
     """), {"uid": uid}).fetchone()
 
     return {
@@ -724,7 +798,7 @@ def get_user_routes(db: Session, uid: str) -> list:
                r.total_duration_ms, r.created_at, f.rating
         FROM routes r
         LEFT JOIN feedback f ON f.route_id = r.id AND f.uid = :uid
-        WHERE r.uid = :uid AND r.status = 'completed'
+        WHERE r.uid = :uid AND r.status IN ('completed', 'completed_partial')
         ORDER BY r.created_at DESC
         LIMIT 100
     """), {"uid": uid}).fetchall()
@@ -978,6 +1052,136 @@ def start_navigation(
     route_id = row.fetchone()[0]
     db.commit()
     return route_id
+
+
+def start_session(
+    db: Session,
+    session_id: str,
+    uid: str,
+    user_type: str,
+    app_version: str,
+    schema_ver: int,
+) -> bool:
+    """측정 세션 시작 — sessions에 행 INSERT.
+
+    session_id는 FE가 발급한다(기존 CollectSession과 동일한 포맷을 그대로 신뢰
+    — BE는 생성하지 않는다). PK라 재시도로 같은 session_id가 다시 오면
+    ON CONFLICT DO NOTHING으로 무시한다(재INSERT 시도 자체가 실패는 아님 —
+    "이미 시작된 세션"이라는 뜻이라 에러로 취급하지 않는다).
+    """
+    if not engine:
+        return False
+
+    db.execute(text("""
+        INSERT INTO sessions (session_id, uid, user_type, started_at, app_version, schema_ver)
+        VALUES (:session_id, :uid, :user_type, NOW(), :app_version, :schema_ver)
+        ON CONFLICT (session_id) DO NOTHING
+    """), {
+        "session_id":  session_id,
+        "uid":         uid,
+        "user_type":   user_type,
+        "app_version": app_version,
+        "schema_ver":  schema_ver,
+    })
+    db.commit()
+    return True
+
+
+def add_navigation_measurement(
+    db: Session,
+    route_id: int,
+    uid: str,
+    session_id: str,
+    unit_index: int,
+    distance_m: float,
+    slope_pct: float,
+    elapsed_ms: int | None,
+    status: str,
+) -> bool:
+    """구간(측정 단위) 완료/스킵 시 navigation_measurements에 행 삽입 — 멱등.
+
+    UNIQUE(route_id, unit_index) + ON CONFLICT DO NOTHING: 같은 unit이 재전송돼도
+    최초 제출만 남고 이후 제출은 조용히 무시된다(갱신하지 않음 — 재전송은
+    "덮어쓰기 요청"이 아니라 "네트워크 재시도"로 간주).
+
+    session_id는 sessions.uid와 route_id 소유자가 같은 uid인지까지 함께
+    확인한다 — 존재하지 않거나(FK 위반이 아니라 아직 /navigation/start를
+    안 거친 session_id) 다른 사용자 소유면 False.
+    """
+    if not engine:
+        return False
+
+    owns = db.execute(text("""
+        SELECT 1 FROM routes r
+        JOIN sessions s ON s.session_id = :session_id
+        WHERE r.id = :route_id AND r.uid = :uid AND r.status = 'in_progress'
+          AND s.uid = :uid
+    """), {"route_id": route_id, "uid": uid, "session_id": session_id}).fetchone()
+    if not owns:
+        return False
+
+    db.execute(text("""
+        INSERT INTO navigation_measurements
+            (route_id, session_id, unit_index, distance_m, slope_pct, elapsed_ms, status)
+        VALUES
+            (:route_id, :session_id, :unit_index, :distance_m, :slope_pct, :elapsed_ms, :status)
+        ON CONFLICT (route_id, unit_index) DO NOTHING
+    """), {
+        "route_id":   route_id,
+        "session_id": session_id,
+        "unit_index": unit_index,
+        "distance_m": distance_m,
+        "slope_pct":  slope_pct,
+        "elapsed_ms": elapsed_ms,
+        "status":     status,
+    })
+    db.commit()
+    return True
+
+
+def save_gps_batch(db: Session, uid: str, session_id: str, points: list) -> int:
+    """gps_traces에 GPS 원본 궤적 배치 삽입 + gps_batch_log에 수신 로그.
+
+    (session_id, seq)가 gps_traces의 PK라 재전송돼도 중복 저장되지 않는다.
+    gps_batch_log는 (uid, session_id, seq) PK — "이 포인트를 받은 적이 있다"는
+    사실 자체를 실제 저장 성공 여부와 무관하게 남긴다(수집 건전성 점검용).
+    session_id가 유효한 세션(해당 uid 소유)이 아니면 아무것도 쓰지 않고 0 반환.
+    """
+    if not engine or not points:
+        return 0
+
+    owns = db.execute(
+        text("SELECT 1 FROM sessions WHERE session_id = :sid AND uid = :uid"),
+        {"sid": session_id, "uid": uid},
+    ).fetchone()
+    if not owns:
+        return 0
+
+    saved = 0
+    for p in points:
+        result = db.execute(text("""
+            INSERT INTO gps_traces (session_id, seq, t_ms, lat, lon, accuracy_m, speed_mps)
+            VALUES (:session_id, :seq, :t_ms, :lat, :lon, :accuracy_m, :speed_mps)
+            ON CONFLICT (session_id, seq) DO NOTHING
+        """), {
+            "session_id": session_id,
+            "seq":        p["seq"],
+            "t_ms":       p["t_ms"],
+            "lat":        p["lat"],
+            "lon":        p["lon"],
+            "accuracy_m": p.get("accuracy_m"),
+            "speed_mps":  p.get("speed_mps"),
+        })
+        saved += result.rowcount
+
+        db.execute(text("""
+            INSERT INTO gps_batch_log (uid, session_id, seq)
+            VALUES (:uid, :session_id, :seq)
+            ON CONFLICT (uid, session_id, seq) DO NOTHING
+        """), {"uid": uid, "session_id": session_id, "seq": p["seq"]})
+
+    db.commit()
+    return saved
 
 
 def add_navigation_segment(
@@ -1376,9 +1580,32 @@ def complete_navigation(
     db: Session,
     route_id: int,
     uid: str,
-    total_duration_ms: int,
+    reached_destination: bool | None = None,
+    session_id: str | None = None,
 ) -> dict | None:
-    """안내 종료 — 구간 집계 후 status=completed 확정"""
+    """안내 종료 — navigation_measurements 집계로 확정, routes.status 결정.
+
+    total_duration_ms는 더 이상 FE가 보낸 값을 그대로 믿지 않는다(예전엔 FE의
+    벽시계 총 경과시간을 그대로 저장했다 — 백그라운드 방치 등으로 부풀려질 수
+    있었다). 대신 실제 GPS로 측정된(status='measured') unit들의 elapsed_ms 합을
+    BE가 직접 계산한다. skipped/애초에 제출 안 된 unit은 elapsed_ms가 NULL이라
+    SUM이 자동으로 건너뛴다 — 값을 지어내 채우지 않는다(클러스터 B 재발 방지).
+
+    reached_destination:
+      - True  → status='completed' (목적지까지 정상 도달)
+      - False → status='completed_partial' (중간에 안내 종료 — 걸은 만큼만 기록.
+                남은 unit은 아무 행도 만들지 않는다 — "안 지나간 것"과 "지나갔는데
+                측정을 놓친 것(skipped)"은 의미가 다르므로 구분해서 비워 둔다)
+      - None  → (구버전 FE 호환용 임시 fallback) 이 필드를 아직 안 보내는 동안은
+                기존과 동일하게 'completed'로 처리한다. FE가 이 필드를 보내기
+                시작하면 이 분기는 더 이상 타지 않아야 한다.
+
+    session_id가 있으면 sessions.ended_at/end_reason도 함께 닫는다 — end_reason은
+    routes.status와 동일한 값 체계('completed'/'completed_partial')를 그대로 쓴다
+    (별도 어휘를 만들면 나중에 둘이 따로 놀 위험이 있어 하나로 통일). session_id가
+    없거나(구버전 FE) 그 uid 소유가 아니면 조용히 건너뛴다 — routes 확정 자체를
+    막을 이유는 아니다(세션 종료 기록은 부가 정보).
+    """
     if not engine:
         return None
 
@@ -1392,23 +1619,23 @@ def complete_navigation(
     agg = db.execute(text("""
         SELECT
             COALESCE(SUM(distance_m), 0),
-            COALESCE(
-                SUM(ABS(slope_pct) * distance_m) / NULLIF(SUM(distance_m), 0),
-                0
-            )
-        FROM navigation_segments
+            COALESCE(SUM(ABS(slope_pct) * distance_m) / NULLIF(SUM(distance_m), 0), 0),
+            COALESCE(SUM(elapsed_ms), 0)
+        FROM navigation_measurements
         WHERE route_id = :route_id
     """), {"route_id": route_id}).fetchone()
 
-    total_length_m = round(float(agg[0]), 1)
-    avg_slope_pct  = round(float(agg[1]), 2)
+    total_length_m    = round(float(agg[0]), 1)
+    avg_slope_pct     = round(float(agg[1]), 2)
+    total_duration_ms = int(agg[2])
+    status = "completed_partial" if reached_destination is False else "completed"
 
     db.execute(text("""
         UPDATE routes
         SET total_length_m    = :total_length_m,
             avg_slope_pct     = :avg_slope_pct,
             total_duration_ms = :total_duration_ms,
-            status            = 'completed'
+            status            = :status
         WHERE id = :id AND uid = :uid
     """), {
         "id":                route_id,
@@ -1416,15 +1643,25 @@ def complete_navigation(
         "total_length_m":    total_length_m,
         "avg_slope_pct":     avg_slope_pct,
         "total_duration_ms": total_duration_ms,
+        "status":            status,
     })
+
+    if session_id:
+        db.execute(text("""
+            UPDATE sessions
+            SET ended_at = NOW(), end_reason = :status
+            WHERE session_id = :session_id AND uid = :uid
+        """), {"session_id": session_id, "uid": uid, "status": status})
 
     # pace(1m당 소요시간) 상위 구간을 지금(종료 시점) 미리 계산해 캐시에 저장 —
     # 안내 종료 직후 FE 가 /navigation/{id}/slow-segments 로 바로 읽어간다.
+    # (이 랭킹은 legacy navigation_segments 기반 — 범위 밖, 손대지 않음)
     ranked = _rank_and_store_slow_segments(db, route_id)
     db.commit()
 
     return {
         "route_id":          route_id,
+        "status":            status,
         "total_length_m":    total_length_m,
         "avg_slope_pct":     avg_slope_pct,
         "total_duration_ms": total_duration_ms,
@@ -1433,26 +1670,21 @@ def complete_navigation(
 
 
 # ── 구간 체감 난이도 평가 (⑭' — 1m당 소요시간 pace 기준) ─────────────────────
-# navigation_segments 는 그래프 엣지 단위(~5~10m, 경로당 수십~수백 행)라 그대로는
-# "구간"이 아니다 — 연속 엣지를 경사 bin 으로 묶어 사람이 인지하는 구간으로 만든 뒤
-# 그 구간들을 pace 순으로 랭킹한다. 파라미터는 C등급(근거 없음) — 파일럿 후 조정.
-SLOW_SEG_MIN_DIST_M = 25.0   # 묶은 구간이 이보다 짧으면 제외 (pickFeedbackSegments 와 동일)
-SLOW_SEG_MAX_RANKED = 10     # 상위 몇 구간까지 물어볼지 (사용자 사양: 10순위, 1~9면 전부)
+# navigation_measurements(routing/measurement_units.py, ≥30m 단위) 기준으로
+# pace 상위 구간을 골라 랭킹한다. 레거시 navigation_segments(엣지 단위, ~5~10m)는
+# 더 이상 이 랭킹의 소스가 아니다 — measurement_units는 이미 GPS 판정 가능한
+# 크기로 묶여 있어 옛 _same_slope_band 같은 재병합이 필요 없다(그 로직은 제거).
+# ⚠️ 이 전환으로 navigation_measurements 행이 없는 구버전(마이그레이션 이전) 경로는
+# 재계산 시 "평가할 구간 없음"으로 나온다 — 소급 재구성하지 않는다(모르는 데이터를
+# 지어내지 않는다는 이 파이프라인 전체 원칙과 동일).
+SLOW_SEG_MIN_DIST_M = 25.0   # 구간이 이보다 짧으면 제외 (pickFeedbackSegments 와 동일)
+SLOW_SEG_MAX_RANKED = 5      # 상위 몇 구간까지 물어볼지 — 파일럿 참가자 수·구간 밀도
+                             # 보면서 조정할 값이라 코드 상수로 뺐다(재배포로 조정,
+                             # DB 설정 테이블화는 불필요 — 실시간 변경 요구 없음).
+                             # 유효 구간이 이보다 적으면 그 전부를 질문 대상으로 삼는다
+                             # (아래 정렬 후 슬라이스가 자연히 그렇게 동작함).
 SLOW_SEG_SPEED_MIN  = 0.05   # m/s — 거리/시간 이 범위 밖이면 GPS 점프/정지 이상치
 SLOW_SEG_SPEED_MAX  = 2.50   # (routing/speed.py _SPEED_MIN/_MAX 와 동일)
-SLOW_SEG_SLOPE_TOL  = 2.0    # 엣지 경사가 진행중 구간 평균에서 이 %p 이상 벗어나면 새 구간
-                             # (고정 bin 경계 대신 평균 기준 허용오차 — 6.1/5.9 나
-                             #  -5.2/-5.5 같은 인접 유사 경사가 경계에서 갈라지지 않게)
-
-
-def _same_slope_band(slope: float, cur: dict) -> bool:
-    """엣지 slope 가 진행중 구간(cur)과 같은 밴드인지 — 같은 오르막/내리막 부호 +
-    길이가중 평균 경사에서 SLOW_SEG_SLOPE_TOL 이내."""
-    d = cur["distance_m"]
-    cur_mean = (cur["_wslope"] / d) if d else 0.0
-    if (slope >= 0) != (cur_mean >= 0):
-        return False
-    return abs(slope - cur_mean) <= SLOW_SEG_SLOPE_TOL
 
 _SLOW_SEG_SELECT = """
     SELECT rank, seg_index, seg_index_end, distance_m, slope_pct, direction, zone,
@@ -1463,53 +1695,45 @@ _SLOW_SEG_SELECT = """
 """
 
 
-def _route_segment_groups(db: Session, route_id: int) -> list[dict]:
+def _route_measurement_groups(db: Session, route_id: int) -> list[dict]:
     """
-    navigation_segments 원본(엣지 단위) → 사람이 인지하는 "구간" 묶음.
-    연속(seg_index 가 1씩 증가) + measured=TRUE + 같은 경사 밴드(_same_slope_band) 이면 한 구간.
-    각 구간: seg_index(첫 엣지), seg_index_end(끝 엣지), distance_m·elapsed_ms 합,
-             slope_pct(길이가중 평균), pace_s_per_m, direction/zone/name(대표값).
+    navigation_measurements → 피드백 질문 후보 목록. 각 행이 이미 하나의 "구간"
+    (MeasurementUnit, ≥30m)이라 레거시 _route_segment_groups처럼 인접 엣지를
+    다시 밴드로 묶을 필요가 없다 — status='measured'(실측) 행만 그대로 쓴다.
+    skipped/미제출 unit은 elapsed_ms가 없어 pace를 낼 수 없으므로 제외한다.
+
+    seg_index/seg_index_end에는 둘 다 unit_index를 넣는다 — route_slow_segments/
+    segment_hardship_feedback 테이블을 새로 만들지 않고 재사용하기 위함으로,
+    레거시(엣지 범위) 때와 달리 항상 start==end(병합 구간이 아닌 단일 unit)다.
+    zone/name은 navigation_measurements에 없는 정보라 zone은 slope로 다시
+    분류하고 name은 빈 값으로 둔다(지어내지 않음 — street name은 알 수 없음).
     """
-    edge_rows = db.execute(text("""
-        SELECT seg_index, distance_m, slope_pct, direction, zone, name, elapsed_ms, measured
-        FROM navigation_segments
-        WHERE route_id = :rid
-        ORDER BY seg_index ASC
+    rows = db.execute(text("""
+        SELECT unit_index, distance_m, slope_pct, elapsed_ms
+        FROM navigation_measurements
+        WHERE route_id = :rid AND status = 'measured'
+        ORDER BY unit_index ASC
     """), {"rid": route_id}).fetchall()
 
-    groups: list[dict] = []
-    cur: dict | None = None
-    for si, dist, slope, direction, zone, name, elapsed, measured in edge_rows:
-        si = int(si)
-        dist = float(dist or 0.0)
+    groups = []
+    for unit_index, dist, slope, elapsed in rows:
+        dist    = float(dist or 0.0)
         elapsed = int(elapsed or 0)
-        slope = None if slope is None else float(slope)
-        if not (bool(measured) and slope is not None and dist > 0):
-            cur = None
+        slope   = 0.0 if slope is None else float(slope)
+        if dist <= 0 or elapsed <= 0:
             continue
-        if cur is not None and si == cur["_next"] and _same_slope_band(slope, cur):
-            cur["seg_index_end"] = si
-            cur["distance_m"]   += dist
-            cur["elapsed_ms"]   += elapsed
-            cur["_wslope"]      += slope * dist
-            cur["_next"]         = si + 1
-            if not cur["name"] and name:
-                cur["name"] = name
-        else:
-            cur = {
-                "seg_index": si, "seg_index_end": si,
-                "distance_m": dist, "elapsed_ms": elapsed,
-                "_wslope": slope * dist, "_next": si + 1,
-                "direction": direction, "zone": zone, "name": name or "",
-            }
-            groups.append(cur)
-
-    for g in groups:
-        d = g["distance_m"]
-        g["slope_pct"]    = round(g["_wslope"] / d, 3) if d else 0.0
-        g["pace_s_per_m"] = round((g["elapsed_ms"] / 1000.0) / d, 4) if d else 0.0
-        for k in ("_wslope", "_next"):
-            g.pop(k, None)
+        direction = "flat" if abs(slope) < FLAT_THRESHOLD else ("up" if slope > 0 else "down")
+        groups.append({
+            "seg_index":     int(unit_index),
+            "seg_index_end": int(unit_index),
+            "distance_m":    dist,
+            "elapsed_ms":    elapsed,
+            "slope_pct":     slope,
+            "direction":     direction,
+            "zone":          None,   # 랭킹 후 최종 선정된 것만 classify_zone으로 채움
+            "name":          "",
+            "pace_s_per_m":  round((elapsed / 1000.0) / dist, 4),
+        })
     return groups
 
 
@@ -1526,20 +1750,27 @@ def _slow_seg_eligible(g: dict) -> bool:
 
 def _rank_and_store_slow_segments(db: Session, route_id: int) -> int:
     """
-    navigation_segments(엣지 단위) → 구간 묶음 → 1m당 소요시간(pace) 큰 순으로
-    상위 SLOW_SEG_MAX_RANKED(=10) 구간을 route_slow_segments 에 저장한다.
-    유효 구간이 10 미만이면 그 전부 (사용자 사양: "1~9구간이면 경로 구간 모두 평가").
-    정렬: pace 내림차순 → 거리 큰 순 → seg_index 오름차순. 커밋은 호출측 책임.
+    navigation_measurements → 1m당 소요시간(pace) 큰 순으로 상위
+    SLOW_SEG_MAX_RANKED 구간을 route_slow_segments 에 저장한다. 유효 구간이 그보다
+    적으면 그 전부(슬라이스가 자연히 그렇게 됨). 정렬: pace 내림차순 → 거리 큰 순 →
+    unit_index 오름차순. 커밋은 호출측 책임.
     """
     ranked = sorted(
-        (g for g in _route_segment_groups(db, route_id) if _slow_seg_eligible(g)),
+        (g for g in _route_measurement_groups(db, route_id) if _slow_seg_eligible(g)),
         key=lambda g: (-g["pace_s_per_m"], -g["distance_m"], g["seg_index"]),
     )[:SLOW_SEG_MAX_RANKED]
 
     db.execute(text("DELETE FROM route_slow_segments WHERE route_id = :rid"),
                {"rid": route_id})
 
+    if ranked:
+        user_type_row = db.execute(
+            text("SELECT user_type FROM routes WHERE id = :rid"), {"rid": route_id}
+        ).fetchone()
+        user_type = (user_type_row[0] if user_type_row and user_type_row[0] else "elderly")
+
     for rank, g in enumerate(ranked, start=1):
+        zone = classify_zone(g["slope_pct"], g["direction"], user_type)
         db.execute(text("""
             INSERT INTO route_slow_segments
                 (route_id, rank, seg_index, seg_index_end, distance_m, slope_pct,
@@ -1551,7 +1782,7 @@ def _rank_and_store_slow_segments(db: Session, route_id: int) -> int:
             "rid": route_id, "rank": rank,
             "seg_index": g["seg_index"], "seg_index_end": g["seg_index_end"],
             "distance_m": round(g["distance_m"], 1), "slope_pct": g["slope_pct"],
-            "direction": g["direction"], "zone": g["zone"],
+            "direction": g["direction"], "zone": zone,
             "name": g["name"] or None,
             "elapsed_ms": g["elapsed_ms"], "pace": g["pace_s_per_m"],
         })
@@ -1576,8 +1807,8 @@ def get_slow_segments(db: Session, route_id: int, uid: str) -> dict | None:
         return None
     status = owns[0]
 
-    # meta 는 엣지가 아니라 "묶은 구간" 기준으로 센다 (사용자가 말하는 "N구간").
-    groups        = _route_segment_groups(db, route_id)
+    # meta 는 navigation_measurements 구간(unit) 기준으로 센다.
+    groups        = _route_measurement_groups(db, route_id)
     total_groups  = len(groups)
     sloped_groups = sum(1 for g in groups if _slow_seg_eligible(g))
 
@@ -1604,7 +1835,7 @@ def get_slow_segments(db: Session, route_id: int, uid: str) -> dict | None:
     meta = {
         "total_segments":  total_groups,     # 경로를 묶었을 때의 구간 수
         "sloped_segments": sloped_groups,    # 그중 경사 있어 평가 후보인 구간 수
-        "ranked":          len(segments),    # 실제로 물어볼 구간 수 (min(10, sloped))
+        "ranked":          len(segments),    # 실제로 물어볼 구간 수 (min(SLOW_SEG_MAX_RANKED, sloped))
     }
 
     if not segments:

@@ -16,6 +16,7 @@
 
 import { binCenter } from "./slopeBinTracker";
 import type { RouteChoice, RouteChoiceCandidate } from "../api/collect";
+import type { MeasurementUnit } from "../api/routeApi";
 
 export type CandidateRoute = {
   kind:          "type" | "distance" | "personal";
@@ -28,6 +29,9 @@ export type CandidateRoute = {
   // 구식 3%/8% 폴백 색칠로 떨어지고 waypoints 음성안내가 아예 안 나온다.
   navigation_segments?: any[];
   waypoints?: any[];
+  // 측정 파이프라인 v2 — GPS 실측 제출 단위(routing/measurement_units.py). 없으면
+  // NavigationScreen 이 실측 인덱스 체계를 못 만들어 submitSegment 자체가 불가능해진다.
+  measurement_units?: MeasurementUnit[];
 };
 
 /** 화면에 실제로 제시되는 후보 1개. */

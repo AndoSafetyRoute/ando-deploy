@@ -298,10 +298,16 @@ async function computeWalkLegUncached(
       light,
     }));
     const bestRoute = res?.routes?.[0] ?? null;
-    // navigation_segments(구간 색상)/waypoints(음성안내)는 routes[0]이 아니라
-    // 응답 최상위 필드라서, NavigationScreen이 그대로 읽을 수 있게 같이 얹어준다.
+    // navigation_segments(구간 색상)/waypoints(음성안내)/measurement_units(GPS 실측
+    // 제출 단위)는 routes[0]이 아니라 응답 최상위 필드라서, NavigationScreen이
+    // 그대로 읽을 수 있게 같이 얹어준다.
     const best = bestRoute
-      ? { ...bestRoute, navigation_segments: res?.navigation_segments, waypoints: res?.waypoints }
+      ? {
+          ...bestRoute,
+          navigation_segments: res?.navigation_segments,
+          waypoints:           res?.waypoints,
+          measurement_units:   res?.measurement_units,
+        }
       : null;
     const distanceM = best ? Number(best.totalDistance) : null;
     const finalDistance = Number.isFinite(distanceM) ? (distanceM as number) : straightM;
@@ -1135,6 +1141,7 @@ export default function TransitContent({
       detourRatio: r.detourRatio,
       navigation_segments: r.navigation_segments,
       waypoints: r.waypoints,
+      measurement_units: r.measurement_units,
     });
 
     // 출발지가 승차 지점과 (좌표상) 사실상 같은 지점일 때만 걸러낸다 — 20m

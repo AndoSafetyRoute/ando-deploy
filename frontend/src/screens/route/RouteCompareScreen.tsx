@@ -152,6 +152,7 @@ export default function RouteCompareScreen({ navigation, route }: Props) {
         routeSegments: chosen.route.routeSegments,
         navigation_segments: chosen.route.navigation_segments ?? [],
         waypoints: chosen.route.waypoints ?? [],
+        measurement_units: chosen.route.measurement_units ?? [],
         totalDistance: chosen.route.totalDistance,
         avgSlope: chosen.route.avgSlope,
         estimatedTimeS: chosen.route.estimatedTimeS,

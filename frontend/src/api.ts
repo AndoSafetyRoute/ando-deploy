@@ -259,6 +259,11 @@ export interface NavStartPayload {
   origin_lon?:    number | null;
   dest_lat?:      number | null;
   dest_lon?:      number | null;
+  // 측정 파이프라인 v2 세션 발급 — 셋 다 없으면 BE가 세션 없이 route_id만
+  // 발급하던 기존 동작 그대로 유지한다(하위호환).
+  session_id?:    string;
+  app_version?:   string;
+  schema_ver?:    number;
 }
 
 export async function startNavigation(
@@ -274,36 +279,56 @@ export async function startNavigation(
   return res.json();
 }
 
+// 측정 파이프라인 v2 — POST /navigation/{route_id}/segment 제출 단위. 옛
+// SegmentPayload(index/measured, routeSegments=교차로 기준 raw edge)와 완전히
+// 별개다 — measurement_units.py의 MeasurementUnit(≥30m 누적거리) 기준으로만
+// 제출한다. zone/direction은 보내지 않는다 — MeasurementUnit엔 그 정보가 없고
+// (raw edge 배열과 인덱스 체계가 다름), BE도 Optional이라 없으면 레거시 병행
+// 기록(navigation_segments)만 zone=None으로 남는다(지어내지 않음).
+export interface MeasurementSegmentPayload {
+  sessionId:    string;
+  unitIndex:    number;
+  distanceM:    number;
+  slopePercent: number;          // 거리가중평균, 부호 포함(양수=오르막)
+  status:       'measured' | 'skipped';
+  elapsedMs?:   number;          // status='measured'일 때만 필수
+}
+
 export async function submitSegment(
   routeId: number,
-  seg: SegmentPayload,
+  seg: MeasurementSegmentPayload,
   idToken: string,
 ): Promise<void> {
   const res = await fetch(`${BASE_URL}/navigation/${routeId}/segment`, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
     body: JSON.stringify({
-      index:       seg.index,
+      session_id:  seg.sessionId,
+      unit_index:  seg.unitIndex,
       distance_m:  seg.distanceM,
       slope_pct:   seg.slopePercent,
+      status:      seg.status,
       elapsed_ms:  seg.elapsedMs,
-      measured:    seg.measured,
-      zone:        seg.zone,
-      direction:   seg.direction,
     }),
   });
-  if (!res.ok) throw new Error(`구간 ${seg.index} 저장 실패`);
+  if (!res.ok) throw new Error(`측정 단위 ${seg.unitIndex} 저장 실패`);
 }
 
 export async function completeNavigation(
   routeId: number,
-  totalDurationMs: number,
   idToken: string,
-): Promise<{ route_id: number; total_length_m: number; avg_slope_pct: number; total_duration_ms: number }> {
+  // reachedDestination: ⑥(조기종료 처리)에서 실제 값을 채운다 — 그때까지는
+  // 안 보내면 BE가 구버전과 동일하게 status='completed'로 처리한다.
+  // sessionId가 있으면 BE가 sessions.ended_at/end_reason도 같이 닫는다.
+  opts?: { sessionId?: string | null; reachedDestination?: boolean },
+): Promise<{ route_id: number; status: string; total_length_m: number; avg_slope_pct: number; total_duration_ms: number }> {
   const res = await fetch(`${BASE_URL}/navigation/${routeId}/complete`, {
     method:  'PATCH',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
-    body:    JSON.stringify({ total_duration_ms: totalDurationMs }),
+    body:    JSON.stringify({
+      session_id:          opts?.sessionId ?? undefined,
+      reached_destination: opts?.reachedDestination ?? undefined,
+    }),
   });
   if (!res.ok) throw new Error('내비게이션 완료 처리 실패');
   return res.json();
