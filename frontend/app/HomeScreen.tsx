@@ -17,6 +17,40 @@ import { goHome } from "../src/utils/navigation";
 import { createClient } from "@supabase/supabase-js";
 import * as Location from "expo-location";
 
+// 일부 기기/에뮬레이터에서 Location.getCurrentPositionAsync()(Android는 내부적으로
+// FusedLocationProviderClient.getCurrentLocation() 사용)가 응답을 아예 안 주고 계속
+// pending으로 남는 경우가 있다 — mock location을 타이머로 계속 흘려줘도 매번 timeout
+// (Android Studio 에뮬레이터 Pixel_3a_API_34에서 재현·확인). 반면 watchPositionAsync
+// (연속 구독)는 NavigationScreen의 실시간 GPS 추적이 이미 같은 환경에서 정상 동작
+// 중이라 — 그래서 1회성 조회도 watch를 걸어 첫 콜백만 받고 바로 해제하는 방식으로
+// 통일한다. 정상 기기에서는 getCurrentPositionAsync와 체감 속도 차이가 거의 없다.
+async function getCurrentPositionReliable(
+  timeoutMs = 5000,
+): Promise<Location.LocationObject | null> {
+  return new Promise((resolve) => {
+    let done = false;
+    let sub: Location.LocationSubscription | null = null;
+    const finish = (result: Location.LocationObject | null) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      sub?.remove();
+      resolve(result);
+    };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+
+    Location.watchPositionAsync(
+      { accuracy: Location.Accuracy.Balanced, timeInterval: 1000, distanceInterval: 0 },
+      (loc) => finish(loc),
+    )
+      .then((s) => {
+        sub = s;
+        if (done) s.remove(); // 구독 세팅 전에 이미 timeout/응답으로 끝난 경우 정리
+      })
+      .catch(() => finish(null));
+  });
+}
+
 const KAKAO_JAVASCRIPT_KEY = process.env.EXPO_PUBLIC_KAKAO_JAVASCRIPT_KEY;
 const KAKAO_REST_API_KEY = process.env.EXPO_PUBLIC_KAKAO_REST_API_KEY;
 
@@ -175,10 +209,7 @@ export default function HomeScreen() {
         const { status } = await Location.requestForegroundPermissionsAsync();
         if (status !== "granted") return;
 
-        const loc: any = await Promise.race([
-          Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 5000)),
-        ]).catch(async () => Location.getLastKnownPositionAsync({}));
+        const loc = (await getCurrentPositionReliable(5000)) ?? (await Location.getLastKnownPositionAsync({}));
 
         if (loc?.coords) {
           setCurrentCoords({ latitude: loc.coords.latitude, longitude: loc.coords.longitude });
@@ -272,16 +303,13 @@ export default function HomeScreen() {
       }
 
       let coords: { latitude: number; longitude: number } | null = null;
-      try {
-        console.log("[GPS] getCurrentPositionAsync 시작");
-        const loc: any = await Promise.race([
-          Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 5000)),
-        ]);
+      console.log("[GPS] getCurrentPositionReliable 시작");
+      const loc = await getCurrentPositionReliable(5000);
+      if (loc) {
         coords = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
         console.log("[GPS] 현위치 수신:", coords.latitude, coords.longitude, "정확도:", loc.coords.accuracy);
-      } catch (err: any) {
-        console.log("[GPS] getCurrentPositionAsync 실패, 마지막 위치로 폴백:", err?.message ?? err);
+      } else {
+        console.log("[GPS] getCurrentPositionReliable 실패(timeout), 마지막 위치로 폴백");
         const last = await Location.getLastKnownPositionAsync({});
         if (last) {
           coords = { latitude: last.coords.latitude, longitude: last.coords.longitude };
