@@ -8,6 +8,7 @@ app.py — Ando 접근성 경로 탐색 FastAPI 서버
 0.0.0.0 으로 띄워야 같은 네트워크의 다른 기기에서 접속할 수 있다.
 """
 import os
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Depends, Header
@@ -713,6 +714,13 @@ class NavigationSegmentRequest(BaseModel):
     slope_pct:  float           # 부호 있는 값 (양수=오르막, 음수=내리막), 거리가중평균
     status:     str             # 'measured' | 'skipped'
     elapsed_ms: int | None = None   # status='measured'일 때만 필수, 'skipped'면 반드시 None
+    # 경로 좌표 배열 인덱스(measurement_units[i].coord_start_idx/coord_end_idx를
+    # FE가 그대로 되돌려 보냄) — gps_traces 사후 투영 재계산에 필요. session_id와
+    # 달리 optional로 둔다: 없어도 status/elapsed_ms 자체의 신뢰도엔 영향이 없는
+    # 부가 위치정보라 실패로 드러낼 이유가 없음(구버전 FE 호환 목적은 아님 —
+    # 이번 release_v9와 같은 배포 주기 안에서 추가된 필드).
+    coord_start_idx: int | None = None
+    coord_end_idx:   int | None = None
     # ── 레거시 navigation_segments(마이페이지 표시용) 병행 기록에만 쓰는 필드 ──
     zone:       str | None = None
     direction:  str | None = None
@@ -752,6 +760,8 @@ def api_add_segment(
         slope_pct=body.slope_pct,
         elapsed_ms=body.elapsed_ms,
         status=body.status,
+        coord_start_idx=body.coord_start_idx,
+        coord_end_idx=body.coord_end_idx,
     )
     if not ok:
         raise HTTPException(
@@ -1157,14 +1167,24 @@ def _segments_payload(segments: list, user_type: str) -> list:
 
 
 def _shortest_route_card(origin: tuple, dest: tuple, user_type: str,
-                         type_len_m: float, speed_profile: dict) -> dict | None:
+                         type_len_m: float, speed_profile: dict,
+                         precomputed_shortest_path: list | None = None) -> dict | None:
     """유형별 경로 옆에 함께 보여줄 '최단 거리'(순수 다익스트라) 카드.
 
     유형별 경로와 거의 같으면(≤3% 차) 카드 2장이 중복돼 보이므로 None 을 반환한다.
     실패해도 메인 응답을 막지 않게 호출부에서 감싼다.
+
+    precomputed_shortest_path: find_route()가 내부적으로 이미 구해 둔
+    shortest_path_nodes(alpha=0 경로) — 있으면 CCH 쿼리를 다시 돌리지 않고
+    그대로 세그먼트만 복원한다(#3, 성능). find_distance_route(safe=False)와
+    결과가 동일함을 전제로 한다 — 호출부가 safe 경로가 필요 없는 컨텍스트에서만
+    넘겨야 한다.
     """
     if _cch is not None:
-        sr = _cch.find_distance_route(origin, dest)
+        if precomputed_shortest_path is not None:
+            sr = _cch.distance_route_from_path(origin, dest, precomputed_shortest_path)
+        else:
+            sr = _cch.find_distance_route(origin, dest)
     else:
         sr = find_route(G, origin, dest, user_type, mode="shortest")
     s_len = round(sr["total_length_m"], 1)
@@ -1237,6 +1257,11 @@ def api_route(
         _snap_debug("origin", origin[0], origin[1])
         _snap_debug("dest",   dest[0],   dest[1])
 
+        # ── 단계별 타이밍 로그(측정용, #2) — 실제 /route 요청에서 어디가
+        # 지배적인지 확인하고 나서 최적화 대상을 정하기 위함. 요청마다 찍히므로
+        # 운영 로그가 시끄러워지면 나중에 샘플링/제거 검토.
+        _t_route_start = time.perf_counter()
+
         # CCH 우선 (서울 전역 그래프), fallback → NetworkX
         if _cch is not None and body.mode == "accessibility":
             try:
@@ -1248,6 +1273,7 @@ def api_route(
         else:
             result = find_route(G, origin, dest, body.user_type,
                                 body.algorithm, mode=body.mode)
+        _t_find_route = time.perf_counter()
 
         coords = [
             [G.nodes[n]["lon"], G.nodes[n]["lat"]]
@@ -1289,10 +1315,12 @@ def api_route(
         if not body.light and body.candidates != "compare":
             try:
                 shortest_obj = _shortest_route_card(
-                    origin, dest, body.user_type, total_length_m, speed_profile
+                    origin, dest, body.user_type, total_length_m, speed_profile,
+                    precomputed_shortest_path=result.get("shortest_path_nodes"),
                 )
             except Exception as _se:
                 print(f"[ROUTE] 최단 경로 카드 생성 실패 (무시): {_se}")
+        _t_shortest_card = time.perf_counter()
 
         # ── 교차로 기반 네비게이션 구간 + 음성안내 + 소요시간 ───────────────────
         # nav_segs(구간별 경사 zone)는 대중교통 탭 후보 경로들의 지도 미리보기
@@ -1307,6 +1335,7 @@ def api_route(
                 G, result["path_nodes"], body.user_type, waypoints_set=_waypoints_set
             )
             nav_time = estimate_nav_time(nav_segs, body.user_type)
+            _t_nav_segs = time.perf_counter()
 
             if not body.light:
                 # path_nodes → coordinates 배열 인덱스 매핑 (첫 등장 우선)
@@ -1337,6 +1366,7 @@ def api_route(
                     ]
                 except Exception as _mu_err:
                     print(f"[NAV] measurement_units 생성 실패 (무시): {_mu_err}")
+                _t_measurement_units = time.perf_counter()
 
                 for i, seg in enumerate(nav_segs[:-1]):
                     wp = G.nodes[seg.end_node]
@@ -1368,6 +1398,18 @@ def api_route(
                     })
         except Exception as _nav_err:
             print(f"[NAV] 네비게이션 구간 생성 실패 (무시): {_nav_err}")
+        _t_waypoints = time.perf_counter()
+        # light 모드는 measurement_units/waypoints 블록 자체를 안 타서 위 두
+        # 타임스탬프가 없을 수 있음 — 그 구간 소요는 0으로 본다(실제로 안 돎).
+        _t_measurement_units = locals().get("_t_measurement_units", _t_nav_segs)
+        print(
+            f"[TIMING] /route  find_route={_t_find_route - _t_route_start:.3f}s  "
+            f"shortest_card={_t_shortest_card - _t_find_route:.3f}s  "
+            f"nav_segs={_t_nav_segs - _t_shortest_card:.3f}s  "
+            f"measurement_units={_t_measurement_units - _t_nav_segs:.3f}s  "
+            f"waypoints={_t_waypoints - _t_measurement_units:.3f}s  "
+            f"total={_t_waypoints - _t_route_start:.3f}s"
+        )
 
         response = {
             # FE WalkContent 호환 필드 — 유형별 + (다르면) 최단 거리

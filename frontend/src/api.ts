@@ -292,6 +292,13 @@ export interface MeasurementSegmentPayload {
   slopePercent: number;          // 거리가중평균, 부호 포함(양수=오르막)
   status:       'measured' | 'skipped';
   elapsedMs?:   number;          // status='measured'일 때만 필수
+  // measurement_units[i].coord_start_idx/coord_end_idx를 그대로 되돌려 보낸다 —
+  // gps_traces를 경로에 사후 투영해 소요시간을 재계산하려면 이 unit이 경로상
+  // 어디였는지 DB에 남아 있어야 한다(session_route_profile로 역산하면 동의
+  // 세션에만 있고, build_measurement_units 흡수 규칙이 바뀌면 과거 데이터
+  // 해석이 깨짐 — 그래서 제출 시점에 직접 실어 보냄).
+  coordStartIdx?: number;
+  coordEndIdx?:   number;
 }
 
 export async function submitSegment(
@@ -303,12 +310,14 @@ export async function submitSegment(
     method:  'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
     body: JSON.stringify({
-      session_id:  seg.sessionId,
-      unit_index:  seg.unitIndex,
-      distance_m:  seg.distanceM,
-      slope_pct:   seg.slopePercent,
-      status:      seg.status,
-      elapsed_ms:  seg.elapsedMs,
+      session_id:      seg.sessionId,
+      unit_index:      seg.unitIndex,
+      distance_m:      seg.distanceM,
+      slope_pct:       seg.slopePercent,
+      status:          seg.status,
+      elapsed_ms:      seg.elapsedMs,
+      coord_start_idx: seg.coordStartIdx,
+      coord_end_idx:   seg.coordEndIdx,
     }),
   });
   if (!res.ok) throw new Error(`측정 단위 ${seg.unitIndex} 저장 실패`);

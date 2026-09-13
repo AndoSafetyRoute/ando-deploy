@@ -545,6 +545,20 @@ def init_db():
                     CHECK (status IN ('measured', 'skipped', 'in_progress'))
             )
         """))
+        # coord_start_idx/coord_end_idx — /route 응답의 measurement_units[i].
+        # coord_start_idx/coord_end_idx(경로 좌표 배열 인덱스)를 그대로 저장한다.
+        # gps_traces(원본 GPS 점)를 경로에 사후 투영해 소요시간을 재계산하려면
+        # unit이 경로상 어디였는지가 필요한데, 실시간 임계값 판정(15m 반경)만으론
+        # 이 위치 정보가 DB에 안 남는다. session_route_profile로 역산하는 방식은
+        # (a) 동의 세션에만 있고 (b) build_measurement_units의 흡수 규칙이 나중에
+        # 바뀌면 과거 데이터 해석이 깨지므로, 제출 시점에 직접 저장한다.
+        # nullable — 이 컬럼 추가 이전에 쌓인 행과 호환.
+        conn.execute(text(
+            "ALTER TABLE navigation_measurements ADD COLUMN IF NOT EXISTS coord_start_idx INT"
+        ))
+        conn.execute(text(
+            "ALTER TABLE navigation_measurements ADD COLUMN IF NOT EXISTS coord_end_idx INT"
+        ))
 
         # GPS 원본 궤적 — /collect/gps-batch 배치 삽입.
         conn.execute(text("""
@@ -1097,6 +1111,8 @@ def add_navigation_measurement(
     slope_pct: float,
     elapsed_ms: int | None,
     status: str,
+    coord_start_idx: int | None = None,
+    coord_end_idx: int | None = None,
 ) -> bool:
     """구간(측정 단위) 완료/스킵 시 navigation_measurements에 행 삽입 — 멱등.
 
@@ -1107,6 +1123,11 @@ def add_navigation_measurement(
     session_id는 sessions.uid와 route_id 소유자가 같은 uid인지까지 함께
     확인한다 — 존재하지 않거나(FK 위반이 아니라 아직 /navigation/start를
     안 거친 session_id) 다른 사용자 소유면 False.
+
+    coord_start_idx/coord_end_idx: /route 응답 measurement_units[i]의 좌표 배열
+    인덱스를 그대로 저장 — gps_traces를 경로에 사후 투영해 소요시간을 재계산할
+    때 이 unit이 경로상 어디였는지 알아야 한다(구버전 FE는 안 보내 None으로
+    남을 수 있음, nullable).
     """
     if not engine:
         return False
@@ -1122,18 +1143,22 @@ def add_navigation_measurement(
 
     db.execute(text("""
         INSERT INTO navigation_measurements
-            (route_id, session_id, unit_index, distance_m, slope_pct, elapsed_ms, status)
+            (route_id, session_id, unit_index, distance_m, slope_pct, elapsed_ms, status,
+             coord_start_idx, coord_end_idx)
         VALUES
-            (:route_id, :session_id, :unit_index, :distance_m, :slope_pct, :elapsed_ms, :status)
+            (:route_id, :session_id, :unit_index, :distance_m, :slope_pct, :elapsed_ms, :status,
+             :coord_start_idx, :coord_end_idx)
         ON CONFLICT (route_id, unit_index) DO NOTHING
     """), {
-        "route_id":   route_id,
-        "session_id": session_id,
-        "unit_index": unit_index,
-        "distance_m": distance_m,
-        "slope_pct":  slope_pct,
-        "elapsed_ms": elapsed_ms,
-        "status":     status,
+        "route_id":        route_id,
+        "session_id":      session_id,
+        "unit_index":      unit_index,
+        "distance_m":      distance_m,
+        "slope_pct":       slope_pct,
+        "elapsed_ms":      elapsed_ms,
+        "status":          status,
+        "coord_start_idx": coord_start_idx,
+        "coord_end_idx":   coord_end_idx,
     })
     db.commit()
     return True

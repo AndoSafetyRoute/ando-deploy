@@ -1196,11 +1196,13 @@ export default function NavigationScreen({ navigation, route }: Props) {
                     sessionId: sid ?? "", unitIndex: unitIdx,
                     distanceM: unit.distance_m, slopePercent: unit.slope_pct,
                     status: "skipped",
+                    coordStartIdx: unit.coord_start_idx, coordEndIdx: unit.coord_end_idx,
                   }
                 : {
                     sessionId: sid ?? "", unitIndex: unitIdx,
                     distanceM: unit.distance_m, slopePercent: unit.slope_pct,
                     status: "measured", elapsedMs: now - unitStartTimesRef.current[unitIdx],
+                    coordStartIdx: unit.coord_start_idx, coordEndIdx: unit.coord_end_idx,
                   };
 
               // sid가 없으면(동의 없음/모달 응답 전) BE가 session_id를 필수로

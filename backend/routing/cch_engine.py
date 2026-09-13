@@ -130,6 +130,10 @@ class CCHEngine:
         self._lat_to_m   = lat_to_m
         self._dist_wf    = dist_wf           # float64 ndarray
         self._slope_wf   = slope_wf          # {ut: float64 ndarray}
+        # alpha 이진탐색(_interp_weights_list)이 매 호출마다 (slope_wf[ut] - dist_wf)
+        # 를 다시 빼던 것을 빌드 시점에 1회만 계산해 둔다(#5, 엣지 수만큼의 배열
+        # 연산 — 이 배열은 3.8M+ 원소라 반복 호출 시 무시 못 할 비용).
+        self._slope_minus_dist = {ut: sw - dist_wf for ut, sw in slope_wf.items()}
         self.metric_dist = metric_dist       # CCHMetric
         self.metrics_a1  = metrics_a1        # {ut: CCHMetric}
         self.metric_dist_safe = metric_dist_safe   # CCHMetric | None
@@ -166,8 +170,13 @@ class CCHEngine:
         return [self.node_list[i] for i in ids]
 
     def _interp_weights_list(self, user_type: str, alpha: float) -> list:
-        """alpha 보간 → Python list[int] (CCHMetric.reset용)."""
-        w = self._dist_wf + alpha * (self._slope_wf[user_type] - self._dist_wf)
+        """alpha 보간 → Python list[int] (CCHMetric.reset용).
+
+        (slope_wf[ut] - dist_wf)는 __init__에서 미리 계산해 둔
+        self._slope_minus_dist[ut]를 쓴다 — 매 이진탐색 반복(최대 5회)마다
+        3.8M+ 원소 배열 뺄셈을 다시 하지 않는다(#5a).
+        """
+        w = self._dist_wf + alpha * self._slope_minus_dist[user_type]
         return np.maximum(1, w).astype(np.int64).tolist()
 
     # ── 공개 API ─────────────────────────────────────────────────────────────
@@ -268,6 +277,12 @@ class CCHEngine:
             "avg_slope_pct":  avg_slope,
             "user_label":     USER_TYPES[user_type]["label"],
             "used_alpha":     used_alpha,
+            # ── 성능: "최단 거리" 카드(find_distance_route(safe=False))가 바로 위에서
+            # 이미 구해둔 이 alpha=0 쿼리 결과를 재사용할 수 있게 그대로 실어 보낸다.
+            # find_distance_route(safe=True)는 다른 metric(금지구간 회피)이라 이걸
+            # 못 쓴다 — 호출부가 safe 여부를 보고 재사용 여부를 판단해야 한다.
+            "shortest_path_nodes": path_d,
+            "shortest_dist_m":     shortest_dist,
         }
 
     def find_distance_route(self, origin_lonlat: tuple, dest_lonlat: tuple,
@@ -295,6 +310,17 @@ class CCHEngine:
         if path_nodes is None:
             raise ValueError("경로를 찾을 수 없습니다.")
 
+        result = self._build_distance_result(path_nodes, safe, src_id, dst_id)
+        print(f"[CCH] 최단경로({'safe' if safe else 'pure'}) 완료 "
+              f"{time.time() - t0:.2f}s  길이={result['total_length_m']:.0f}m  노드={len(path_nodes)}")
+        return result
+
+    def _build_distance_result(self, path_nodes: list, safe: bool,
+                                src_id: int, dst_id: int) -> dict:
+        """path_nodes(alpha=0 최단경로 노드열) → find_distance_route()와 동일한
+        반환 dict. CCH 쿼리(self._query) 없이 세그먼트 복원만 한다 — find_route()가
+        내부적으로 이미 구해둔 path_d를 재사용할 때(성능, _shortest_route_card
+        참고) 쓴다."""
         G = self.G
         segments = recalculate_path_slopes(G, path_nodes)
         total_len = sum(s["length_m"] for s in segments)
@@ -302,10 +328,6 @@ class CCHEngine:
             sum(abs(s["slope_pct"]) * s["length_m"] for s in segments) / total_len
             if total_len > 0 else 0.0
         )
-
-        print(f"[CCH] 최단경로({'safe' if safe else 'pure'}) 완료 "
-              f"{time.time() - t0:.2f}s  길이={total_len:.0f}m  노드={len(path_nodes)}")
-
         return {
             "algorithm":      "cch-distance-safe" if safe else "cch-distance",
             "origin_node":    self.node_list[src_id],
@@ -318,6 +340,18 @@ class CCHEngine:
             "user_label":     "최단 경로",
             "used_alpha":     0.0,
         }
+
+    def distance_route_from_path(self, origin_lonlat: tuple, dest_lonlat: tuple,
+                                  path_nodes: list) -> dict:
+        """find_route()가 반환한 shortest_path_nodes를 그대로 카드로 만든다 —
+        find_distance_route(safe=False)와 결과가 동일하지만 CCH 쿼리를 다시
+        돌리지 않는다(성능, #3). safe=True(안전 최단, 다른 metric)가 필요하면
+        이 메서드를 쓰면 안 되고 find_distance_route(safe=True)를 그대로 호출할 것.
+        _nearest_id는 KDTree 조회라 비용이 무시할 만하다 — origin_node/dest_node
+        라벨을 채우려고 다시 부른다."""
+        src_id = self._nearest_id(*origin_lonlat)
+        dst_id = self._nearest_id(*dest_lonlat)
+        return self._build_distance_result(path_nodes, False, src_id, dst_id)
 
     def find_route_with_metric(self, origin_lonlat: tuple, dest_lonlat: tuple,
                                 metric, label: str, kind: str) -> dict:
