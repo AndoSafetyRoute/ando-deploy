@@ -36,7 +36,10 @@ export default function NavigationPage() {
       // 안에서 스스로를 다시 호출하는 유일한 케이스라 빠져있었다 — 이게
       // 없으면 기본값(router.push("/"))으로 떨어져 홈으로 튕겨나갔다.
       if (screenName === "Navigation") {
-        router.push({
+        // push로 쌓으면 구간 전환마다 NavigationScreen이 새로 마운트되어
+        // voiceEnabled 등 로컬 상태가 기본값으로 리셋된다(음성안내를 꺼도
+        // 다음 구간에서 다시 켜지는 원인) — replace로 현재 화면을 교체한다.
+        router.replace({
           pathname: "/navigation",
           params: screenParams,
         });

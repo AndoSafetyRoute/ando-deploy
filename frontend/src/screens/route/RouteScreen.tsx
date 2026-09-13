@@ -160,8 +160,30 @@ function getDistanceText(routeData: any) {
   return `${Math.round(distanceNumber)}m`;
 }
 
+function getEstimatedTimeSeconds(routeData: any): number | null {
+  if (!routeData) return null;
+
+  const recommendedRoute = getRecommendedRoute(routeData);
+
+  const seconds =
+    recommendedRoute?.estimatedTimeS ??
+    routeData?.estimatedTimeS;
+
+  const n = Number(seconds);
+
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
 function getTimeText(routeData: any, fallback: string) {
   if (!routeData) return fallback;
+
+  // 백엔드가 이동유형별 속도(estimate_route_time)로 이미 계산해 보내주는 값을
+  // 우선 쓴다 — 여기서 "거리/60(=1m/s 가정)"으로 따로 계산하면 휠체어 등
+  // 실제 속도와 달라서 경로가 바뀔 때마다 엉뚱한 분으로 보일 수 있었다.
+  const estimatedSeconds = getEstimatedTimeSeconds(routeData);
+  if (estimatedSeconds !== null) {
+    return formatMinutes(estimatedSeconds / 60);
+  }
 
   const distanceNumber = getDistanceNumber(routeData);
 
@@ -171,6 +193,23 @@ function getTimeText(routeData: any, fallback: string) {
   const minute = Math.max(1, Math.round(distanceNumber / 60));
 
   return formatMinutes(minute);
+}
+
+// 대중교통 경로를 못 찾았을 때("정확한 경로 없음")도 실제로 갈 방법이 없는 건
+// 아니므로, 하드코딩된 placeholder 대신 같은 출발/도착의 '최단 거리' 도보
+// 시간을 대신 보여준다 — 없으면 유형별(메인) 경로 시간으로 한 번 더 폴백한다.
+function getShortestRouteTimeText(routeData: any, fallback: string) {
+  if (!routeData) return fallback;
+
+  const routesList = Array.isArray(routeData.routes) ? routeData.routes : [];
+  const shortestRoute = routesList.find((r: any) => r.id === "shortest");
+
+  const seconds = Number(shortestRoute?.estimatedTimeS);
+  if (Number.isFinite(seconds) && seconds > 0) {
+    return formatMinutes(seconds / 60);
+  }
+
+  return getTimeText(routeData, fallback);
 }
 
 export default function RouteScreen({ navigation, route }: Props) {
@@ -564,7 +603,13 @@ export default function RouteScreen({ navigation, route }: Props) {
     }
 
     if (tab.key === "transit") {
-      return transitTimeMin != null ? formatMinutes(transitTimeMin) : tab.defaultTime;
+      // 계산 중에는 31분류 placeholder나 최단거리 대체값을 보여주면 "이미 계산된
+      // 값"처럼 보인다 — 계산이 끝나기 전까지는 로딩중임을 분명히 표시한다.
+      if (hasCoordsForTransit && transitState.loading) return "계산 중";
+
+      return transitTimeMin != null
+        ? formatMinutes(transitTimeMin)
+        : getShortestRouteTimeText(parsedRouteData, tab.defaultTime);
     }
 
     return tab.defaultTime;

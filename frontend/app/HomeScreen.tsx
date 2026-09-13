@@ -47,8 +47,7 @@ const CATEGORY_GROUP_CODES: Record<string, string> = {
   restaurant: "FD6",
 };
 
-// 지도가 처음 여는 중심 좌표와 동일하게 맞춘다. 지도를 실제로 움직였을 때
-// 그 위치 기준으로 재검색하는 기능은 아직 없어서, 우선 이 좌표 주변으로 고정 검색한다.
+// 현위치를 못 받았을 때만 쓰는 폴백 중심(서울역) — 지도 자체의 초기 중심과도 동일하게 맞춘다.
 const MAP_DEFAULT_CENTER = { lat: 37.553149, lng: 126.968881 };
 const NEARBY_SEARCH_RADIUS_M = 1500;
 
@@ -64,32 +63,54 @@ type MapPlace = {
   phone?: string;
 };
 
-async function fetchWheelchairChargers(): Promise<MapPlace[]> {
+type Center = { lat: number; lng: number };
+
+// 휠체어 충전소는 전국/서울 전역 데이터라 거리 필터 없이 전부 불러오면, 지도를
+// 현재 위치 주변으로 맞추는 순간 화면 밖 마커까지 bounds에 끌려들어가 지도가
+// 크게 축소돼 보인다(또는 반대로 setBounds를 안 쓰면 마커가 화면 밖에 있어
+// 아무것도 안 보인다). 카페/음식점과 똑같이 현재 위치 주변만 걸러서 쓴다.
+function haversineMeters(a: Center, b: Center): number {
+  const R = 6371000;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const sinLat = Math.sin(dLat / 2);
+  const sinLng = Math.sin(dLng / 2);
+  const h =
+    sinLat * sinLat +
+    Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * sinLng * sinLng;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+async function fetchWheelchairChargers(center: Center): Promise<MapPlace[]> {
   const { data, error } = await supabase
     .from("charging_stations")
     .select("name, lat, lng, address_road, operating_hours, has_air_pump, has_phone_charger");
 
   if (error) throw error;
 
-  return (data ?? []).map((row) => ({
-    name: row.name,
-    lat: row.lat,
-    lng: row.lng,
-    address: row.address_road,
-    hours: row.operating_hours,
-    hasAirPump: row.has_air_pump,
-    hasPhoneCharger: row.has_phone_charger,
-  }));
+  return (data ?? [])
+    .filter((row) => Number.isFinite(row.lat) && Number.isFinite(row.lng))
+    .map((row) => ({
+      name: row.name,
+      lat: row.lat,
+      lng: row.lng,
+      address: row.address_road,
+      hours: row.operating_hours,
+      hasAirPump: row.has_air_pump,
+      hasPhoneCharger: row.has_phone_charger,
+    }))
+    .filter((place) => haversineMeters(center, place) <= NEARBY_SEARCH_RADIUS_M * 2);
 }
 
-async function fetchNearbyPlaces(categoryGroupCode: string): Promise<MapPlace[]> {
+async function fetchNearbyPlaces(categoryGroupCode: string, center: Center): Promise<MapPlace[]> {
   const results: MapPlace[] = [];
 
   for (let page = 1; page <= 3; page++) {
     const url =
       `https://dapi.kakao.com/v2/local/search/category.json` +
       `?category_group_code=${categoryGroupCode}` +
-      `&x=${MAP_DEFAULT_CENTER.lng}&y=${MAP_DEFAULT_CENTER.lat}` +
+      `&x=${center.lng}&y=${center.lat}` +
       `&radius=${NEARBY_SEARCH_RADIUS_M}&sort=distance&page=${page}`;
 
     const response = await fetch(url, {
@@ -120,11 +141,11 @@ async function fetchNearbyPlaces(categoryGroupCode: string): Promise<MapPlace[]>
   return results;
 }
 
-function fetchPlacesForCategory(categoryId: string): Promise<MapPlace[]> {
-  if (categoryId === "wheelchair-charge") return fetchWheelchairChargers();
+function fetchPlacesForCategory(categoryId: string, center: Center): Promise<MapPlace[]> {
+  if (categoryId === "wheelchair-charge") return fetchWheelchairChargers(center);
 
   const groupCode = CATEGORY_GROUP_CODES[categoryId];
-  if (groupCode) return fetchNearbyPlaces(groupCode);
+  if (groupCode) return fetchNearbyPlaces(groupCode, center);
 
   return Promise.resolve([]);
 }
@@ -135,17 +156,64 @@ export default function HomeScreen() {
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   // 카테고리별로 한 번 불러온 결과는 다시 선택해도 재조회하지 않고 캐시에서 쓴다.
   const [placesCache, setPlacesCache] = useState<Record<string, MapPlace[]>>({});
+  // 마운트 시 자동으로 받아온 현위치. 못 받으면 null로 남고, 이 경우 지도는
+  // kakaoMapHtml에 박혀있는 기본 중심(서울역)에 그대로 머문다.
+  const [currentCoords, setCurrentCoords] = useState<{ latitude: number; longitude: number } | null>(null);
+  // WebView 안의 카카오맵 스크립트가 로드를 마쳐야 window.moveToLocation이 존재한다.
+  // 그 전에 injectJavaScript를 호출하면 조용히 무시되므로, 로드 완료 신호를 따로 받는다.
+  const [webviewLoaded, setWebviewLoaded] = useState(false);
   const webviewRef = useRef<WebView>(null);
 
   const toggleCategory = (id: string) => {
     setSelectedCategory((prev) => (prev === id ? null : id));
   };
 
-  // 선택된 카테고리가 처음 선택될 때 한 번만 데이터를 불러온다.
+  // 앱 진입 시 1회, 조용히 현위치를 시도한다(권한 거부/실패 시 알림 없이 폴백 유지).
   useEffect(() => {
-    if (!selectedCategory || placesCache[selectedCategory]) return;
+    (async () => {
+      try {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== "granted") return;
 
-    fetchPlacesForCategory(selectedCategory)
+        const loc: any = await Promise.race([
+          Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 5000)),
+        ]).catch(async () => Location.getLastKnownPositionAsync({}));
+
+        if (loc?.coords) {
+          setCurrentCoords({ latitude: loc.coords.latitude, longitude: loc.coords.longitude });
+        }
+      } catch (e) {
+        console.log("[GPS] 자동 현위치 수신 실패:", e);
+      }
+    })();
+  }, []);
+
+  // 현위치를 받았고 지도도 로드가 끝났으면, 지도를 그 위치로 옮긴다.
+  useEffect(() => {
+    if (currentCoords && webviewLoaded) {
+      webviewRef.current?.injectJavaScript(
+        `if (window.moveToLocation) { window.moveToLocation(${currentCoords.latitude}, ${currentCoords.longitude}); } true;`
+      );
+    }
+  }, [currentCoords, webviewLoaded]);
+
+  // 선택된 카테고리가 처음 선택될 때 한 번만 데이터를 불러온다. 현위치를 받았으면
+  // 그 주변, 못 받았으면 폴백(서울역) 주변으로 검색한다 — 지도가 현위치로 옮겨간
+  // 뒤에도 검색은 계속 서울역 기준이면, 결과가 화면 밖에 있어 아무것도 안 보인다.
+  useEffect(() => {
+    // 빈 결과([])는 캐시하지 않는다 — GPS가 아직 안 잡힌 상태에서 폴백 좌표로
+    // 조회됐다가 0개가 나오면, 캐시돼버려서 다음에 다시 눌러도 재조회 없이
+    // 계속 0개만 보이는 문제가 있었다.
+    if (!selectedCategory || (placesCache[selectedCategory]?.length ?? 0) > 0) return;
+
+    const center: Center = currentCoords
+      ? { lat: currentCoords.latitude, lng: currentCoords.longitude }
+      : MAP_DEFAULT_CENTER;
+
+    console.log(`${selectedCategory} 조회 기준 좌표:`, center, "(GPS 수신:", !!currentCoords, ")");
+
+    fetchPlacesForCategory(selectedCategory, center)
       .then((data) => {
         console.log(`${selectedCategory} 장소 개수:`, data.length);
         setPlacesCache((prev) => ({ ...prev, [selectedCategory]: data }));
@@ -154,7 +222,7 @@ export default function HomeScreen() {
         console.log("장소 조회 오류:", e);
         Alert.alert("오류", "장소 정보를 불러오지 못했습니다.");
       });
-  }, [selectedCategory]);
+  }, [selectedCategory, currentCoords]);
 
   // 선택된 카테고리에 해당하는 장소들을 지도에 마커로 표시하고, 해제되면 지운다.
   useEffect(() => {
@@ -327,6 +395,10 @@ export default function HomeScreen() {
               });
 
               map.setBounds(bounds, 100);
+              // 검색 반경(1.5km) 안 결과라도 개수가 많으면 bounds가 넓어져 지도가
+              // 과하게 축소된다 — "현위치" 버튼이 쓰는 레벨(3)과 비슷하게, 너무
+              // 멀리 빠지지 않게 줌 레벨을 위쪽으로만 한번 더 제한.
+              if (map.getLevel() > 4) map.setLevel(4);
             };
 
             window.clearCategoryMarkers = function () {
@@ -414,6 +486,7 @@ export default function HomeScreen() {
           domStorageEnabled={true}
           mixedContentMode="always"
           style={styles.webView}
+          onLoadEnd={() => setWebviewLoaded(true)}
         />
       </View>
 
