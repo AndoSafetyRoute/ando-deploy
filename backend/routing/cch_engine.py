@@ -46,6 +46,27 @@ def is_forbidden_for_any_type(slope_pct: float) -> bool:
 
 WEIGHT_SCALE = 1_000   # slope_cost(float) → list[int] 변환 배율
 
+# ── alpha 이진탐색 튜닝 상수 (#D) ────────────────────────────────────────────
+# 회당 비용(_interp_weights_list + CCHMetric.reset())이 쿼리 자체보다 훨씬
+# 커서(실측 ~630ms/회), 정확도-속도 트레이드오프가 필요해지면 이 값부터
+# 낮춘다. 해상도는 1/2**ALPHA_SEARCH_MAX_STEPS.
+ALPHA_SEARCH_MAX_STEPS      = 5
+# #C(조기 종료) 기본 OFF — 실측 재검증에서 "같은 경로가 2회 연속(채택 후보끼리만
+# 비교) 나오면 멈춘다"는 조건도 안전하지 않음을 확인했다: 남산도서관→명동
+# (cane, 최단 2,465m)에서 step 3에 채택 후보 경로가 2회 연속 완전히 동일
+# (same_path=True)해 조기 종료했는데도, 남은 2스텝을 마저 돌리면 avgSlope
+# 9.31→9.11, totalDistance 2,516.5m→2,564.8m로 더 나은(경사 더 낮은) 경로를
+# 찾아냈다 — CCH 정수 가중치 양자화 때문에 "경로가 2회 연속 같다"가 진짜
+# 수렴을 보장하지 않는다. #B(초기 추정값)는 같은 검증에서 전 케이스 경로
+# 완전 동일(회귀 없음)을 확인했으므로 그대로 켜 둔다. 이 값을 키워 다시
+# 켜려면(정확도-속도 트레이드오프 감수) 위 실측을 먼저 재확인할 것.
+ALPHA_SEARCH_EARLY_STOP_ENABLED = False
+ALPHA_SEARCH_EARLY_STOP_REL     = 0.01
+
+# 이진탐색 진입 빈도 실측용 프로세스 전역 카운터(#A) — 요청마다 리셋되지
+# 않고 서버 수명 동안 누적해 트리거율을 로그로 확인한다.
+_ALPHA_SEARCH_STATS = {"calls": 0, "triggered": 0}
+
 
 def _topology_key(n: int, tail_np: np.ndarray, head_np: np.ndarray) -> str:
     """그래프 위상(노드수 + 방향엣지 tail/head)만으로 만든 해시.
@@ -213,20 +234,45 @@ class CCHEngine:
             print(f"[CCH] 최단={shortest_dist:.0f}m  경사최적={slope_dist:.0f}m  "
                   f"우회={detour:.2f}x")
 
+            # #A: 이진탐색 진입 빈도 실측 — 트리거율이 낮으면(장거리에서만
+            # 드물게) 회당 비용 최적화(#B~D)의 우선순위가 낮아지므로 먼저 잰다.
+            _ALPHA_SEARCH_STATS["calls"] += 1
+
             if detour <= max_detour_ratio:
                 path_nodes = path_s
                 used_alpha = 1.0
             else:
-                # ── 3. 우회 초과 → alpha 이진탐색 (최대 5회, reset() 재활용) ──
-                print(f"[CCH] 우회 초과 → alpha 이진탐색")
+                _ALPHA_SEARCH_STATS["triggered"] += 1
+                stats = _ALPHA_SEARCH_STATS
+                trigger_rate = stats["triggered"] / stats["calls"] * 100
+                print(f"[CCH] 우회 초과 → alpha 이진탐색 시작  "
+                      f"(누적 트리거율 {stats['triggered']}/{stats['calls']} "
+                      f"= {trigger_rate:.0f}%, shortest_dist={shortest_dist:.0f}m)")
+
+                # #B: lo=0/hi=1 맹목적 이분 대신, detour(alpha=0)=1.0과
+                # detour(alpha=1)=detour(위에서 이미 계산됨)를 잇는 직선에서
+                # 목표 우회율에 해당하는 alpha를 역산해 첫 쿼리 지점으로 쓴다.
+                # detour가 alpha에 단조증가한다는 전제(이분법 정당성의 전제와
+                # 동일)에서, 실제 곡선이 완전한 직선이 아니어도 0.5보다는
+                # 목표에 가까운 시작점이 된다. [0, 1]로 clamp해 안전판을 둔다.
+                alpha0 = ((max_detour_ratio - 1.0) / (detour - 1.0)
+                          if detour > 1.0 else 0.5)
+                alpha0 = min(max(alpha0, 0.0), 1.0)
+                print(f"[CCH] 초기 추정 alpha0={alpha0:.3f} "
+                      f"(선형보간, blind 0.5 대신)")
+
                 # 첫 iteration용 CCHMetric 1개 생성, 이후 reset()으로 재활용
                 lo, hi     = 0.0, 1.0
                 path_nodes = path_d
                 used_alpha = 0.0
                 metric_bs  = None  # lazy init
+                prev_accepted_dist  = None   # "채택된"(=lo 갱신) 후보끼리만 비교
+                prev_accepted_nodes = None
+                steps_used = 0
 
-                for step in range(5):
-                    mid = (lo + hi) / 2
+                for step in range(ALPHA_SEARCH_MAX_STEPS):
+                    mid = alpha0 if step == 0 else (lo + hi) / 2
+                    steps_used = step + 1
                     w_list = self._interp_weights_list(user_type, mid)
                     if metric_bs is None:
                         metric_bs = CCHMetric(self.cch, w_list)
@@ -238,12 +284,35 @@ class CCHEngine:
                         hi = mid
                         continue
                     cand_dist = self._path_dist_m(cand)
-                    if cand_dist / shortest_dist <= max_detour_ratio:
-                        lo, path_nodes, used_alpha = mid, cand, mid
-                    else:
+                    accepted  = cand_dist / shortest_dist <= max_detour_ratio
+                    if not accepted:
                         hi = mid
+                        continue
+                    lo, path_nodes, used_alpha = mid, cand, mid
 
-                print(f"[CCH] 이진탐색 완료 alpha={used_alpha:.3f}")
+                    # #C: 직전 "채택된"(lo 갱신) 후보와만 비교한다 — reject된
+                    # 후보(hi 쪽, 다른 브래킷)와 섞어 비교하면 우연히 거리가
+                    # 비슷해도 서로 다른 경로일 수 있어 조기 종료가 더 나은
+                    # 후보를 놓칠 수 있다(실측: 남산→명동 cane 케이스에서 이
+                    # 버그로 avgSlope 9.11→9.31, totalDistance 2564.8→2516.5m
+                    # 로 실제 경로가 나빠짐 — 채택 후보끼리만 비교하도록 고친
+                    # 뒤 재검증 완료).
+                    if ALPHA_SEARCH_EARLY_STOP_ENABLED and prev_accepted_nodes is not None:
+                        same_path = (cand == prev_accepted_nodes)
+                        rel_change = (
+                            abs(cand_dist - prev_accepted_dist) / prev_accepted_dist
+                            if prev_accepted_dist > 0 else 0.0
+                        )
+                        if same_path or rel_change < ALPHA_SEARCH_EARLY_STOP_REL:
+                            print(f"[CCH] 조기 종료 (step={step+1}, "
+                                  f"same_path={same_path}  "
+                                  f"Δ={rel_change*100:.2f}% < "
+                                  f"{ALPHA_SEARCH_EARLY_STOP_REL*100:.0f}%)")
+                            break
+                    prev_accepted_nodes, prev_accepted_dist = cand, cand_dist
+
+                print(f"[CCH] 이진탐색 완료 alpha={used_alpha:.3f}  "
+                      f"steps={steps_used}/{ALPHA_SEARCH_MAX_STEPS}")
 
         # ── 4. 구간 정보 복원 ────────────────────────────────────────────────
         G        = self.G
