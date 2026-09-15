@@ -8,7 +8,7 @@
 // 이 파일은 순수하게 스키마 + HTTP 한 번만 책임진다.
 
 import { BASE_URL, getAuthToken } from "../api";
-import { COLLECT_BATCH_PATH } from "../personalization/config";
+import { COLLECT_BATCH_PATH, COLLECT_SESSION_START_PATH } from "../personalization/config";
 
 // ── 신호 A: 경사 bin별 통과 관측 ────────────────────────────────────────────────
 export type SlopeObservation = {
@@ -81,6 +81,49 @@ export type CollectBatchResponse =
  * - 401(인증 만료/미로그인)·네트워크 오류는 throw → 호출부(collectQueue)가 큐에 남겨 재시도.
  * - 200이면 그대로 반환. duplicate:true 도 "성공"으로 보고 큐에서 제거하면 된다.
  */
+// ── 세션 시작 (독립 — /navigation/start와 순서 무관) ────────────────────────
+export type CollectSessionStart = {
+  sessionId:  string;
+  walkerType: string;
+  appVersion: string;
+  schemaVer:  number;
+};
+
+/**
+ * /collect/session/start 로 sessions 행을 생성한다. beginCollection() 시점(동의
+ * 확정 즉시)에 best-effort로 부른다 — 실패해도 던지지 않고 호출부가 삼킨다.
+ * session_id가 PK라 재시도/중복 호출은 서버가 멱등 처리(ON CONFLICT DO NOTHING).
+ */
+export async function startCollectSession(
+  body: CollectSessionStart,
+  idToken?: string,
+): Promise<void> {
+  const token = idToken ?? (await getAuthToken());
+  if (!token) throw new Error("no-auth-token");
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const res = await fetch(`${BASE_URL}${COLLECT_SESSION_START_PATH}`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        session_id:  body.sessionId,
+        walker_type: body.walkerType,
+        app_version: body.appVersion,
+        schema_ver:  body.schemaVer,
+      }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`collect/session/start ${res.status}: ${text.slice(0, 200)}`);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function postCollectBatch(
   body: CollectBatch,
   idToken?: string,

@@ -33,8 +33,9 @@ from database import (
     start_navigation, add_navigation_segment, complete_navigation,
     save_zone_observation, get_user_speed_profile, save_collect_batch,
     delete_user_account, get_personalization_status,
-    get_slow_segments, save_segment_hardship_feedback,
+    get_slow_segments, save_segment_hardship_feedback, get_segment_hardship_feedback,
     start_session, add_navigation_measurement, save_gps_batch,
+    get_route_measurements,
 )
 from routing.speed import get_zone_key, estimate_route_time, get_default_speed
 from routing.segments import build_navigation_segments, extract_waypoints
@@ -721,6 +722,15 @@ class NavigationSegmentRequest(BaseModel):
     # 이번 release_v9와 같은 배포 주기 안에서 추가된 필드).
     coord_start_idx: int | None = None
     coord_end_idx:   int | None = None
+    # 실제 위/경도 — RouteDetailScreen "구간 설문조사"(나중에 평가)가 이 구간을
+    # 지도에 그리는 데 쓴다(coord_start_idx/coord_end_idx는 좌표 배열 인덱스일
+    # 뿐 그 배열 자체가 저장 안 돼 있어 나중엔 역참조 불가 — database.py
+    # navigation_measurements 컬럼 주석 참고). FE가 measurement_units[i]에서
+    # 이미 갖고 있어 비용이 거의 없다. optional — 없어도 다른 필드 신뢰도엔 영향 없음.
+    start_lat: float | None = None
+    start_lon: float | None = None
+    end_lat:   float | None = None
+    end_lon:   float | None = None
     # ── 레거시 navigation_segments(마이페이지 표시용) 병행 기록에만 쓰는 필드 ──
     zone:       str | None = None
     direction:  str | None = None
@@ -762,6 +772,10 @@ def api_add_segment(
         status=body.status,
         coord_start_idx=body.coord_start_idx,
         coord_end_idx=body.coord_end_idx,
+        start_lat=body.start_lat,
+        start_lon=body.start_lon,
+        end_lat=body.end_lat,
+        end_lon=body.end_lon,
     )
     if not ok:
         raise HTTPException(
@@ -877,8 +891,8 @@ def api_complete_navigation(
 
 
 # ── 구간 체감 난이도 평가 (⑭' — pace = 1m당 소요시간 기준) ───────────────────
-# 안내 종료 후: pace 상위 min(10, 유효구간수) 구간에 대해 구간마다
-#   Q1 was_uncomfortable(불편했나요 예/아니오) → 예면 Q2 hardship_score(1~10점).
+# 안내 종료 후: pace 상위 min(10, 유효구간수) 구간에 대해 구간마다 1단계 3버튼
+# ("이 구간, 어떠셨나요?" 편했어요/보통이었어요/힘들었어요 → verdict -1/0/+1).
 # 랭킹은 complete_navigation 이 종료 시점에 미리 계산해 둔다.
 
 @app.get("/navigation/{route_id}/slow-segments")
@@ -894,6 +908,21 @@ def api_slow_segments(
     return result
 
 
+@app.get("/navigation/{route_id}/measurements")
+def api_route_measurements(
+    route_id: int,
+    db: Session = Depends(get_db),
+    decoded: dict = Depends(_verified),
+):
+    """RouteDetailScreen 용 — navigation_measurements(BE 실측, 신뢰 소스) 전체를
+    반환한다. 동의 안 했거나 서버 저장이 실패한 경로는 segments가 빈 배열로
+    온다 — FE가 이 경우 로컬(record.segments)로 폴백한다."""
+    result = get_route_measurements(db, route_id, decoded["uid"])
+    if result is None:
+        raise HTTPException(404, "경로를 찾을 수 없거나 권한이 없습니다")
+    return result
+
+
 class SegmentHardshipAnswer(BaseModel):
     seg_index:         int
     seg_index_end:     int | None = None   # 묶은 구간의 끝 엣지 (GET 이 준 값 되싣기)
@@ -903,8 +932,13 @@ class SegmentHardshipAnswer(BaseModel):
     distance_m:        float
     slope_pct:         float
     zone:              str | None = None
-    was_uncomfortable: bool
-    hardship_score:    int | None = None   # 예일 때만 1~10, 아니오면 null
+    # 1단계 3버튼(편했어요 +1 / 보통이었어요 0 / 힘들었어요 -1). 예전
+    # was_uncomfortable(예/아니오)+hardship_score(1~10 점) 2단계 설계에서 전환 —
+    # ① "보통"과 "평지보다 편함"을 구분 못 해 s_u(g)가 음의 방향(더 편함) 데이터를
+    # 아예 못 받던 커버리지 구멍, ② 10점은 명목 해상도일 뿐 s_u(g)가 애초에
+    # 저차 보정항이라 못 씀, ③ 지금 병목은 응답률(2단계 최대 탭10 → 1단계 최대
+    # 탭5). 파일럿 전이라 하위호환 불필요 — 구버전 요청은 그냥 422.
+    verdict:           int
 
 
 class SegmentHardshipRequest(BaseModel):
@@ -921,10 +955,8 @@ def api_segment_hardship_feedback(
 ):
     """구간 체감 난이도 응답 저장 (route_id+seg_index upsert)."""
     for a in body.answers:
-        if a.was_uncomfortable and a.hardship_score is None:
-            raise HTTPException(400, f"seg_index={a.seg_index}: 불편함=예 이면 hardship_score(1~10) 필요")
-        if a.hardship_score is not None and not (1 <= a.hardship_score <= 10):
-            raise HTTPException(400, f"seg_index={a.seg_index}: hardship_score 는 1~10")
+        if a.verdict not in (-1, 0, 1):
+            raise HTTPException(400, f"seg_index={a.seg_index}: verdict는 -1/0/1이어야 합니다")
     result = save_segment_hardship_feedback(
         db,
         route_id=route_id,
@@ -932,6 +964,21 @@ def api_segment_hardship_feedback(
         session_id=body.session_id,
         answers=[a.model_dump() for a in body.answers],
     )
+    if result is None:
+        raise HTTPException(404, "경로를 찾을 수 없거나 권한이 없습니다")
+    return result
+
+
+@app.get("/navigation/{route_id}/segment-hardship-feedback")
+def api_get_segment_hardship_feedback(
+    route_id: int,
+    db: Session = Depends(get_db),
+    decoded: dict = Depends(_verified),
+):
+    """이 경로에서 사용자가 실제로 답한 D 신호 응답 목록 — RouteDetailScreen이
+    객관 경사 분류와 나란히 보여줄 때 쓴다. 답 안 한 구간은 그냥 응답 목록에
+    없다(FE가 seg_index로 찾아서 없으면 빈칸 처리)."""
+    result = get_segment_hardship_feedback(db, route_id, decoded["uid"])
     if result is None:
         raise HTTPException(404, "경로를 찾을 수 없거나 권한이 없습니다")
     return result
@@ -999,6 +1046,49 @@ class CollectBatchRequest(BaseModel):
     route_choice:        RouteChoicePayload | None = None
     segment_feedback:    list[SegmentFeedbackPayload] = []
     route_profile:       RouteProfilePayload | None = None
+
+
+class CollectSessionStartRequest(BaseModel):
+    session_id:  str
+    walker_type: str = "elderly"
+    app_version: str
+    schema_ver:  int
+
+
+@app.post("/collect/session/start")
+def api_collect_session_start(
+    body: CollectSessionStartRequest,
+    db: Session = Depends(get_db),
+    decoded: dict = Depends(_verified),
+):
+    """개인화 계측 세션(sessions 행) 생성 — /navigation/start와 의도적으로 독립적인
+    엔드포인트. FE는 동의가 확정되는 시점(beginCollection 호출 시점 — 최초부터
+    granted든, 모달 응답이 늦게 온 unknown→granted든)에 이걸 바로 부른다.
+
+    기존엔 session_id 발급이 /navigation/start 요청 본문에만 실려 갔는데, 그
+    요청은 동의 모달 응답을 기다리지 않고 즉시 나가서 "unknown 상태로 시작한
+    첫 걸음"은 뒤늦게 동의해도 sessions 행이 영영 안 생겼다(실측: uid 9명·
+    route 102개 중 session 1건 — "드문 edge case"가 아니라 사실상 모든 최초
+    세션이 겪는 기본 경로였음, ⑤ 4순위 판단 철회 근거).
+
+    sessions는 route_id를 갖지 않는 독립 엔티티(스키마 참고)라 이 호출이
+    /navigation/start보다 먼저 오든 나중에 오든 순서는 무관하다 —
+    navigation_measurements가 둘 다 FK로 참조하는 시점(GPS로 첫 measurement
+    unit을 실제로 지날 때, 보통 안내 시작 수십 초~수 분 뒤)까지만 둘 다
+    존재하면 된다. session_id는 PK라 /navigation/start 쪽의 기존 session_id
+    파라미터와 중복 호출돼도 ON CONFLICT DO NOTHING으로 안전(start_session
+    참고) — 그쪽은 하위호환으로 그대로 둔다."""
+    ok = start_session(
+        db,
+        session_id=body.session_id,
+        uid=decoded["uid"],
+        user_type=body.walker_type,
+        app_version=body.app_version,
+        schema_ver=body.schema_ver,
+    )
+    if not ok:
+        raise HTTPException(503, "DB 미설정")
+    return {"ok": True}
 
 
 @app.post("/collect/batch")

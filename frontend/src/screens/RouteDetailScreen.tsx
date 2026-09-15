@@ -19,11 +19,13 @@ import {
   getRoutes,
   deleteRoute,
   formatDuration,
-  getSlopeEffort,
   RouteRecord,
   SegmentTime,
 } from "../utils/storage";
+import { classifySlopeZone, type SlopeZoneKey } from "../utils/slopeZone";
 import { getAuthToken, deleteUserRoute } from "../api";
+import { getRouteMeasurements, type RouteMeasurementSegment } from "../api/routeMeasurements";
+import { getSegmentHardshipFeedback } from "../api/slowSegments";
 
 const NAVY = "#1B0F4A";
 const WHITE = "#FFFFFF";
@@ -33,25 +35,45 @@ const TEXT = "#111111";
 const TEXT_GRAY = "#666666";
 const TEXT_MUTE = "#9A9A9A";
 
-const EFFORT_CONFIG = {
-  easy: {
-    label: "쉬움",
+// 객관적 경사 분류 — 안내 중 지도 색(ZONE_COLORS)·마이페이지와 동일한 유형별
+// 4단계(utils/slopeZone.ts classifySlopeZone)로 통일. 예전엔 이 화면만 고정
+// 2%/5% 3단계(평지/완만/급경사, getSlopeEffort)를 따로 써서 안내 중 색과 안
+// 맞았다. 표정 이모지를 안 쓰는 이유(주관 D 신호 VERDICT_CONFIG와 혼동 방지)는
+// 그대로 유지 — 여긴 아이콘만 쓴다.
+const EFFORT_CONFIG: Record<SlopeZoneKey, { label: string; color: string; bg: string; icon: string }> = {
+  flat: {
+    label: "평지",
     color: C.success,
     bg: "#E8F8F5",
-    icon: "😊",
+    icon: "―",
   },
-  normal: {
-    label: "보통",
+  optimal: {
+    label: "완만",
     color: C.warn,
     bg: "#FFF8E6",
-    icon: "😐",
+    icon: "╱",
   },
-  hard: {
-    label: "힘듦",
+  warning: {
+    label: "주의",
+    color: "#FF9800",
+    bg: "#FFF1E0",
+    icon: "▲",
+  },
+  forbidden: {
+    label: "금지",
     color: C.danger,
     bg: "#FFF0F0",
-    icon: "😓",
+    icon: "⚠",
   },
+};
+
+// 주관적 D 신호(segment_hardship_feedback.verdict, 사용자가 실제로 답한 것만) —
+// EFFORT_CONFIG와 라벨·색·아이콘 계열을 완전히 분리한다. 표정 이모지를 여기만
+// 쓰는 이유는 위 주석 참고. 답 안 한 구간은 아예 안 뜬다(빈칸).
+const VERDICT_CONFIG: Record<number, { label: string; color: string; bg: string; icon: string }> = {
+  [1]:  { label: "편했어요",   color: C.success, bg: "#E8F8F5", icon: "😊" },
+  [0]:  { label: "보통이었어요", color: C.warn,    bg: "#FFF8E6", icon: "😐" },
+  [-1]: { label: "힘들었어요",  color: C.danger,  bg: "#FFF0F0", icon: "😣" },
 };
 
 const MODE_INFO: Record<string, { icon: string; label: string; color: string }> =
@@ -88,11 +110,11 @@ function formatDistance(meter: number) {
   return `${Math.round(meter)}m`;
 }
 
-function SlopeBar({ slope }: { slope: number }) {
+function SlopeBar({ slope, walkerType }: { slope: number; walkerType?: string }) {
   const absSlope = Math.abs(Number(slope) || 0);
   const capped = Math.min(absSlope, 10);
-  const effort = getSlopeEffort(absSlope);
-  const cfg = EFFORT_CONFIG[effort];
+  const zone = classifySlopeZone(slope, walkerType);
+  const cfg = EFFORT_CONFIG[zone];
 
   return (
     <View style={bar.wrap}>
@@ -115,10 +137,20 @@ function SlopeBar({ slope }: { slope: number }) {
   );
 }
 
-function SegmentRow({ seg, index }: { seg: SegmentTime; index: number }) {
-  const slope = Math.abs(Number(seg.slopePercent) || 0);
-  const effort = getSlopeEffort(slope);
-  const cfg = EFFORT_CONFIG[effort];
+function SegmentRow({
+  seg,
+  index,
+  verdict,
+  walkerType,
+}: {
+  seg: SegmentTime;
+  index: number;
+  verdict?: number; // 이 구간에 대한 D 신호 응답(-1/0/1) — 없으면 안 답한 것, 배지 자체를 안 그림
+  walkerType?: string;
+}) {
+  const zone = classifySlopeZone(seg.slopePercent, walkerType);
+  const cfg = EFFORT_CONFIG[zone];
+  const vcfg = verdict != null ? VERDICT_CONFIG[verdict] : undefined;
 
   return (
     <View style={styles.segRow}>
@@ -132,15 +164,26 @@ function SegmentRow({ seg, index }: { seg: SegmentTime; index: number }) {
             {Math.round(seg.distanceM)}m 구간
           </Text>
 
-          <View style={[styles.effortBadge, { backgroundColor: cfg.bg }]}>
-            <Text style={styles.effortIcon}>{cfg.icon}</Text>
-            <Text style={[styles.effortLabel, { color: cfg.color }]}>
-              {cfg.label}
-            </Text>
+          <View style={styles.badgeRow}>
+            <View style={[styles.effortBadge, { backgroundColor: cfg.bg }]}>
+              <Text style={styles.effortIcon}>{cfg.icon}</Text>
+              <Text style={[styles.effortLabel, { color: cfg.color }]}>
+                {cfg.label}
+              </Text>
+            </View>
+
+            {vcfg && (
+              <View style={[styles.verdictBadge, { backgroundColor: vcfg.bg, borderColor: vcfg.color }]}>
+                <Text style={styles.effortIcon}>{vcfg.icon}</Text>
+                <Text style={[styles.effortLabel, { color: vcfg.color }]}>
+                  {vcfg.label}
+                </Text>
+              </View>
+            )}
           </View>
         </View>
 
-        <SlopeBar slope={seg.slopePercent} />
+        <SlopeBar slope={seg.slopePercent} walkerType={walkerType} />
       </View>
 
       <View style={styles.segTime}>
@@ -184,6 +227,13 @@ export default function RouteDetailScreen() {
   const routeId = getParam(params.routeId);
 
   const [record, setRecord] = useState<RouteRecord | null>(null);
+  const [displaySegments, setDisplaySegments] = useState<SegmentTime[]>([]);
+  // getRouteMeasurements 원본(좌표 포함) — "구간 설문조사"(나중에 평가) 진입 시
+  // 지도를 그리려면 필요하다. displaySegments(SegmentTime)는 좌표가 없는 화면
+  // 표시 전용 타입이라 별도로 들고 있는다. 로컬 폴백일 땐 빈 배열(지도 없음).
+  const [rawMeasurements, setRawMeasurements] = useState<RouteMeasurementSegment[]>([]);
+  const [dataSource, setDataSource] = useState<"server" | "local">("local");
+  const [verdictBySegIndex, setVerdictBySegIndex] = useState<Record<number, number>>({});
   const [loading, setLoading] = useState(true);
 
   useFocusEffect(
@@ -196,8 +246,52 @@ export default function RouteDetailScreen() {
         const routes = await getRoutes();
         const found = routes.find((r) => r.id === routeId) ?? null;
 
+        // 서버 데이터(navigation_measurements) 우선 — 동의·서버 저장 성공한
+        // 실측만 담겨 있어 로컬(record.segments)보다 신뢰도가 높다. serverRouteId가
+        // 없거나(동의 안 함/서버 라운드트립 실패) 조회 자체가 실패하거나 빈
+        // 배열이면(동의 안 함/서버 저장 실패) 로컬로 폴백 — 기록이 아예 안 보이는
+        // 것보다는 낫다는 판단(§RouteDetailScreen 데이터소스 결정).
+        let segments: SegmentTime[] = found?.segments ?? [];
+        let source: "server" | "local" = "local";
+        let verdictMap: Record<number, number> = {};
+        if (found?.serverRouteId != null) {
+          try {
+            const token = await getAuthToken();
+            if (token) {
+              const resp = await getRouteMeasurements(found.serverRouteId, token);
+              if (resp.segments.length > 0) {
+                segments = resp.segments.map((s) => ({
+                  index:        s.index,
+                  distanceM:    s.distance_m,
+                  slopePercent: s.slope_pct,
+                  elapsedMs:    s.elapsed_ms,
+                  measured:     true,
+                }));
+                source = "server";
+                if (active) setRawMeasurements(resp.segments);
+
+                // D 신호(주관 평가) — seg_index가 unit_index라 서버 소스일 때만
+                // 안전하게 매칭된다(로컬 폴백은 raw edge 인덱스라 아예 안 불러옴).
+                // 실패해도 조용히 무시 — 이 화면의 핵심은 객관 데이터, D 신호는
+                // 보조 표시일 뿐이라 실패로 나머지를 막을 이유가 없다.
+                try {
+                  const hf = await getSegmentHardshipFeedback(found.serverRouteId, token);
+                  hf.answers.forEach((a) => { verdictMap[a.seg_index] = a.verdict; });
+                } catch (e) {
+                  console.log("[FE] segment-hardship-feedback(get) 조회 실패 (무시):", e);
+                }
+              }
+            }
+          } catch (e) {
+            console.log("[FE] navigation_measurements 조회 실패 (로컬로 대체):", e);
+          }
+        }
+
         if (active) {
           setRecord(found);
+          setDisplaySegments(segments);
+          setDataSource(source);
+          setVerdictBySegIndex(verdictMap);
           setLoading(false);
         }
       }
@@ -271,23 +365,29 @@ export default function RouteDetailScreen() {
     date.getHours()
   ).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 
-  const segments = record.segments ?? [];
+  const segments = displaySegments;
 
   const totalDistance = segments.reduce(
     (sum, seg) => sum + (seg.distanceM ?? 0),
     0
   );
 
-  const hardCount = segments.filter(
-    (s) => getSlopeEffort(Math.abs(s.slopePercent)) === "hard"
+  const walkerType = record.walkerType;
+
+  const flatCount = segments.filter(
+    (s) => classifySlopeZone(s.slopePercent, walkerType) === "flat"
   ).length;
 
-  const normalCount = segments.filter(
-    (s) => getSlopeEffort(Math.abs(s.slopePercent)) === "normal"
+  const optimalCount = segments.filter(
+    (s) => classifySlopeZone(s.slopePercent, walkerType) === "optimal"
   ).length;
 
-  const easyCount = segments.filter(
-    (s) => getSlopeEffort(Math.abs(s.slopePercent)) === "easy"
+  const warningCount = segments.filter(
+    (s) => classifySlopeZone(s.slopePercent, walkerType) === "warning"
+  ).length;
+
+  const forbiddenCount = segments.filter(
+    (s) => classifySlopeZone(s.slopePercent, walkerType) === "forbidden"
   ).length;
 
   return (
@@ -380,9 +480,10 @@ export default function RouteDetailScreen() {
 
           <View style={styles.effortSummaryRow}>
             {[
-              { effort: "easy" as const, count: easyCount },
-              { effort: "normal" as const, count: normalCount },
-              { effort: "hard" as const, count: hardCount },
+              { effort: "flat" as const, count: flatCount },
+              { effort: "optimal" as const, count: optimalCount },
+              { effort: "warning" as const, count: warningCount },
+              { effort: "forbidden" as const, count: forbiddenCount },
             ].map(({ effort, count }) => {
               const cfg = EFFORT_CONFIG[effort];
 
@@ -406,7 +507,11 @@ export default function RouteDetailScreen() {
 
         <View style={styles.segmentsCard}>
           <Text style={styles.cardTitle}>구간별 소요 시간</Text>
-          <Text style={styles.cardDesc}>5m 단위 · 경사도 기준 난이도</Text>
+          <Text style={styles.cardDesc}>
+            {dataSource === "server"
+              ? "서버에 저장된 실측 기록 · 경사도 기준 난이도"
+              : "이 기기에 저장된 기록 · 경사도 기준 난이도"}
+          </Text>
 
           {segments.length === 0 ? (
             <View style={styles.noSegmentBox}>
@@ -415,7 +520,7 @@ export default function RouteDetailScreen() {
           ) : (
             segments.map((seg, index) => (
               <React.Fragment key={`${seg.index ?? index}-${index}`}>
-                <SegmentRow seg={seg} index={index} />
+                <SegmentRow seg={seg} index={index} verdict={verdictBySegIndex[seg.index]} walkerType={walkerType} />
                 {index < segments.length - 1 && (
                   <View style={styles.segDivider} />
                 )}
@@ -423,6 +528,60 @@ export default function RouteDetailScreen() {
             ))
           )}
         </View>
+
+        {dataSource === "server" && record.serverRouteId != null && (
+          <TouchableOpacity
+            style={styles.surveyCard}
+            activeOpacity={0.85}
+            onPress={() => {
+              // 좌표 있는 unit만 골라 unit_index 위치를 그대로 보존한 채(희소
+              // 배열) 넘긴다 — SlowSegmentFeedbackScreen이 measurementUnits[seg_index]로
+              // 직접 인덱싱하므로 순서를 압축하면 엉뚱한 구간을 가리키게 된다.
+              // 이 컬럼(start/end 위경도) 추가 이전에 걸은 경로는 전부 null이라
+              // 지도 없이(hasMap=false) 텍스트만 폴백 — 기존과 동일하게 동작.
+              const withCoords = rawMeasurements.filter((s) => s.start_coords && s.end_coords);
+              const maxIdx = rawMeasurements.reduce((m, s) => Math.max(m, s.index), -1);
+              const measurementUnits: (Record<string, unknown> | null)[] = new Array(maxIdx + 1).fill(null);
+              withCoords.forEach((s) => {
+                measurementUnits[s.index] = {
+                  unit_index: s.index, distance_m: s.distance_m, slope_pct: s.slope_pct,
+                  coord_start_idx: s.index, coord_end_idx: s.index + 1,
+                  start_coords: s.start_coords, end_coords: s.end_coords,
+                };
+              });
+              const routeSegments = withCoords.map((s) => ({
+                start: { latitude: s.start_coords![1], longitude: s.start_coords![0] },
+                end:   { latitude: s.end_coords![1],   longitude: s.end_coords![0] },
+                slope_pct: s.slope_pct,
+                length_m:  s.distance_m,
+              }));
+
+              router.push({
+                pathname: "/slow-segment-feedback",
+                params: {
+                  serverRouteId: String(record.serverRouteId),
+                  nextRouteId: routeId,
+                  ...(withCoords.length > 0
+                    ? {
+                        measurementUnits: JSON.stringify(measurementUnits),
+                        routeSegments:    JSON.stringify(routeSegments),
+                      }
+                    : {}),
+                },
+              });
+            }}
+          >
+            <View style={{ flex: 1 }}>
+              <Text style={styles.surveyTitle}>구간 설문조사</Text>
+              <Text style={styles.surveyDesc}>
+                {Object.keys(verdictBySegIndex).length > 0
+                  ? "답변을 더 하거나 수정할 수 있어요."
+                  : "느린 구간이 어땠는지 나중에 평가할 수 있어요."}
+              </Text>
+            </View>
+            <Ionicons name="chevron-forward" size={22} color={NAVY} />
+          </TouchableOpacity>
+        )}
 
         <View style={{ height: 40 }} />
       </ScrollView>
@@ -790,6 +949,31 @@ const styles = StyleSheet.create({
     ...shadowStyle,
   },
 
+  surveyCard: {
+    marginTop: 18,
+    backgroundColor: WHITE,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: BORDER_GRAY,
+    padding: 18,
+    flexDirection: "row",
+    alignItems: "center",
+    ...shadowStyle,
+  },
+
+  surveyTitle: {
+    fontSize: 15,
+    fontWeight: "900",
+    color: TEXT,
+  },
+
+  surveyDesc: {
+    marginTop: 4,
+    fontSize: 12.5,
+    color: TEXT_GRAY,
+    fontWeight: "600",
+  },
+
   noSegmentBox: {
     marginTop: 14,
     backgroundColor: LIGHT_GRAY,
@@ -833,6 +1017,8 @@ const styles = StyleSheet.create({
   segTop: {
     flexDirection: "row",
     alignItems: "center",
+    flexWrap: "wrap",
+    rowGap: 6,
     marginBottom: 8,
   },
 
@@ -843,12 +1029,29 @@ const styles = StyleSheet.create({
     flex: 1,
   },
 
+  badgeRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+
   effortBadge: {
     flexDirection: "row",
     alignItems: "center",
     borderRadius: 999,
     paddingHorizontal: 8,
     paddingVertical: 4,
+  },
+
+  // D 신호(주관 평가) 배지 — effortBadge(경사, 채워진 배경)와 시각적으로 다르게
+  // 테두리형으로 구분한다. "객관 경사와 나란히 놓여도 헷갈리지 않게"가 목적.
+  verdictBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderRadius: 999,
+    borderWidth: 1.5,
+    paddingHorizontal: 8,
+    paddingVertical: 3.5,
   },
 
   effortIcon: {

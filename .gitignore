@@ -32,3 +32,7 @@ backend/data/*
 Thumbs.db
 .vscode/
 .idea/
+
+# ── 로컬 개발 실행 로그 ──────────────────────────────────────────────────────
+backend/dev_local_backend.log
+frontend/dev_metro.log

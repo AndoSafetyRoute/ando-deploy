@@ -33,6 +33,7 @@ import {
   getShowSlopeMarkers,
   formatMinutes,
 } from "../utils/storage";
+import { classifySlopeZone } from "../utils/slopeZone";
 import {
   getAuthToken,
   startNavigation,
@@ -42,6 +43,7 @@ import {
 } from "../api";
 import type { NavSegment, Waypoint, MeasurementUnit } from "../api/routeApi";
 import { CollectSession, drainCollectQueue } from "../utils/collectQueue";
+import { startCollectSession } from "../api/collect";
 import { GpsTraceBuffer } from "../utils/gpsTraceBuffer";
 import { SlopeBinTracker } from "../utils/slopeBinTracker";
 import {
@@ -198,14 +200,18 @@ function isLocationNearRoute(location: Coordinate | null, coordinates: Coordinat
   );
 }
 
-function getSegmentColor(slope: number) {
-  const abs = Math.abs(slope);
-  if (abs < 3)                      return "#79C56A";
-  if (slope >= 3 && slope < 8)      return "#D96A4E";
-  if (slope <= -3 && slope > -8)    return "#5D8FD6";
-  if (slope >= 8)                   return "#8B2E24";
-  if (slope <= -8)                  return "#284B7C";
-  return "#79C56A";
+// navSegData(백엔드 navigation_segments, classify_zone 결과)가 비어있을 때만
+// 쓰는 폴백 — 하이브리드/DEM 커버리지 밖 구간 등(§도보 안내 지도 렌더 분기,
+// ":518-550" 부근 navSegs/segmentData 우선순위 참고). 예전엔 유형과 무관하게
+// 고정 ±3%/±8%(구식 3%/8% 폴백, 커밋 14169cf에서 언급된 그 코드)를 써서, 예를
+// 들어 walker(워커)의 내리막처럼 g_opt=0%인 유형은 0~3% 내리막이 실제로는
+// "주의"인데 화면에는 "완만" 초록으로 뜨는 불일치가 있었다. backend/routing/cost.py
+// USER_TYPES(g_opt/g_warn)를 그대로 복제해 classify_zone과 동일한 판정 후
+// ZONE_COLORS로 칠한다. 분류 로직(유형별 g_opt/g_warn 임계값)은 마이페이지·
+// 경로상세와 공유하는 utils/slopeZone.ts로 이전 — 예전엔 이 파일에만 있어서
+// 안내 중 색(4단계 유형별)과 다녀온 뒤 요약(3단계 고정) 분류가 서로 달랐다.
+function getSegmentColor(slope: number, walkerType?: string) {
+  return ZONE_COLORS[classifySlopeZone(slope, walkerType)] ?? ZONE_COLORS.flat;
 }
 
 function formatDistance(distanceM: any) {
@@ -248,6 +254,11 @@ function formatSlope(avgSlope: any) {
 }
 
 const PROXIMITY_THRESHOLD = 15;
+// routeSegments catch-up 스캔 한도(세그먼트 개수) — 콜백 공백 중 놓친 세그먼트를
+// 몇 개까지 앞서 훑어볼지. 실기기 dt 최대 27.7s 관측 기준 도보~가벼운 조깅
+// 속도(≤3m/s)로도 최대 ~83m라 5~10m 단위 세그먼트로는 수십 개면 충분히 여유
+// 있게 잡은 값(비용은 haversine 계산 몇 번뿐이라 넉넉하게 잡아도 무리 없음).
+const SEGMENT_CATCHUP_LOOKAHEAD = 50;
 // Accuracy.High는 GPS 하드웨어 단독 픽스만 기다려서 실내·건물 인근·GPS
 // 신호가 약한 곳에서 첫 위치가 잡히지 않고 무한 대기하는 경우가 있다
 // (expo-location Android 알려진 이슈). Balanced는 Wi-Fi/셀룰러 기반
@@ -323,6 +334,7 @@ function makeKakaoMapHtml({
   journeyMapSegments,
   finalDestinationName,
   finalOriginName,
+  walkerType,
 }: {
   coordinates:    Coordinate[];
   navSegData:     NavSegData[];
@@ -335,6 +347,7 @@ function makeKakaoMapHtml({
   journeyMapSegments: { coordinates: Coordinate[]; color: string }[];
   finalDestinationName: string;
   finalOriginName: string;
+  walkerType?: string; // navSegData 비었을 때 폴백(getSegmentColor)의 유형별 색칠용
 }) {
   const fallback = coordinates[0] ?? { latitude: 37.5665, longitude: 126.978 };
 
@@ -370,7 +383,7 @@ function makeKakaoMapHtml({
     routeSegments.map((seg) => ({
       start: { lat: seg.start.latitude, lng: seg.start.longitude },
       end:   { lat: seg.end.latitude,   lng: seg.end.longitude   },
-      color: getSegmentColor(seg.slope),
+      color: getSegmentColor(seg.slope, walkerType),
     }))
   );
 
@@ -834,6 +847,12 @@ export default function NavigationScreen({ navigation, route }: Props) {
   // true로 세팅되고, unit 루프가 그 다음으로 닫는 unit 하나에 소비한 뒤 리셋한다
   // (SlopeBinTracker.invalidateCurrent와 같은 목적, 별도 트래킹이라 별도 플래그).
   const unitGapPendingRef = useRef<boolean>(false);
+  // routeSegments 루프(로컬 SegmentTime — RouteDetailScreen 폴백·MyPageScreen
+  // 경사도별 누적시간 통계 둘 다의 소스) 전용 오염 플래그. unitGapPendingRef와
+  // 세팅 시점은 항상 같이 가지만(같은 신호 B 판정) 소비·리셋은 이 루프가 독립적으로
+  // 한다 — 한 ref를 공유하면 routeSegments 루프가 먼저 소비·리셋해버려 뒤이어
+  // 도는 unit 루프가 같은 tick의 진짜 공백을 못 보게 되는 레이스가 생긴다.
+  const segGapPendingRef = useRef<boolean>(false);
 
   // ── 개인화 계측 (인계 §5 ⑪, ando_ml_plan_v2 §3.2 신호 A) ────────────────────
   // zone(3단계 안전 분류) 단위로 뭉치면 경사 축 해상도가 파괴된다(§3.1). 대신
@@ -864,10 +883,25 @@ export default function NavigationScreen({ navigation, route }: Props) {
     // 세션이 안내 종료 시 null 로 비워진 뒤에도 구간평가(신호 D) POST 가 session_id 를
     // 실을 수 있도록 문자열만 따로 보존한다 (신호 A/B 와 조인용).
     collectSessionIdRef.current = collectSessionRef.current.sessionId;
-    // GPS 원본 궤적도 같은 session_id·같은 동의 게이트로 시작 — sessions 테이블
-    // 행은 /navigation/start가 이미(동의 여부와 무관하게) 만들어 뒀을 수도, 아직
-    // 안 만들어졌을 수도 있다(레이스). gps-batch는 BE가 sessions 존재 여부로
-    // 조용히 no-op 처리하니 여기서 별도로 기다리지 않는다.
+    // sessions 행 생성은 여기서 직접, /navigation/start와 독립적으로 낸다 — 예전엔
+    // /navigation/start 요청 본문의 session_id에만 기댔는데, 그 요청은 동의 모달
+    // 응답을 기다리지 않고 즉시 나가서 "unknown 상태로 시작한 첫 걸음"은 여기서
+    // beginCollection이 나중에(모달 응답 이후) 불려도 sessions 행이 영영 안
+    // 생겼다(실측: uid 9명·route 102개 중 session 1건 — "드문 edge case"가 아니라
+    // 사실상 모든 최초 세션의 기본 경로였음). sessions는 route_id를 안 가진 독립
+    // 엔티티라 이 호출과 /navigation/start 중 뭐가 먼저 끝나든 상관없다 — 둘 다
+    // submitSegment 시점(첫 unit을 실제로 지날 때)까지만 있으면 된다. 실패해도
+    // 던지지 않는다 — gps-batch/submitSegment 쪽이 sessions 부재를 이미 조용히
+    // no-op 처리하므로 이 호출 실패가 나머지 안내 흐름을 막을 이유는 없다.
+    getAuthToken().then((token) => {
+      if (!token) return;
+      startCollectSession({
+        sessionId:  collectSessionRef.current!.sessionId,
+        walkerType,
+        appVersion: APP_VERSION,
+        schemaVer:  MEASUREMENT_SCHEMA_VERSION,
+      }, token).catch(() => {});
+    }).catch(() => {});
     gpsTraceBufferRef.current = new GpsTraceBuffer(collectSessionRef.current.sessionId);
     binTrackerRef.current = new SlopeBinTracker(routeSegments[0]?.slope ?? 0, initTime);
     try {
@@ -881,7 +915,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
         coordinates: (coordinates ?? []).map((c: any) => [c.longitude, c.latitude]) as [number, number][],
       });
     } catch { /* 스냅샷 실패는 수집 자체를 막지 않는다 */ }
-  }, [route?.params?.collectSessionId, routeSegments, routeData, coordinates]);
+  }, [route?.params?.collectSessionId, routeSegments, routeData, coordinates, walkerType]);
 
   const visitedWaypointsRef = useRef<Set<number>>(new Set());
 
@@ -956,6 +990,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
       unitStartTimesRef.current = Array(measurementUnits.length).fill(initTime);
       currentUnitIdxRef.current = 0;
       unitGapPendingRef.current = false;
+      segGapPendingRef.current  = false;
 
       // 이전 세션에서 전송 못 하고 큐에 남은 배치는 동의 여부와 무관하게 재시도한다
       // (그 배치들은 당시 동의 상태에서 쌓인 것).
@@ -979,10 +1014,14 @@ export default function NavigationScreen({ navigation, route }: Props) {
       // 아예 전송하지 않음 — 아래 GPS 콜백의 unit 루프 참고).
       //   granted  → beginCollection으로 세션 확정 후 이어서 /navigation/start
       //   unknown  → 도보 안내면 모달을 띄운다. 사용자 응답을 무한정 기다릴 수
-      //              없으므로 이번 /navigation/start는 세션 없이 나간다 — 모달에서
-      //              뒤늦게 동의해도 이번 경로의 navigation_measurements는 유실
-      //              (sessions 행 자체가 없어 BE가 404/no-op — gps-batch가 이미
-      //              감내하던 것과 동일한 트레이드오프).
+      //              없으므로 이번 /navigation/start는 세션 없이 나간다 — 예전엔
+      //              여기서 늦게 동의해도 이번 경로의 navigation_measurements가
+      //              유실됐지만(sessions 행이 /navigation/start에만 의존),
+      //              이제 beginCollection() 자체가 /collect/session/start로
+      //              독립적으로 sessions 행을 만들어서(api/collect.ts) 모달에서
+      //              뒤늦게 동의해도 그 순간부터 정상 수집된다 — 실측(uid 9명·
+      //              route 102개 중 session 1건)으로 이 케이스가 edge case가
+      //              아니라 사실상 기본 경로였음이 드러나 구조를 바꿨다.
       //   denied   → 세션 없이 진행(기존과 동일)
       getCollectConsent().then((consent) => {
         if (!mounted) return;
@@ -1088,6 +1127,21 @@ export default function NavigationScreen({ navigation, route }: Props) {
                   speed_ms:       v,
                 });
                 if (v < NEAR_STOP_SPEED_MS) binTrackerRef.current?.noteStop(dt * 1000); // stop_ms 누적
+                // 정상 판정이 한 번이라도 성공하면 오염 플래그를 바로 내린다 — 원래는
+                // 이 unit이 닫힐 때(아래 gapConsumed)까지 기다렸는데, 실기기 콜백 간격이
+                // SPEED_SAMPLE_MAX_GAP_S 근처/이상으로 흔해서(sess-1789364304261-iy39nwa8
+                // 42%) 다음 unit이 닫히기 전에 또 다른 콜백이 새로 공백 판정을 일으켜
+                // 플래그가 사실상 계속 true로 남는 문제가 있었다(모든 unit이 skipped).
+                // 트레이드오프: 공백 발생 직후 곧바로 복구되면(다음 콜백이 정상) 그
+                // 사이 열려 있던 unit의 elapsed_ms 에는 여전히 공백 시간이 섞여 있는데도
+                // 이 unit이 나중에 닫힐 때 skipped로 안 잡힐 수 있다 — 단, 그 경우
+                // 공백 길이 자체가 SPEED_SAMPLE_MAX_GAP_S(20s) 미만이라 애초에 이 분기가
+                // 아니라 위 분기(정상)로 처리됐을 가능성이 높다. 20s 이상 실제 GPS
+                // 유실(터널 등) 후 바로 다음 콜백이 정상 복귀하는 드문 경우만 이 완화의
+                // 영향을 받는다 — 현재 100% skip으로 데이터가 전혀 안 쌓이는 것보다
+                // 낫다고 판단.
+                unitGapPendingRef.current = false;
+                segGapPendingRef.current  = false;
               } else if (dt >= SPEED_SAMPLE_MAX_GAP_S || d >= SPEED_SAMPLE_MAX_JUMP_M) {
                 // GPS 점프/장시간 공백 — 이 표본만이 아니라 진행 중이던 bin 관측
                 // 전체를 버린다 (점프 앞뒤로 거리·시간 오염, Q&A #5).
@@ -1095,14 +1149,25 @@ export default function NavigationScreen({ navigation, route }: Props) {
                 // measurementUnits 쪽도 같은 이유로 오염 — 지금 진행 중이던 unit이
                 // 다음에 닫힐 때 elapsed에 이 공백/점프 구간 전체가 섞여 들어간다
                 // (DB 분석에서 찾은 "9.9m 구간에 27700ms" 패턴). 그 unit이 닫히는
-                // 시점에 status='skipped'로 보내도록 표시만 해 둔다.
+                // 시점에 status='skipped'로 보내도록 표시만 해 둔다. routeSegments
+                // 루프(로컬 SegmentTime)도 같은 공백을 겪으므로 별도 플래그로 동일 표시.
                 unitGapPendingRef.current = true;
+                segGapPendingRef.current  = true;
                 if (__DEV__) console.warn(`[collect] GPS 점프/공백으로 bin 무효화 (dt=${dt.toFixed(1)}s d=${d.toFixed(0)}m)`);
               }
             }
             lastGpsPosRef.current  = curPos;
             lastGpsTimeRef.current = now;
           }
+
+          // 이 콜백 진입 시점의 오염 여부를 고정(unit 루프와 동일 패턴, 아래
+          // measurementUnits 루프의 gapPendingAtStart 참고) —
+          // 신호 B/AppState 핸들러가 이 루프보다 먼저 돈다. 이 시점 값은 이미 이번
+          // tick의 신호 B 블록을 거친 뒤라, 정상 판정이 성공했으면 위에서 이미
+          // false로 내려가 있을 수 있다.
+          const segGapPendingAtStart = segGapPendingRef.current;
+          let segGapConsumed = false;
+          let segsThisTick = 0; // 이 콜백 안에서 이미 몇 개의 세그먼트를 지났는지
 
           let curIdx = currentSegIdxRef.current;
           while (curIdx < routeSegments.length) {
@@ -1111,17 +1176,72 @@ export default function NavigationScreen({ navigation, route }: Props) {
               { latitude: loc.coords.latitude, longitude: loc.coords.longitude },
               seg.end
             );
-            if (dist >= PROXIMITY_THRESHOLD) break;
+            if (dist >= PROXIMITY_THRESHOLD) {
+              // curIdx의 끝점 15m 반경에 못 들었다 — 콜백 공백/점프로 이 세그먼트를
+              // 그냥 지나쳤을 수 있다(실기기 dt 최대 27.7s 관측, 신호 B 조사).
+              // 예전엔 여기서 바로 break해 다음 콜백을 기다렸는데, 그 다음 콜백도
+              // curIdx 끝점만 보므로 이미 지나친 지점엔 영원히 다시 가까워지지
+              // 않아 이후 세그먼트 전체(및 routeSegments 소진에 의존하는 대중교통
+              // leg 자동전환)가 그대로 멈춰 섰다. measurementUnits 루프(아래)의
+              // catch-up과 같은 방식으로, 앞쪽 몇 개를 미리 훑어 지금 위치와
+              // 실제로 가까운 세그먼트가 있으면 그 지점까지 건너뛴다.
+              let caughtUpIdx = -1;
+              const lookaheadEnd = Math.min(routeSegments.length, curIdx + 1 + SEGMENT_CATCHUP_LOOKAHEAD);
+              for (let j = curIdx + 1; j < lookaheadEnd; j++) {
+                const d2 = haversineDistance(
+                  { latitude: loc.coords.latitude, longitude: loc.coords.longitude },
+                  routeSegments[j].end
+                );
+                if (d2 < PROXIMITY_THRESHOLD) { caughtUpIdx = j; break; }
+              }
+              if (caughtUpIdx === -1) break; // 아직 어디에도 안 가까움 — 다음 콜백 대기
+
+              // curIdx..caughtUpIdx는 통째로 건너뛴 세그먼트다 — caughtUpIdx 자체도
+              // "언제 시작했는지" 모르는 채로 끝점만 확인된 것이라, elapsed를 만들면
+              // (now - 옛 시작시각) 그대로 공백 시간이 섞여 들어간다(unit 쪽에서 잡던
+              // "9.9m에 27700ms" 오염과 동일 패턴). 그래서 caughtUpIdx까지 전부 미측정
+              // 처리하고, 다음(caughtUpIdx+1)부터 "지금 막 도착한 지점"을 새 시작점으로
+              // 깨끗하게 다시 잰다. measuredMsRef는 이미 null로 채워져 있어(§1441
+              // "미통과·부분통과 → 저장 안 함") 따로 표시할 것도 없다 — signal A(bin)
+              // 쪽만 outsideSeoul과 동일하게 무효화해 거리·시간이 다음 bin에 안 섞이게 한다.
+              for (let k = curIdx; k <= caughtUpIdx; k++) {
+                binTrackerRef.current?.invalidateCurrent(now);
+              }
+              curIdx = caughtUpIdx + 1;
+              currentSegIdxRef.current = curIdx;
+              if (curIdx < routeSegments.length) {
+                segmentStartTimesRef.current[curIdx] = now;
+              }
+              continue; // 새 curIdx를 다음 while 반복에서 정상 경로로 재평가
+            }
 
             const elapsed = now - segmentStartTimesRef.current[curIdx];
             const nextSeg = curIdx + 1 < routeSegments.length ? routeSegments[curIdx + 1] : null;
+
+            // 오염 사유 둘 — 아래 measurementUnits 루프("skip 사유 둘")와 동일한 논리:
+            //  1) 이 콜백 한 번에 세그먼트를 2개 이상 지났다(segsThisTick>0) — 두
+            //     번째부터는 시작시각이 방금 같은 tick에 세팅돼 elapsed가 사실상 0.
+            //     실기기 콜백 지연(dt 최대 27.7s)으로 짧은 세그먼트 여러 개가 한
+            //     tick에 몰리면 흔히 나온다("첫 구간 과다측정 + 다음 2~3구간 0초"
+            //     증상 원인).
+            //  2) 이 세그먼트가 열려 있던 동안 GPS 공백/점프가 있었다
+            //     (segGapPendingAtStart) — 1개만 닫혀도 elapsed에 공백이 섞여있다.
+            const isCatchUpSeg = segsThisTick > 0 || segGapPendingAtStart;
+            if (segGapPendingAtStart && segsThisTick === 0) segGapConsumed = true;
 
             if (seg.outsideSeoul) {
               // 서울 밖(경사 데이터 없는 직선) 구간 — 측정·제출·신호 A/D 판단에서 제외.
               // GPS 공백/중도 종료 구간과 동일하게 현재 bin 을 무효화하고 그냥 지나간다.
               binTrackerRef.current?.invalidateCurrent(now);
             } else {
-              measuredMsRef.current[curIdx] = elapsed;
+              // 오염된 세그먼트는 measuredMsRef에 아예 안 남긴다(null 유지) — 종료
+              // 시 "미통과·부분통과 → 저장 안 함"(§1441)과 같은 경로로 자연스럽게
+              // 빠져서, RouteDetailScreen/MyPageScreen 양쪽 다 0초로 새지 않고
+              // 그 구간이 통째로 안 보이게 된다(가짜 값보다 낫다는 이 파이프라인
+              // 전체 원칙과 동일, unit 쪽 status='skipped'와 대응).
+              if (!isCatchUpSeg) {
+                measuredMsRef.current[curIdx] = elapsed;
+              }
 
               // BE 제출(submitSegment)은 더 이상 여기서 하지 않는다 — measurement_units
               // 기준(아래 별도 while 루프)으로만 나간다. measuredMsRef는 로컬 기록
@@ -1142,12 +1262,18 @@ export default function NavigationScreen({ navigation, route }: Props) {
               }
             }
 
+            segsThisTick += 1;
             curIdx += 1;
             currentSegIdxRef.current = curIdx;
             if (curIdx < routeSegments.length) {
               segmentStartTimesRef.current[curIdx] = now;
             }
           }
+          // 보조 리셋 경로 — 주 리셋은 신호 B 블록(정상 판정 성공 시 즉시, §1136)에서
+          // 일어난다. 여기 남겨두는 이유: 신호 B가 공백을 세팅한 바로 그 tick에
+          // 마침 세그먼트 경계도 함께 지나는 경우, 다음 tick의 신호 B를 기다릴
+          // 것 없이 이 tick에서 바로 소비·리셋해 다음 세그먼트부터는 정상 처리되게 한다.
+          if (segGapConsumed) segGapPendingRef.current = false;
 
           // 측정 파이프라인 v2 — measurement_units(≥30m) 기준 GPS 도착판정. 위
           // routeSegments 루프(신호 A/안내용)와 완전히 독립적으로 돈다 — 인덱스
@@ -1162,7 +1288,10 @@ export default function NavigationScreen({ navigation, route }: Props) {
             const sid = collectSessionIdRef.current ?? undefined;
             // 이 콜백 진입 시점의 오염 여부를 고정해 둔다 — 루프 도중 새로
             // 세팅될 일은 없지만(신호 B/AppState 핸들러는 이 루프보다 먼저 돈다),
-            // 소비 후 리셋 타이밍을 이 tick 하나로 명확히 하기 위함.
+            // 소비 후 리셋 타이밍을 이 tick 하나로 명확히 하기 위함. 이 시점의 값은
+            // 이미 이번 tick의 신호 B 블록을 거친 뒤다 — 이번 tick에서 정상 판정이
+            // 성공했으면 위에서 이미 false로 내려가 있을 수 있다(그 경우 이 unit은
+            // catch-up 사유로만 skip 여부가 갈린다).
             const gapPendingAtStart = unitGapPendingRef.current;
             let gapConsumed = false;
             let curUnitIdx = currentUnitIdxRef.current;
@@ -1175,7 +1304,53 @@ export default function NavigationScreen({ navigation, route }: Props) {
                 { latitude: loc.coords.latitude, longitude: loc.coords.longitude },
                 { latitude: endLat, longitude: endLng }
               );
-              if (distToUnitEnd >= PROXIMITY_THRESHOLD) break;
+              if (distToUnitEnd >= PROXIMITY_THRESHOLD) {
+                // routeSegments 루프와 동일한 문제 — curUnitIdx 끝점 15m을 콜백
+                // 공백/점프로 그냥 지나쳤으면 여기서 break만 해선 이 unit도,
+                // 이후 모든 unit도 영원히 안 닫힌다. 뒤쪽을 미리 훑어 지금
+                // 위치와 실제로 가까운 unit이 있으면 그 지점까지 건너뛴다.
+                let caughtUpIdx = -1;
+                const lookaheadEnd = Math.min(measurementUnits.length, curUnitIdx + 1 + SEGMENT_CATCHUP_LOOKAHEAD);
+                for (let j = curUnitIdx + 1; j < lookaheadEnd; j++) {
+                  const [jLng, jLat] = measurementUnits[j].end_coords;
+                  const dj = haversineDistance(
+                    { latitude: loc.coords.latitude, longitude: loc.coords.longitude },
+                    { latitude: jLat, longitude: jLng }
+                  );
+                  if (dj < PROXIMITY_THRESHOLD) { caughtUpIdx = j; break; }
+                }
+                if (caughtUpIdx === -1) break; // 아직 어디에도 안 가까움 — 다음 콜백 대기
+
+                // curUnitIdx..caughtUpIdx 전부 skip 처리한다 — caughtUpIdx도 포함해야
+                // 한다: unitStartTimesRef[caughtUpIdx]는 애초에 curUnitIdx가 열릴 때
+                // 세팅된(혹은 마운트 시 initTime으로 채워진) 값이라, 이 unit을 "정상
+                // 측정"으로 처리하면 elapsedMs에 건너뛴 구간 전체(길게는 세션 시작
+                // 이후 전체 경과)가 섞여 들어간다. caughtUpIdx+1부터 "지금 막 도착한
+                // 지점"을 새 시작점으로 깨끗하게 다시 잰다.
+                for (let k = curUnitIdx; k <= caughtUpIdx; k++) {
+                  const su = measurementUnits[k];
+                  const rid2 = serverRouteIdRef.current;
+                  if (rid2 !== null && sid) {
+                    const payload: MeasurementSegmentPayload = {
+                      sessionId: sid ?? "", unitIndex: k,
+                      distanceM: su.distance_m, slopePercent: su.slope_pct,
+                      status: "skipped",
+                      coordStartIdx: su.coord_start_idx, coordEndIdx: su.coord_end_idx,
+                      startCoords: su.start_coords, endCoords: su.end_coords,
+                    };
+                    getAuthToken().then((token) => {
+                      if (!token) return;
+                      submitSegment(rid2, payload, token).catch(() => {});
+                    }).catch(() => {});
+                  }
+                }
+                curUnitIdx = caughtUpIdx + 1;
+                currentUnitIdxRef.current = curUnitIdx;
+                if (curUnitIdx < measurementUnits.length) {
+                  unitStartTimesRef.current[curUnitIdx] = now;
+                }
+                continue; // 새 curUnitIdx를 다음 while 반복에서 정상 경로로 재평가
+              }
 
               // skip 사유 둘:
               //  1) 이 콜백 한 번에 unit을 2개 이상 지났다(catch-up) — 두 번째
@@ -1197,12 +1372,14 @@ export default function NavigationScreen({ navigation, route }: Props) {
                     distanceM: unit.distance_m, slopePercent: unit.slope_pct,
                     status: "skipped",
                     coordStartIdx: unit.coord_start_idx, coordEndIdx: unit.coord_end_idx,
+                    startCoords: unit.start_coords, endCoords: unit.end_coords,
                   }
                 : {
                     sessionId: sid ?? "", unitIndex: unitIdx,
                     distanceM: unit.distance_m, slopePercent: unit.slope_pct,
                     status: "measured", elapsedMs: now - unitStartTimesRef.current[unitIdx],
                     coordStartIdx: unit.coord_start_idx, coordEndIdx: unit.coord_end_idx,
+                    startCoords: unit.start_coords, endCoords: unit.end_coords,
                   };
 
               // sid가 없으면(동의 없음/모달 응답 전) BE가 session_id를 필수로
@@ -1222,9 +1399,12 @@ export default function NavigationScreen({ navigation, route }: Props) {
               }
             }
 
-            // 오염 플래그는 실제로 unit 하나를 닫는 데 소비했을 때만 리셋한다 —
-            // 아직 어떤 unit 경계도 안 지났다면(같은 tick에 도착판정 자체가 없었다면)
-            // 다음 콜백까지 계속 들고 있어야 그 다음에 닫히는 unit이 오염 처리된다.
+            // 이 리셋은 이제 보조 경로다 — 주 리셋은 위 신호 B 블록(정상 판정
+            // 성공 시 즉시)에서 일어난다. 여기 남겨두는 이유: 신호 B가 공백을
+            // 세팅한 바로 그 tick에 마침 unit 경계도 함께 지나는 경우, 그 unit은
+            // (gapPendingAtStart=true라) 여전히 skip 처리해야 하지만 다음 tick의
+            // 신호 B를 기다릴 것 없이 이 tick에서 바로 소비·리셋해 다음 unit부터는
+            // 정상 처리되게 한다.
             if (gapConsumed) unitGapPendingRef.current = false;
           }
 
@@ -1300,10 +1480,11 @@ export default function NavigationScreen({ navigation, route }: Props) {
           binTrackerRef.current?.invalidateCurrent(Date.now());
           lastGpsPosRef.current = null;
           lastGpsTimeRef.current = 0;
-          // 진행 중이던 measurementUnit도 같은 공백을 그대로 삼킨다 — 다음에
-          // 닫힐 때 status='skipped'로 나가도록 표시(위 신호 B 블록과 동일 플래그).
+          // 진행 중이던 measurementUnit/routeSegment 둘 다 같은 공백을 그대로
+          // 삼킨다 — 다음에 닫힐 때 각자 오염 처리되도록 표시(위 신호 B 블록과 동일 플래그).
           unitGapPendingRef.current = true;
-          if (__DEV__) console.warn(`[collect] 백그라운드 복귀 공백 ${gapS.toFixed(0)}s — 진행 중 bin/unit 무효화`);
+          segGapPendingRef.current  = true;
+          if (__DEV__) console.warn(`[collect] 백그라운드 복귀 공백 ${gapS.toFixed(0)}s — 진행 중 bin/unit/segment 무효화`);
         }
       }
     });
@@ -1357,9 +1538,10 @@ export default function NavigationScreen({ navigation, route }: Props) {
         journeyMapSegments,
         finalDestinationName,
         finalOriginName,
+        walkerType,
       }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [coordinates, navSegData, routeSegments, from, to, showSlopeMarkers, journeyMapPath, journeyMapSegments, finalDestinationName, finalOriginName]
+    [coordinates, navSegData, routeSegments, from, to, showSlopeMarkers, journeyMapPath, journeyMapSegments, finalDestinationName, finalOriginName, walkerType]
   );
 
   // 최초 진입 이후의 위치 갱신은 지도를 다시 그리지 않고 마커만 옮긴다.

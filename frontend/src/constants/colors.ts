@@ -71,8 +71,9 @@ export const C = {
 // 경사도 zone별 색상 — NavigationScreen(실제 GPS 안내)과 RouteMapView(경로 미리보기)가
 // 공유한다. 대중교통 탑승 구간(노선별 브랜드 색) 팔레트와는 톤이 겹치지 않게 분리되어 있다.
 export const ZONE_COLORS: Record<string, string> = {
-  flat:      '#4CAF50',
-  optimal:   '#2196F3',
-  warning:   '#FF9800',
-  forbidden: '#F44336',
+  flat:      '#4CAF50',  // 평지 — 초록
+  optimal:   '#FDD835',  // 완만 — 노랑 (기존 파랑은 위험도 상승 순서(초록→노랑→주황→빨강)에서
+                          // 벗어나 헷갈린다는 피드백으로 교체)
+  warning:   '#FF9800',  // 주의 — 주황
+  forbidden: '#F44336',  // 금지 — 빨강
 };

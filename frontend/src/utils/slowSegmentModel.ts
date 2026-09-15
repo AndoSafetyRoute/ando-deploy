@@ -2,16 +2,23 @@
 // 순수 로직만(단위 검증 대상). HTTP 는 src/api/slowSegments.ts, 화면은
 // src/screens/route/SlowSegmentFeedbackScreen.tsx.
 //
-// 흐름(사용자 최종 확정 · 잠금): 구간마다
-//   Q1 "소요시간 상위 10위 구간이에요. 불편했나요?"  예 / 아니오      (was_uncomfortable)
-//   Q2 Q1="예" 일 때만 → "힘듦 정도 1~10점"                         (hardship_score ∈ 1..10)
-//      Q1="아니오" 면 Q2 없이 다음 구간 (hardship_score = null)
+// 흐름(1단계 3버튼 — 2026-09 재설계, 이전 2단계 was_uncomfortable+hardship_score
+// 설계 대체): 구간마다
+//   "이 구간, 어떠셨나요?"  편했어요(+1) / 보통이었어요(0) / 힘들었어요(-1)  (verdict)
+//
+// 재설계 이유 — ① 예/아니오 2지선다는 "보통"과 "평지보다 편했다"를 구분 못 해
+// s_u(g) 보정항이 음의 방향(더 편함) 데이터를 아예 못 받는 커버리지 구멍이었다
+// (내리막처럼 속도는 빠른데 체감은 힘들 수 있는 비대칭 구간을 놓침). ② 10점
+// 척도는 명목상 해상도일 뿐 s_u(g)가 저차 보정항(매듭 3개 수준)이라 못 씀. ③
+// 지금 병목은 정밀도가 아니라 응답률(2단계 인터랙션 → 경로당 탭 최대 10회를
+// 1단계 최대 5회로 줄임). 3점이 부족하면(예: "힘들었어요" 응답이 과밀해 구분이
+// 안 되면) 그때 5점으로 확장 — 3→5는 쉽지만 반대는 데이터를 버려야 한다.
 //
 // 순위/필터는 BE(complete_navigation 시점에 미리 계산)에서 끝나 있고, GET 은
 // pace 상위 min(10, 유효구간수) 를 그대로 준다. BE 가 그래프 엣지(~5~10m)를 경사
 // bin(±1%p)으로 묶어 "사람이 인지하는 구간"으로 만든 뒤 순위를 매기므로, 한 항목은
 // routeSegments[seg_index .. seg_index_end] 범위를 가리킨다. FE 는 받은 스냅샷
-// 필드를 그대로 되돌려 싣고 Q1/Q2 만 얹어 POST 한다.
+// 필드를 그대로 되돌려 싣고 verdict 만 얹어 POST 한다.
 
 export type SlowSegment = {
   rank:          number;   // 1 = 가장 느린(오래 걸린) 구간
@@ -40,10 +47,9 @@ export type SlowSegmentsResponse = {
   meta?:     SlowSegmentsMeta;
 };
 
-export const HARDSHIP_MIN = 1;
-export const HARDSHIP_MAX = 10;
+export type Verdict = -1 | 0 | 1; // -1 힘들었어요 / 0 보통이었어요 / +1 편했어요
 
-// POST 한 건 — GET 스냅샷 필드를 그대로 되돌려 싣고 Q1/Q2 추가.
+// POST 한 건 — GET 스냅샷 필드를 그대로 되돌려 싣고 verdict 추가.
 export type SegmentHardshipAnswer = {
   seg_index:         number;
   seg_index_end:     number;
@@ -53,8 +59,7 @@ export type SegmentHardshipAnswer = {
   distance_m:        number;
   slope_pct:         number;
   zone:              string;
-  was_uncomfortable: boolean;        // Q1 (불편했나요) — 예=true
-  hardship_score:    number | null;  // Q2 — 1..10 정수. was_uncomfortable=false 면 null
+  verdict:           Verdict;
 };
 
 export type SegmentHardshipPayload = {
@@ -69,58 +74,34 @@ export function hasSlowSegments(r?: SlowSegmentsResponse | null): boolean {
   return !!r && r.eligible === true && Array.isArray(r.segments) && r.segments.length > 0;
 }
 
-/** 1..10 정수로 강제. 범위 밖/NaN 이면 null. */
-export function clampHardship(v: unknown): number | null {
-  const n = Math.round(Number(v));
-  if (!Number.isFinite(n) || n < HARDSHIP_MIN || n > HARDSHIP_MAX) return null;
-  return n;
+/** 한 구간 응답이 "완료"인지 — 3버튼 중 하나를 눌렀으면 그걸로 끝(추가 질문 없음). */
+export function isSegmentAnswerComplete(verdict: Verdict | undefined): boolean {
+  return verdict === -1 || verdict === 0 || verdict === 1;
 }
 
 /**
- * 한 구간 응답이 "완료"인지.
- *  - Q1=아니오 → 그걸로 완료
- *  - Q1=예    → 1..10 점수도 있어야 완료
- *  - Q1 미응답 → 미완
- */
-export function isSegmentAnswerComplete(
-  wasUncomfortable: boolean | undefined,
-  hardshipScore: number | null | undefined,
-): boolean {
-  if (wasUncomfortable === false) return true;
-  if (wasUncomfortable === true)  return clampHardship(hardshipScore) !== null;
-  return false;
-}
-
-/**
- * GET 구간 목록 + Q1/Q2 응답 → POST 본문.
- *  - Q1 이 아직 boolean 이 아닌(미응답) 구간은 제외.
- *  - Q1=아니오 면 hardship_score = null 로 고정.
+ * GET 구간 목록 + verdict 응답 → POST 본문.
+ *  - 아직 안 누른(undefined) 구간은 제외.
  *  - 순서는 입력(=rank) 순 유지.
  */
 export function buildSegmentAnswers(
   segments: SlowSegment[],
-  uncomfortableByIndex: Record<number, boolean | undefined>,
-  scoreByIndex: Record<number, number | null | undefined>,
+  verdictByIndex: Record<number, Verdict | undefined>,
   sessionId?: string | null,
 ): SegmentHardshipPayload {
   const answers: SegmentHardshipAnswer[] = (Array.isArray(segments) ? segments : [])
-    .filter((s) => typeof uncomfortableByIndex?.[s.seg_index] === "boolean")
-    .map((s) => {
-      const was_uncomfortable = uncomfortableByIndex[s.seg_index] as boolean;
-      const hardship_score = was_uncomfortable ? clampHardship(scoreByIndex?.[s.seg_index]) : null;
-      return {
-        seg_index:     s.seg_index,
-        seg_index_end: s.seg_index_end,
-        rank:          s.rank,
-        pace_s_per_m:  s.pace_s_per_m,
-        elapsed_ms:    s.elapsed_ms,
-        distance_m:    s.distance_m,
-        slope_pct:     s.slope_pct,
-        zone:          s.zone,
-        was_uncomfortable,
-        hardship_score,
-      };
-    });
+    .filter((s) => isSegmentAnswerComplete(verdictByIndex?.[s.seg_index]))
+    .map((s) => ({
+      seg_index:     s.seg_index,
+      seg_index_end: s.seg_index_end,
+      rank:          s.rank,
+      pace_s_per_m:  s.pace_s_per_m,
+      elapsed_ms:    s.elapsed_ms,
+      distance_m:    s.distance_m,
+      slope_pct:     s.slope_pct,
+      zone:          s.zone,
+      verdict:       verdictByIndex[s.seg_index] as Verdict,
+    }));
   return { session_id: sessionId ?? null, answers };
 }
 

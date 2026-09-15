@@ -299,6 +299,11 @@ export interface MeasurementSegmentPayload {
   // 해석이 깨짐 — 그래서 제출 시점에 직접 실어 보냄).
   coordStartIdx?: number;
   coordEndIdx?:   number;
+  // 실제 위/경도 — RouteDetailScreen "구간 설문조사"(나중에 평가)가 지도를
+  // 그리는 데 쓴다. measurement_units[i].start_coords/end_coords([lon, lat])를
+  // 그대로 되돌려 보낸다.
+  startCoords?: [number, number];
+  endCoords?:   [number, number];
 }
 
 export async function submitSegment(
@@ -318,6 +323,10 @@ export async function submitSegment(
       elapsed_ms:      seg.elapsedMs,
       coord_start_idx: seg.coordStartIdx,
       coord_end_idx:   seg.coordEndIdx,
+      start_lon:       seg.startCoords?.[0] ?? null,
+      start_lat:       seg.startCoords?.[1] ?? null,
+      end_lon:         seg.endCoords?.[0] ?? null,
+      end_lat:         seg.endCoords?.[1] ?? null,
     }),
   });
   if (!res.ok) throw new Error(`측정 단위 ${seg.unitIndex} 저장 실패`);

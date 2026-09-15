@@ -18,9 +18,13 @@ import {
   getRoutes,
   saveRoutes,
   formatDuration,
-  getSlopeEffort,
   RouteRecord,
 } from "../utils/storage";
+import {
+  classifySlopeZoneForMyPage,
+  MYPAGE_ZONE_COLORS,
+  type MyPageSlopeZoneKey,
+} from "../utils/slopeZone";
 import {
   getAuthToken,
   getUserRoutes,
@@ -56,28 +60,18 @@ const MODE_INFO: Record<string, { icon: string; label: string; color: string }> 
   },
 };
 
-const SLOPE_ZONES = [
-  {
-    key: "easy" as const,
-    emoji: "😊",
-    label: "평지",
-    range: "0~2%",
-    color: C.success,
-  },
-  {
-    key: "normal" as const,
-    emoji: "😐",
-    label: "완만",
-    range: "2~5%",
-    color: C.warn,
-  },
-  {
-    key: "hard" as const,
-    emoji: "😓",
-    label: "급경사",
-    range: "5%+",
-    color: C.danger,
-  },
+// 오르막/내리막을 나눠서 보여준다 — 유형별 임계값은 안내 중 지도와 동일하되
+// (utils/slopeZone.ts), 방향별로 색 계열을 분리(오르막 노랑/주황, 내리막
+// 하늘/파랑)해서 같은 "완만"이라도 오르막인지 내리막인지 한눈에 구분되게 했다.
+// forbidden 칸은 안 둔다 — 임계값이 넓어 실측상 사실상 안 나오고, 혹시
+// 나와도 classifySlopeZoneForMyPage가 같은 방향의 warning에 합산한다(경로상세
+// "구간별 난이도 요약"은 그대로 4단계 유지 — 거긴 안 바꾸기로 함).
+const SLOPE_ZONES: { key: MyPageSlopeZoneKey; emoji: string; label: string; color: string }[] = [
+  { key: "flat",         emoji: "😊", label: "평지",       color: MYPAGE_ZONE_COLORS.flat },
+  { key: "up_optimal",   emoji: "🙂", label: "오르막 완만", color: MYPAGE_ZONE_COLORS.up_optimal },
+  { key: "up_warning",   emoji: "😓", label: "오르막 주의", color: MYPAGE_ZONE_COLORS.up_warning },
+  { key: "down_optimal", emoji: "🙂", label: "내리막 완만", color: MYPAGE_ZONE_COLORS.down_optimal },
+  { key: "down_warning", emoji: "😓", label: "내리막 주의", color: MYPAGE_ZONE_COLORS.down_warning },
 ];
 
 function pad(n: number) {
@@ -96,14 +90,12 @@ function StatChip({ label, value }: { label: string; value: string }) {
 function SlopeBar({
   emoji,
   label,
-  range,
   ms,
   maxMs,
   color,
 }: {
   emoji: string;
   label: string;
-  range: string;
   ms: number;
   maxMs: number;
   color: string;
@@ -119,7 +111,6 @@ function SlopeBar({
       <View style={styles.slopeInfo}>
         <View style={styles.slopeLabelRow}>
           <Text style={styles.slopeName}>{label}</Text>
-          <Text style={styles.slopeRange}>{range}</Text>
         </View>
 
         <View style={styles.slopeBarBg}>
@@ -275,24 +266,27 @@ export default function MyPageScreen() {
     }, [])
   );
 
-  const slopeMs: Record<"easy" | "normal" | "hard", number> = {
-    easy: 0,
-    normal: 0,
-    hard: 0,
+  const slopeMs: Record<MyPageSlopeZoneKey, number> = {
+    flat: 0,
+    up_optimal: 0,
+    up_warning: 0,
+    down_optimal: 0,
+    down_warning: 0,
   };
 
+  // 유형별 임계값 분류라 route.walkerType이 필요 — classifySlopeZoneForMyPage가
+  // 안내 중 지도 색과 동일 판정 위에 방향(오르막/내리막)만 더 나눈다(이전엔
+  // 여기만 유형 무관 고정 2%/5% 컷이었음). 예전 버그: getSlopeEffort(segment.
+  // slopePercent)가 절댓값 없이 호출돼 내리막 구간이 전부 "평지"로 잘못
+  // 집계됐다 — classifySlopeZoneForMyPage는 내부에서 abs 처리.
   routes.forEach((route) => {
     (route.segments ?? []).forEach((segment) => {
-      const effort = getSlopeEffort(segment.slopePercent) as
-        | "easy"
-        | "normal"
-        | "hard";
-
-      slopeMs[effort] += segment.elapsedMs ?? 0;
+      const zone = classifySlopeZoneForMyPage(segment.slopePercent, route.walkerType);
+      slopeMs[zone] += segment.elapsedMs ?? 0;
     });
   });
 
-  const maxSlopeMs = Math.max(slopeMs.easy, slopeMs.normal, slopeMs.hard, 1);
+  const maxSlopeMs = Math.max(...Object.values(slopeMs), 1);
 
   const totalDistM = routes.reduce(
     (sum, route) =>
@@ -437,7 +431,6 @@ export default function MyPageScreen() {
                   key={zone.key}
                   emoji={zone.emoji}
                   label={zone.label}
-                  range={zone.range}
                   ms={slopeMs[zone.key]}
                   maxMs={maxSlopeMs}
                   color={zone.color}

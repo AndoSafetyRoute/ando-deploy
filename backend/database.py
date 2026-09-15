@@ -331,31 +331,13 @@ def init_db():
             )
         """))
 
-        # 신호 D: 구간 주관 평가
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS segment_feedback (
-                id             SERIAL PRIMARY KEY,
-                uid            TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
-                route_id       INT  REFERENCES routes(id) ON DELETE CASCADE,
-                slope_mean     FLOAT NOT NULL,
-                length_m       FLOAT NOT NULL,
-                verdict        SMALLINT NOT NULL,
-                created_at     TIMESTAMPTZ DEFAULT NOW()
-            )
-        """))
-        # verdict 는 -1(불편)/0(보통)/+1(편함) 만 허용 — FE 신뢰에만 의존하지 않도록
-        # DB 레벨에서 못박는다 (docs/personalization-data-collection-plan.md, 이슈 #6).
-        conn.execute(text("""
-            DO $$ BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM pg_constraint
-                    WHERE conname = 'chk_verdict' AND conrelid = 'segment_feedback'::regclass
-                ) THEN
-                    ALTER TABLE segment_feedback
-                        ADD CONSTRAINT chk_verdict CHECK (verdict IN (-1, 0, 1));
-                END IF;
-            END $$
-        """))
+        # 신호 D 구 설계(구간 주관 평가, -1/0/+1)의 잔재 — 화면 자체가
+        # SlowSegmentFeedbackScreen(segment_hardship_feedback 테이블)으로 대체된 지
+        # 오래고, FE의 유일한 작성 경로(CollectSession.addSegmentFeedback)를 호출하는
+        # 곳이 어디에도 없어 실질적으로 죽은 테이블이었다(실측: 0행). 같은 이름의
+        # verdict 컬럼이 segment_hardship_feedback에도 새로 생기면서(아래) "verdict가
+        # 두 테이블에 있는데 뭐가 진짜냐"는 혼동을 막기 위해 정리한다.
+        conn.execute(text("DROP TABLE IF EXISTS segment_feedback CASCADE"))
 
         # session_route_profile — route_id 가 NULL 인(=/navigation/start 실패) 세션도
         # "어떤 경로였나"를 잃지 않도록, FE 가 세션 첫 배치에 실어 보내는 경로 형상을
@@ -471,9 +453,16 @@ def init_db():
             "ALTER TABLE route_slow_segments ADD COLUMN IF NOT EXISTS seg_index_end INT"
         ))
 
-        # 구간별 체감 난이도 응답. Q1 was_uncomfortable(불편했나요 예/아니오) +
-        # Q2 hardship_score(예일 때만 1~10점). 평가 시점의 경사·소요시간 스냅샷을
-        # 함께 박아 두어 추후 누적 데이터를 분석에 쓸 수 있게 한다(사용자 요구).
+        # 구간별 체감 난이도 응답. 2단계(불편했나요 예/아니오 → 1~10점)에서 1단계
+        # 3버튼(편했어요/보통이었어요/힘들었어요, verdict -1/0/+1)으로 재설계 —
+        # 이유 셋: ① was_uncomfortable=false가 "보통"과 "평지보다 편함"을 구분 못 해
+        # s_u(g) 보정항이 음의 방향(더 편함)으로 갈 데이터를 아예 못 받는 커버리지
+        # 구멍이었음(척도를 세밀하게 해도 안 풀림), ② 10점 척도는 명목상 해상도일
+        # 뿐 훈련 안 된 응답자는 3~4단계에 몰리고 s_u(g)도 자유도가 가장 낮은
+        # 보정항(매듭 3개 수준)이라 그 이상을 못 씀, ③ 지금 병목은 정밀도가 아니라
+        # 응답률(segment_hardship_feedback 실측 1행) — 2단계 인터랙션(최대 탭 10회)을
+        # 1단계(최대 5회)로 줄여 응답률을 올리는 게 우선. 평가 시점의 경사·소요시간
+        # 스냅샷을 함께 박아 두는 것은 기존과 동일.
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS segment_hardship_feedback (
                 id                SERIAL PRIMARY KEY,
@@ -488,22 +477,54 @@ def init_db():
                 distance_m        FLOAT NOT NULL,
                 slope_pct         FLOAT NOT NULL,
                 zone              TEXT,
-                was_uncomfortable BOOLEAN NOT NULL,
-                hardship_score    SMALLINT,
+                verdict           SMALLINT NOT NULL,
                 answered_at       TIMESTAMPTZ DEFAULT NOW(),
                 UNIQUE (route_id, seg_index),
-                CONSTRAINT chk_hardship_score
-                    CHECK (hardship_score IS NULL OR hardship_score BETWEEN 1 AND 10),
-                CONSTRAINT chk_hardship_consistency
-                    CHECK (was_uncomfortable OR hardship_score IS NULL)
+                CONSTRAINT chk_hardship_verdict
+                    CHECK (verdict IN (-1, 0, 1))
             )
         """))
         conn.execute(text(
             "ALTER TABLE segment_hardship_feedback ADD COLUMN IF NOT EXISTS seg_index_end INT"
         ))
+        # ── 구 스키마(was_uncomfortable/hardship_score) → verdict 마이그레이션 ──
+        # 파일럿 시작 전이라 실 데이터가 1행뿐이라 비용이 사실상 0(2026-09-14
+        # 확인: id=5, was_uncomfortable=false → verdict=0으로 이관). 컬럼 존재
+        # 여부로 감싸서 여러 번 재기동해도 안전(첫 실행에만 실제로 동작).
+        conn.execute(text("""
+            DO $$ BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'segment_hardship_feedback' AND column_name = 'was_uncomfortable'
+                ) THEN
+                    ALTER TABLE segment_hardship_feedback ADD COLUMN IF NOT EXISTS verdict SMALLINT;
+                    UPDATE segment_hardship_feedback
+                        SET verdict = CASE WHEN was_uncomfortable THEN -1 ELSE 0 END
+                        WHERE verdict IS NULL;
+                    ALTER TABLE segment_hardship_feedback DROP CONSTRAINT IF EXISTS chk_hardship_consistency;
+                    ALTER TABLE segment_hardship_feedback DROP CONSTRAINT IF EXISTS chk_hardship_score;
+                    ALTER TABLE segment_hardship_feedback DROP COLUMN was_uncomfortable;
+                END IF;
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'segment_hardship_feedback' AND column_name = 'hardship_score'
+                ) THEN
+                    ALTER TABLE segment_hardship_feedback DROP COLUMN hardship_score;
+                END IF;
+                ALTER TABLE segment_hardship_feedback ALTER COLUMN verdict SET NOT NULL;
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'chk_hardship_verdict' AND conrelid = 'segment_hardship_feedback'::regclass
+                ) THEN
+                    ALTER TABLE segment_hardship_feedback
+                        ADD CONSTRAINT chk_hardship_verdict CHECK (verdict IN (-1, 0, 1));
+                END IF;
+            END $$
+        """))
+        conn.execute(text("DROP INDEX IF EXISTS idx_seg_hardship_analysis"))
         conn.execute(text("""
             CREATE INDEX IF NOT EXISTS idx_seg_hardship_analysis
-            ON segment_hardship_feedback (slope_pct, pace_s_per_m, was_uncomfortable)
+            ON segment_hardship_feedback (slope_pct, pace_s_per_m, verdict)
         """))
 
         # ── 측정 파이프라인 v2 (Supabase 콘솔에서 먼저 생성·검증한 스키마를 그대로
@@ -559,6 +580,17 @@ def init_db():
         conn.execute(text(
             "ALTER TABLE navigation_measurements ADD COLUMN IF NOT EXISTS coord_end_idx INT"
         ))
+        # start/end 위/경도 — RouteDetailScreen "구간 설문조사"(나중에 평가)가
+        # 이 구간이 지도에서 어디인지 그려야 하는데, coord_start_idx/coord_end_idx는
+        # /route 응답의 좌표 배열 인덱스일 뿐 그 배열 자체를 저장해 두지 않아서
+        # 나중엔 역참조가 안 된다(routes.route_geom도 현재 아무 데서도 채우지
+        # 않음). 그래서 제출 시점에 실제 좌표를 직접 같이 저장한다 — FE가
+        # measurement_units[i].start_coords/end_coords를 이미 갖고 있어 비용이
+        # 거의 없다. nullable — 이 컬럼 추가 이전 행과 호환.
+        for col in ("start_lat", "start_lon", "end_lat", "end_lon"):
+            conn.execute(text(
+                f"ALTER TABLE navigation_measurements ADD COLUMN IF NOT EXISTS {col} DOUBLE PRECISION"
+            ))
 
         # GPS 원본 궤적 — /collect/gps-batch 배치 삽입.
         conn.execute(text("""
@@ -1113,6 +1145,10 @@ def add_navigation_measurement(
     status: str,
     coord_start_idx: int | None = None,
     coord_end_idx: int | None = None,
+    start_lat: float | None = None,
+    start_lon: float | None = None,
+    end_lat: float | None = None,
+    end_lon: float | None = None,
 ) -> bool:
     """구간(측정 단위) 완료/스킵 시 navigation_measurements에 행 삽입 — 멱등.
 
@@ -1144,10 +1180,10 @@ def add_navigation_measurement(
     db.execute(text("""
         INSERT INTO navigation_measurements
             (route_id, session_id, unit_index, distance_m, slope_pct, elapsed_ms, status,
-             coord_start_idx, coord_end_idx)
+             coord_start_idx, coord_end_idx, start_lat, start_lon, end_lat, end_lon)
         VALUES
             (:route_id, :session_id, :unit_index, :distance_m, :slope_pct, :elapsed_ms, :status,
-             :coord_start_idx, :coord_end_idx)
+             :coord_start_idx, :coord_end_idx, :start_lat, :start_lon, :end_lat, :end_lon)
         ON CONFLICT (route_id, unit_index) DO NOTHING
     """), {
         "route_id":        route_id,
@@ -1159,6 +1195,10 @@ def add_navigation_measurement(
         "status":          status,
         "coord_start_idx": coord_start_idx,
         "coord_end_idx":   coord_end_idx,
+        "start_lat":       start_lat,
+        "start_lon":       start_lon,
+        "end_lat":         end_lat,
+        "end_lon":         end_lon,
     })
     db.commit()
     return True
@@ -1572,19 +1612,10 @@ def save_collect_batch(
             "chosen_kind": route_choice.get("chosen_kind"),
         })
 
-    for f in segment_feedback_in:
-        db.execute(text("""
-            INSERT INTO segment_feedback
-                (uid, route_id, slope_mean, length_m, verdict)
-            VALUES
-                (:uid, :route_id, :slope_mean, :length_m, :verdict)
-        """), {
-            "uid":        uid,
-            "route_id":   f.get("route_id"),
-            "slope_mean": f["slope_mean"],
-            "length_m":   f["length_m"],
-            "verdict":    f["verdict"],
-        })
+    # segment_feedback 테이블은 삭제됐다(위 init_db 참고, 실질적으로 죽은
+    # 신호였음 — FE가 이 필드를 채워 보낸 적이 없어 segment_feedback_in은 항상
+    # 빈 배열이었다). 파라미터/응답 필드는 그대로 남겨 /collect/batch 요청
+    # 바디 계약을 안 건드린다 — 그냥 아무 데도 쓰지 않고 개수만 되돌려준다.
 
     db.commit()
     return {
@@ -1876,6 +1907,49 @@ def get_slow_segments(db: Session, route_id: int, uid: str) -> dict | None:
     return {"eligible": True, "route_id": route_id, "segments": segments, "meta": meta}
 
 
+def get_route_measurements(db: Session, route_id: int, uid: str) -> dict | None:
+    """RouteDetailScreen 용 — navigation_measurements(BE 실측, 신뢰 소스)를 그대로 반환.
+    소유자가 아니거나 경로가 없으면 None(호출측이 404) — get_slow_segments와 동일 패턴.
+
+    status='measured' 행만 돌려준다 — 'skipped'는 elapsed_ms가 없어 화면에 보여줄
+    소요시간이 없고, FE 로컬(measuredMsRef) 쪽도 이미 미측정 구간은 저장하지 않는
+    동일한 "모아진 것만 남긴다" 원칙을 쓰고 있다(§ navigation_measurements 설계 메모).
+    """
+    if not engine:
+        return None
+
+    owns = db.execute(
+        text("SELECT status FROM routes WHERE id = :id AND uid = :uid"),
+        {"id": route_id, "uid": uid},
+    ).fetchone()
+    if not owns:
+        return None
+
+    rows = db.execute(text("""
+        SELECT unit_index, distance_m, slope_pct, elapsed_ms,
+               start_lat, start_lon, end_lat, end_lon
+        FROM navigation_measurements
+        WHERE route_id = :rid AND status = 'measured'
+        ORDER BY unit_index ASC
+    """), {"rid": route_id}).fetchall()
+
+    def _coords(lat, lon):
+        # [lon, lat] — FE MeasurementUnit.start_coords/end_coords와 동일한
+        # GeoJSON 순서. 이 컬럼 추가 이전에 쌓인 행은 None(지도 없이 폴백).
+        return [float(lon), float(lat)] if lat is not None and lon is not None else None
+
+    segments = [{
+        "index":        int(r[0]),
+        "distance_m":   round(float(r[1]), 1),
+        "slope_pct":    round(float(r[2]), 2),
+        "elapsed_ms":   int(r[3]),
+        "start_coords": _coords(r[4], r[5]),
+        "end_coords":   _coords(r[6], r[7]),
+    } for r in rows]
+
+    return {"route_id": route_id, "segments": segments}
+
+
 def save_segment_hardship_feedback(
     db: Session,
     route_id: int,
@@ -1886,7 +1960,7 @@ def save_segment_hardship_feedback(
     """
     구간 체감 난이도 응답 저장 (upsert on route_id+seg_index).
     각 answer: seg_index, rank, pace_s_per_m, elapsed_ms, distance_m, slope_pct,
-    zone, was_uncomfortable, hardship_score(예일 때만 1~10, 아니면 None).
+    zone, verdict(-1 힘들었어요 / 0 보통이었어요 / +1 편했어요, 1단계 3버튼).
     소유자가 아니거나 경로가 없으면 None.
     """
     if not engine:
@@ -1901,11 +1975,9 @@ def save_segment_hardship_feedback(
 
     count = 0
     for a in answers:
-        was_unc = bool(a["was_uncomfortable"])
-        raw_score = a.get("hardship_score")
-        score = int(raw_score) if (was_unc and raw_score is not None) else None
-        if score is not None:
-            score = max(1, min(10, score))
+        verdict = int(a["verdict"])
+        if verdict not in (-1, 0, 1):
+            raise ValueError(f"seg_index={a.get('seg_index')}: verdict는 -1/0/1이어야 합니다")
 
         seg_end = a.get("seg_index_end")
         seg_end = int(seg_end) if seg_end is not None else None
@@ -1913,32 +1985,63 @@ def save_segment_hardship_feedback(
         db.execute(text("""
             INSERT INTO segment_hardship_feedback
                 (uid, route_id, session_id, seg_index, seg_index_end, rank, pace_s_per_m,
-                 elapsed_ms, distance_m, slope_pct, zone,
-                 was_uncomfortable, hardship_score)
+                 elapsed_ms, distance_m, slope_pct, zone, verdict)
             VALUES
                 (:uid, :route_id, :session_id, :seg_index, :seg_end, :rank, :pace,
-                 :elapsed_ms, :distance_m, :slope_pct, :zone,
-                 :was_unc, :score)
+                 :elapsed_ms, :distance_m, :slope_pct, :zone, :verdict)
             ON CONFLICT (route_id, seg_index) DO UPDATE SET
-                session_id        = EXCLUDED.session_id,
-                seg_index_end     = EXCLUDED.seg_index_end,
-                rank              = EXCLUDED.rank,
-                pace_s_per_m      = EXCLUDED.pace_s_per_m,
-                elapsed_ms        = EXCLUDED.elapsed_ms,
-                distance_m        = EXCLUDED.distance_m,
-                slope_pct         = EXCLUDED.slope_pct,
-                zone              = EXCLUDED.zone,
-                was_uncomfortable = EXCLUDED.was_uncomfortable,
-                hardship_score    = EXCLUDED.hardship_score,
-                answered_at       = NOW()
+                session_id    = EXCLUDED.session_id,
+                seg_index_end = EXCLUDED.seg_index_end,
+                rank          = EXCLUDED.rank,
+                pace_s_per_m  = EXCLUDED.pace_s_per_m,
+                elapsed_ms    = EXCLUDED.elapsed_ms,
+                distance_m    = EXCLUDED.distance_m,
+                slope_pct     = EXCLUDED.slope_pct,
+                zone          = EXCLUDED.zone,
+                verdict       = EXCLUDED.verdict,
+                answered_at   = NOW()
         """), {
             "uid": uid, "route_id": route_id, "session_id": session_id,
             "seg_index": int(a["seg_index"]), "seg_end": seg_end, "rank": int(a["rank"]),
             "pace": float(a["pace_s_per_m"]), "elapsed_ms": int(a["elapsed_ms"]),
             "distance_m": float(a["distance_m"]), "slope_pct": float(a["slope_pct"]),
-            "zone": a.get("zone"), "was_unc": was_unc, "score": score,
+            "zone": a.get("zone"), "verdict": verdict,
         })
         count += 1
 
     db.commit()
     return {"ok": True, "count": count}
+
+
+def get_segment_hardship_feedback(db: Session, route_id: int, uid: str) -> dict | None:
+    """이 경로에서 사용자가 실제로 답한 D 신호(주관 평가) 응답 목록.
+    RouteDetailScreen이 객관 경사 분류(getSlopeEffort)와 나란히 보여줄 때 쓴다.
+    seg_index는 unit_index다 — navigation_measurements 기준(서버 소스)
+    RouteDetailScreen에만 안전하게 매칭된다. 로컬 폴백(routeSegments raw edge
+    인덱스)에는 이 인덱스 체계가 안 맞으니 FE가 dataSource==='server'일 때만
+    써야 한다(같은 종류의 인덱스 불일치를 이미 measurementUnits 쪽에서 한 번
+    겪었음). 소유자가 아니거나 경로가 없으면 None(호출측이 404)."""
+    if not engine:
+        return None
+
+    owns = db.execute(
+        text("SELECT 1 FROM routes WHERE id = :id AND uid = :uid"),
+        {"id": route_id, "uid": uid},
+    ).fetchone()
+    if not owns:
+        return None
+
+    rows = db.execute(text("""
+        SELECT seg_index, seg_index_end, verdict
+        FROM segment_hardship_feedback
+        WHERE route_id = :rid
+        ORDER BY seg_index ASC
+    """), {"rid": route_id}).fetchall()
+
+    answers = [{
+        "seg_index":     int(r[0]),
+        "seg_index_end": int(r[1]) if r[1] is not None else int(r[0]),
+        "verdict":       int(r[2]),
+    } for r in rows]
+
+    return {"route_id": route_id, "answers": answers}

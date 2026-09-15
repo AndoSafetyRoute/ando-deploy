@@ -7,6 +7,7 @@ import type {
   SlowSegmentsResponse,
   SegmentHardshipPayload,
   SegmentHardshipResponse,
+  Verdict,
 } from "../utils/slowSegmentModel";
 
 /**
@@ -52,7 +53,7 @@ export async function getSlowSegments(
 
 /**
  * POST /navigation/{routeId}/segment-hardship-feedback  (upsert)
- * GET 으로 받은 스냅샷 필드를 그대로 되돌려 실어 보낸다 + was_uncomfortable(Q1) / hardship_score(Q2).
+ * GET 으로 받은 스냅샷 필드를 그대로 되돌려 실어 보낸다 + verdict(1단계 3버튼: -1/0/+1).
  */
 export async function postSegmentHardshipFeedback(
   routeId: number | string,
@@ -76,6 +77,49 @@ export async function postSegmentHardshipFeedback(
       throw new Error(`segment-hardship-feedback ${res.status}: ${text.slice(0, 200)}`);
     }
     return (await res.json()) as SegmentHardshipResponse;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export type SegmentHardshipAnswerSummary = {
+  seg_index:     number;
+  seg_index_end: number;
+  verdict:       Verdict;
+};
+
+export type GetSegmentHardshipFeedbackResponse = {
+  route_id: number;
+  answers:  SegmentHardshipAnswerSummary[];
+};
+
+/**
+ * GET /navigation/{routeId}/segment-hardship-feedback
+ * 이 경로에서 실제로 답한 D 신호(주관 평가) 목록 — RouteDetailScreen용.
+ * seg_index는 unit_index다: navigation_measurements 기준(서버 소스) 구간에만
+ * 안전하게 매칭된다. 로컬 폴백(routeSegments raw edge 인덱스) segments에는
+ * 인덱스 체계가 달라 맞지 않으니, 호출측이 dataSource==='server'일 때만 불러야
+ * 한다(측정 파이프라인 v2에서 이미 겪은 것과 같은 인덱스 불일치).
+ */
+export async function getSegmentHardshipFeedback(
+  routeId: number | string,
+  idToken?: string,
+): Promise<GetSegmentHardshipFeedbackResponse> {
+  const token = idToken ?? (await getAuthToken());
+  if (!token) throw new Error("no-auth-token");
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const res = await fetch(`${BASE_URL}${SEGMENT_HARDSHIP_FEEDBACK_PATH(routeId)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal:  controller.signal,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`segment-hardship-feedback(get) ${res.status}: ${text.slice(0, 200)}`);
+    }
+    return (await res.json()) as GetSegmentHardshipFeedbackResponse;
   } finally {
     clearTimeout(timer);
   }

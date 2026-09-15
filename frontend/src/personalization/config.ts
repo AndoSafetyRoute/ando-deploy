@@ -41,9 +41,19 @@ export const SLOW_SEGMENTS_PATH = (routeId: number | string) =>
 export const SEGMENT_HARDSHIP_FEEDBACK_PATH = (routeId: number | string) =>
   `/navigation/${routeId}/segment-hardship-feedback`;
 
+// RouteDetailScreen — navigation_measurements(BE 실측) 조회. 동의 무관하게
+// 호출은 가능하나, 동의 안 했거나 서버 저장 실패면 segments가 빈 배열로 온다.
+export const ROUTE_MEASUREMENTS_PATH = (routeId: number | string) =>
+  `/navigation/${routeId}/measurements`;
+
 // ── 백엔드 계약 (인계 §3.1 / ando-BE app.py) ────────────────────────────────
 // 실제 응답/스펙과 이름이 다르면 여기 상수만 고치면 나머지 코드가 따라간다.
 export const COLLECT_BATCH_PATH   = "/collect/batch";
+// beginCollection() 시점에 독립적으로 sessions 행을 만든다 — /navigation/start의
+// session_id 파라미터(동의 모달 응답을 기다리지 않고 즉시 나감)에만 기대면 "동의가
+// unknown이었다가 뒤늦게 granted"된 첫 걸음의 세션이 영영 유실된다(실측: uid 9명·
+// route 102개 중 session 1건). 두 경로 모두 session_id가 PK라 중복 호출은 안전.
+export const COLLECT_SESSION_START_PATH = "/collect/session/start";
 export const ROUTE_PATH           = "/route";
 export const ROUTE_CANDIDATES_KEY = "candidates";        // 요청 필드: "single" | "compare"
 export const ROUTE_CANDIDATES_COMPARE = "compare";
@@ -74,9 +84,16 @@ export const MEASUREMENT_SCHEMA_VERSION = 1;
 export const SLOPE_BIN_WIDTH_PCT = 0.5;   // ando_ml_plan_v2 §4 설계상수 — 고정
 
 // 직전 GPS 픽스와의 공백이 이보다 길면: 순간속도 표본 제외 + 진행 중이던 bin
-// 관측 전체 무효화(invalidateCurrent). 보행 1.2m/s 로 10초면 12m 이동이라 그
-// 사이 경사가 여러 bin 을 지날 수 있어 귀속이 모호해진다 (Q&A #5: 30→10).
-export const SPEED_SAMPLE_MAX_GAP_S = 10;
+// 관측 전체 무효화(invalidateCurrent). 원래 10초(Q&A #5: 30→10)였으나 실기기
+// 세션(sess-1789364304261-iy39nwa8, route 169) gps_traces 실측에서 콜백 간격
+// dt 가 중앙값 6.9s·p75 12.9s·5s 미만 표본 0건으로 나왔다 — GPS_WATCH_OPTIONS
+// .timeInterval=3000ms은 실기기(OS 배터리 최적화 + distanceInterval 조합)에서
+// 전혀 보장되지 않고, dt>=10s 콜백이 42%(33/78)라 10s 임계값은 "정상 콜백
+// 지연"을 전부 공백으로 오판정해 unitGapPendingRef를 사실상 상시 true로
+// 만들고 있었다(navigation_measurements 전량 status='skipped' 원인). 20s로
+// 올려 정상 분포(p75=12.9s)는 통과시키되, 관측된 실제 이상치(27.7s, 아마
+// 터널/실내 등 진짜 GPS 유실)는 여전히 걸러지는 수준으로 잡는다.
+export const SPEED_SAMPLE_MAX_GAP_S = 20;
 
 // 직전 픽스에서 이보다 크게 튀면 점프(지하도·고층 사이 등)로 보고: 그 표본만이
 // 아니라 진행 중이던 bin 관측 전체를 무효화한다 — 점프 앞뒤로 거리·시간이
