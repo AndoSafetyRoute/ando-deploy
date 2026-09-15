@@ -225,6 +225,20 @@ def _build_graph_legacy(data: dict) -> nx.DiGraph:
     print(f"[그래프 구성·legacy] 노드: {G.number_of_nodes():,}  엣지: {G.number_of_edges():,}")
     return _connect_components(G, BRIDGE_GAP_M)
 
+def _incident_layers(G: nx.DiGraph, nd) -> set:
+    """nd 에 붙은 실제(원본 OSM) 엣지들의 layer 집합. 없으면 {0}(지상 가정).
+
+    snap/bridge 로 나중에 추가된 인공 엣지(항상 layer=0)는 제외한다 — 안 그러면
+    한 번 잘못 이어진 연결이 layer 집합을 오염시켜 다음 후보 판정에도 번진다.
+
+    primary/secondary 도입 후 고가/지하(layer≠0) 구간이 늘면서, 평면좌표만 보는
+    snap/bridge 가 고가차도와 그 아래 지상도로를 잘못 이어버리는 사례가 실측
+    8,229건 확인됨(스캔 스크립트, SNAP_TOL_M=5m 기준) — 이 함수로 방지한다.
+    """
+    layers = {a.get("layer", 0) for _, _, a in G.out_edges(nd, data=True)
+            if a.get("highway") not in ("snap", "bridge")}
+    return layers or {0}
+
 
 def _snap_nearby_nodes(G: nx.DiGraph, tol_m: float) -> int:
     """tol_m 이내인데 엣지로 이어지지 않은 노드쌍에 짧은 보행 링크를 추가한다.
@@ -280,6 +294,8 @@ def _snap_nearby_nodes(G: nx.DiGraph, tol_m: float) -> int:
         d = haversine(ud["lon"], ud["lat"], vd["lon"], vd["lat"])
         if d < 0.2:               # 사실상 동일 노드 (round 6dp 잔차) — 스킵
             continue
+        if not (_incident_layers(G, u) & _incident_layers(G, v)):
+            continue               # 고가/지하 등 실제 layer 가 겹치지 않음 — 오연결 방지
         eu = ud.get("elevation", 0.0) or 0.0
         ev = vd.get("elevation", 0.0) or 0.0
         # slope 크기는 인접 실제 엣지에서 상속한다. 5m 링크에 DEM 을 직접 계산하면
@@ -366,10 +382,13 @@ def _connect_components(G: nx.DiGraph, bridge_gap_m: float) -> nx.DiGraph:
         if _use_kdtree:
             for u in sample:
                 u_idx = node_to_idx[u]
+                u_layers = _incident_layers(G, u)
                 for vidx in tree.query_ball_point(coords_m[u_idx], r=search_r):
                     v = node_list[vidx]
                     if v not in main_set or v == u:
                         continue
+                    if not (u_layers & _incident_layers(G, v)):
+                        continue   # 고가/지하 등 실제 layer 가 겹치지 않음 — 오연결 방지
                     ud, vd = G.nodes[u], G.nodes[v]
                     d = haversine(ud["lon"], ud["lat"], vd["lon"], vd["lat"])
                     if d < best_dist:
@@ -381,7 +400,10 @@ def _connect_components(G: nx.DiGraph, bridge_gap_m: float) -> nx.DiGraph:
             main_list = list(main_set)
             for u in small_list:
                 ud = G.nodes[u]
+                u_layers = _incident_layers(G, u)
                 for v in main_list:
+                    if not (u_layers & _incident_layers(G, v)):
+                        continue   # 고가/지하 등 실제 layer 가 겹치지 않음 — 오연결 방지
                     vd = G.nodes[v]
                     d  = haversine(ud["lon"], ud["lat"], vd["lon"], vd["lat"])
                     if d < best_dist:

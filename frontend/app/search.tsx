@@ -922,12 +922,14 @@ const styles = StyleSheet.create({
 
   bookmarkRow: {
     flexGrow: 0,
+    height: 40,
     marginTop: 12,
   },
 
   bookmarkRowContent: {
     alignItems: "center",
     paddingRight: 8,
+    paddingVertical: 2,
   },
 
   bookmarkChip: {
@@ -952,12 +954,14 @@ const styles = StyleSheet.create({
 
   categoryRow: {
     flexGrow: 0,
+    height: 40,
     marginTop: 10,
   },
 
   categoryRowContent: {
     alignItems: "center",
     paddingRight: 8,
+    paddingVertical: 2,
   },
 
   categoryChip: {

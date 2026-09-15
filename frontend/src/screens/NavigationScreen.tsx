@@ -448,7 +448,7 @@ function makeKakaoMapHtml({
         <div id="legendBox" class="legend hidden">
           <div class="legend-title">경로 색상 안내</div>
           <div class="legend-row"><span class="legend-line" style="background:#4CAF50"></span>평지 구간</div>
-          <div class="legend-row"><span class="legend-line" style="background:#2196F3"></span>완만한 경사</div>
+          <div class="legend-row"><span class="legend-line" style="background:#FDD835"></span>완만한 경사</div>
           <div class="legend-row"><span class="legend-line" style="background:#FF9800"></span>주의 구간</div>
           <div class="legend-row"><span class="legend-line" style="background:#F44336"></span>위험 구간</div>
         </div>
