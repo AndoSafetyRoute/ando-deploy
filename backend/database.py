@@ -1733,6 +1733,20 @@ def complete_navigation(
 # ⚠️ 이 전환으로 navigation_measurements 행이 없는 구버전(마이그레이션 이전) 경로는
 # 재계산 시 "평가할 구간 없음"으로 나온다 — 소급 재구성하지 않는다(모르는 데이터를
 # 지어내지 않는다는 이 파이프라인 전체 원칙과 동일).
+#
+# 2026-09 설계 확장(기술적 완화 아님, 의도적 범위 확장): 예전엔 _slow_seg_eligible이
+# abs(slope_pct) < FLAT_THRESHOLD 구간을 전부 제외했다 — "경사로 인한 숨은 부담
+# 포착"이 D 신호의 유일한 목적이었기 때문. 그런데 이 앱의 가장 흔한 실사용
+# 패턴(도보 30분 넘으면 대중교통으로 대체됨 → 실제로 걷는 경로는 대부분 짧고
+# 완만함)에서는 이 필터가 측정된 구간을 통째로 걸러내 설문 자체가 거의 안 뜨는
+# 결과를 낳았다(예: route 176 — measured 7개 전부 slope 0~0.29%로 필터에 전부
+# 탈락). 그래서 D 신호의 목적을 "경사로 인한 부담 포착"에서 "구간 체감에 대한
+# 일반 피드백 수집(경사 여부 무관)"으로 넓힌다 — 평지 구간의 "편했어요" 응답도
+# 이제 유의미하다(나중에 "완만한 오르막이 평지 대비 얼마나 불편한가"를 비교할
+# baseline이 된다). 순위 기준(pace_s_per_m 내림차순)은 애초에 경사가 아니라
+# 속도 기준이었으므로 그대로 둔다 — 완전 평지 route에서도 "그나마 상대적으로
+# 느렸던 구간"을 자연히 뽑아준다. 유효 구간이 1~4개뿐이면 그만큼만(SLOW_SEG_MAX_RANKED는
+# 상한일 뿐 하한이 아님) 물어본다 — 이것도 정렬 후 슬라이스로 이미 자연히 동작한다.
 SLOW_SEG_MIN_DIST_M = 25.0   # 구간이 이보다 짧으면 제외 (pickFeedbackSegments 와 동일)
 SLOW_SEG_MAX_RANKED = 5      # 상위 몇 구간까지 물어볼지 — 파일럿 참가자 수·구간 밀도
                              # 보면서 조정할 값이라 코드 상수로 뺐다(재배포로 조정,
@@ -1794,11 +1808,13 @@ def _route_measurement_groups(db: Session, route_id: int) -> list[dict]:
 
 
 def _slow_seg_eligible(g: dict) -> bool:
-    """랭킹 대상 구간인지 — 경사 있고, 충분히 길고, 속도가 현실적인지."""
+    """랭킹 대상 구간인지 — 충분히 길고, 속도가 현실적인지(GPS 이상치 배제).
+
+    경사 유무는 더 이상 필터 조건이 아니다(2026-09 설계 확장, 위 주석 참고) —
+    평지 구간도 pace 기준으로 "상대적으로 느렸던 구간"이 될 수 있다.
+    """
     d, e = g["distance_m"], g["elapsed_ms"]
     if d < SLOW_SEG_MIN_DIST_M or e <= 0:
-        return False
-    if abs(g["slope_pct"]) < FLAT_THRESHOLD:
         return False
     spd = d / (e / 1000.0)
     return SLOW_SEG_SPEED_MIN < spd < SLOW_SEG_SPEED_MAX
@@ -1863,10 +1879,12 @@ def get_slow_segments(db: Session, route_id: int, uid: str) -> dict | None:
         return None
     status = owns[0]
 
-    # meta 는 navigation_measurements 구간(unit) 기준으로 센다.
-    groups        = _route_measurement_groups(db, route_id)
-    total_groups  = len(groups)
-    sloped_groups = sum(1 for g in groups if _slow_seg_eligible(g))
+    # meta 는 navigation_measurements 구간(unit) 기준으로 센다. eligible_groups는
+    # 예전엔 "경사 있는 구간 수"였지만(2026-09 설계 확장 이후) 지금은 "GPS
+    # 이상치를 뺀, 질문 후보가 될 수 있는 구간 수"를 뜻한다 — 경사 무관.
+    groups          = _route_measurement_groups(db, route_id)
+    total_groups    = len(groups)
+    eligible_groups = sum(1 for g in groups if _slow_seg_eligible(g))
 
     rows = db.execute(text(_SLOW_SEG_SELECT), {"rid": route_id}).fetchall()
     if not rows:
@@ -1889,9 +1907,9 @@ def get_slow_segments(db: Session, route_id: int, uid: str) -> dict | None:
     } for r in rows]
 
     meta = {
-        "total_segments":  total_groups,     # 경로를 묶었을 때의 구간 수
-        "sloped_segments": sloped_groups,    # 그중 경사 있어 평가 후보인 구간 수
-        "ranked":          len(segments),    # 실제로 물어볼 구간 수 (min(SLOW_SEG_MAX_RANKED, sloped))
+        "total_segments":    total_groups,       # 경로를 묶었을 때의 구간 수
+        "eligible_segments": eligible_groups,    # 그중 질문 후보인 구간 수(경사 무관, GPS 이상치만 제외)
+        "ranked":            len(segments),      # 실제로 물어본 구간 수 (min(SLOW_SEG_MAX_RANKED, eligible))
     }
 
     if not segments:
@@ -1900,7 +1918,9 @@ def get_slow_segments(db: Session, route_id: int, uid: str) -> dict | None:
         elif total_groups == 0:
             reason = "no_measured_segments"
         else:
-            reason = "no_sloped_segments"      # 구간은 있으나 전부 평지/너무 짧음
+            # 경사 필터가 없어진 뒤(위 2026-09 설계 확장) 이 분기는 사실상 전부
+            # GPS 이상치(SLOW_SEG_SPEED_MIN/MAX 밖)로 제외된 극단 케이스만 남는다.
+            reason = "no_eligible_segments"
         return {"eligible": False, "reason": reason, "route_id": route_id,
                 "segments": [], "meta": meta}
 

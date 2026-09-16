@@ -25,7 +25,7 @@ import {
 import { classifySlopeZone, type SlopeZoneKey } from "../utils/slopeZone";
 import { getAuthToken, deleteUserRoute } from "../api";
 import { getRouteMeasurements, type RouteMeasurementSegment } from "../api/routeMeasurements";
-import { getSegmentHardshipFeedback } from "../api/slowSegments";
+import { getSegmentHardshipFeedback, getSlowSegments } from "../api/slowSegments";
 
 const NAVY = "#1B0F4A";
 const WHITE = "#FFFFFF";
@@ -235,6 +235,10 @@ export default function RouteDetailScreen() {
   const [dataSource, setDataSource] = useState<"server" | "local">("local");
   const [verdictBySegIndex, setVerdictBySegIndex] = useState<Record<number, number>>({});
   const [loading, setLoading] = useState(true);
+  // 구간 설문조사 대상 존재 여부 — null: 아직 모름(조회 실패 포함, 버튼은 기존처럼
+  // 보여준다/막지 않는다), true: 물어볼 구간 있음, false: eligible:false(대부분
+  // 평지 등) — 버튼 대신 안내 문구로 바꾼다. "왜 안 뜨는지 드러낸다" 원칙.
+  const [slowEligible, setSlowEligible] = useState<boolean | null>(null);
 
   useFocusEffect(
     useCallback(() => {
@@ -254,6 +258,7 @@ export default function RouteDetailScreen() {
         let segments: SegmentTime[] = found?.segments ?? [];
         let source: "server" | "local" = "local";
         let verdictMap: Record<number, number> = {};
+        let eligible: boolean | null = null;
         if (found?.serverRouteId != null) {
           try {
             const token = await getAuthToken();
@@ -280,6 +285,16 @@ export default function RouteDetailScreen() {
                 } catch (e) {
                   console.log("[FE] segment-hardship-feedback(get) 조회 실패 (무시):", e);
                 }
+
+                // "구간 설문조사" 버튼을 보여줄지 판단 — eligible:false(대부분 평지라
+                // 물어볼 구간 없음)면 버튼 대신 안내 문구로 바꾼다. 조회 자체가
+                // 실패하면 null로 남겨 기존처럼 버튼을 보여준다(모름 ≠ 없음).
+                try {
+                  const ss = await getSlowSegments(found.serverRouteId, token, { retry: false });
+                  eligible = ss.eligible === true;
+                } catch (e) {
+                  console.log("[FE] slow-segments eligibility 조회 실패 (무시):", e);
+                }
               }
             }
           } catch (e) {
@@ -292,6 +307,7 @@ export default function RouteDetailScreen() {
           setDisplaySegments(segments);
           setDataSource(source);
           setVerdictBySegIndex(verdictMap);
+          setSlowEligible(eligible);
           setLoading(false);
         }
       }
@@ -529,7 +545,18 @@ export default function RouteDetailScreen() {
           )}
         </View>
 
-        {dataSource === "server" && record.serverRouteId != null && (
+        {dataSource === "server" && record.serverRouteId != null && slowEligible === false && (
+          <View style={styles.surveyCardDisabled}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.surveyTitleMuted}>구간 설문조사</Text>
+              <Text style={styles.surveyDesc}>
+                이 경로는 실측된 구간이 없어 평가할 내용이 없어요.
+              </Text>
+            </View>
+          </View>
+        )}
+
+        {dataSource === "server" && record.serverRouteId != null && slowEligible !== false && (
           <TouchableOpacity
             style={styles.surveyCard}
             activeOpacity={0.85}
@@ -965,6 +992,23 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: "900",
     color: TEXT,
+  },
+
+  surveyCardDisabled: {
+    marginTop: 18,
+    backgroundColor: LIGHT_GRAY,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: BORDER_GRAY,
+    padding: 18,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+
+  surveyTitleMuted: {
+    fontSize: 15,
+    fontWeight: "900",
+    color: TEXT_MUTE,
   },
 
   surveyDesc: {

@@ -34,16 +34,16 @@ export type SlowSegment = {
 };
 
 export type SlowSegmentsMeta = {
-  total_segments:  number;   // 묶인 구간 수
-  sloped_segments: number;   // 경사 있는(|slope|≥0.5%) 구간 수
-  ranked:          number;   // 실제 순위 매긴 수 = min(10, sloped_segments)
+  total_segments:    number;   // 묶인 구간 수
+  eligible_segments: number;   // 질문 후보 구간 수(2026-09~ 경사 무관, GPS 이상치만 제외)
+  ranked:            number;   // 실제 순위 매긴 수 = min(SLOW_SEG_MAX_RANKED, eligible_segments)
 };
 
 export type SlowSegmentsResponse = {
   eligible:  boolean;
   route_id:  number;
   segments:  SlowSegment[];
-  reason?:   "no_measured_segments" | "no_sloped_segments" | "route_not_completed" | string;
+  reason?:   "no_measured_segments" | "no_eligible_segments" | "route_not_completed" | string;
   meta?:     SlowSegmentsMeta;
 };
 

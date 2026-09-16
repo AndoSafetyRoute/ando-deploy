@@ -253,7 +253,8 @@ function formatSlope(avgSlope: any) {
   return `${n.toFixed(2)}%`;
 }
 
-const PROXIMITY_THRESHOLD = 15;
+// 2026-09 1단계 완화(15m→25m) — 실기기 미검증, 다음 세션에서 실측 확인 필요.
+const PROXIMITY_THRESHOLD = 25;
 // routeSegments catch-up 스캔 한도(세그먼트 개수) — 콜백 공백 중 놓친 세그먼트를
 // 몇 개까지 앞서 훑어볼지. 실기기 dt 최대 27.7s 관측 기준 도보~가벼운 조깅
 // 속도(≤3m/s)로도 최대 ~83m라 5~10m 단위 세그먼트로는 수십 개면 충분히 여유
@@ -1093,7 +1094,8 @@ export default function NavigationScreen({ navigation, route }: Props) {
           // 걸러내려는 것이지 정밀도 필터가 아님 (이슈 §1-B).
           binTrackerRef.current?.noteGpsSample();
 
-          if (loc.coords.accuracy && loc.coords.accuracy > 20) return;
+          // 2026-09 1단계 완화(20m→30m) — 실기기 미검증, 다음 세션에서 실측 확인 필요.
+          if (loc.coords.accuracy && loc.coords.accuracy > 30) return;
 
           gpsCallbackCountRef.current += 1;
           if (gpsCallbackCountRef.current === 2 && currentSegIdxRef.current === 0) {
