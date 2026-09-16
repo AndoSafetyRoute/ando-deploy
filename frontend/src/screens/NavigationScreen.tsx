@@ -34,6 +34,7 @@ import {
   formatMinutes,
 } from "../utils/storage";
 import { classifySlopeZone } from "../utils/slopeZone";
+import { createRouteProgressTracker } from "../utils/routeProgress";
 import {
   getAuthToken,
   startNavigation,
@@ -749,6 +750,31 @@ export default function NavigationScreen({ navigation, route }: Props) {
     [routeData]
   );
 
+  // GPS 경로 추종 판정 2단계(2026-09) — 반경(PROXIMITY_THRESHOLD) 판정을 대체하지
+  // 않고 보완하는 두 번째 축. coordinates(전체 경로 폴리라인)에 GPS를 투영해
+  // "경로 시작 기준 누적 진행 거리"를 추적하고, 그 진행 거리가 어떤 구간/unit의
+  // 끝점 위치를 이미 지났으면 그 구간은 통과로 본다 — GPS가 끝점 반경을 못
+  // 찍었어도(건물 근처 흔들림, 살짝 비껴 찍음) 실제로 그 지점을 지나왔다면
+  // 놓치지 않는다. routeSegments/measurementUnits 루프 양쪽에서 공유해 쓴다.
+  const routeProgressTracker = useMemo(
+    () => createRouteProgressTracker(coordinates),
+    [coordinates]
+  );
+
+  const segEndArcLength: number[] = useMemo(
+    () => routeSegments.map((seg) => routeProgressTracker.arcLengthOf(seg.end)),
+    [routeSegments, routeProgressTracker]
+  );
+
+  const unitEndArcLength: number[] = useMemo(
+    () =>
+      measurementUnits.map((u) => {
+        const [endLng, endLat] = u.end_coords;
+        return routeProgressTracker.arcLengthOf({ latitude: endLat, longitude: endLng });
+      }),
+    [measurementUnits, routeProgressTracker]
+  );
+
   useEffect(() => {
     // routeSegments(경로 자체)는 있는데 measurementUnits가 비어 있으면 BE의
     // build_measurement_units가 실패했다는 뜻(app.py가 예외를 삼키고 빈 배열로
@@ -1097,6 +1123,14 @@ export default function NavigationScreen({ navigation, route }: Props) {
           // 2026-09 1단계 완화(20m→30m) — 실기기 미검증, 다음 세션에서 실측 확인 필요.
           if (loc.coords.accuracy && loc.coords.accuracy > 30) return;
 
+          // 2026-09 2단계 — 이 픽스를 경로 진행률 트래커에도 반영(위 useMemo 주석
+          // 참고). 아래 두 while 루프의 "반경 밖이어도 경로상 이미 지나쳤으면
+          // 통과 인정" 판정이 이 값을 쓴다.
+          routeProgressTracker.update({
+            latitude:  loc.coords.latitude,
+            longitude: loc.coords.longitude,
+          });
+
           gpsCallbackCountRef.current += 1;
           if (gpsCallbackCountRef.current === 2 && currentSegIdxRef.current === 0) {
             segmentStartTimesRef.current[0] = now;
@@ -1178,8 +1212,12 @@ export default function NavigationScreen({ navigation, route }: Props) {
               { latitude: loc.coords.latitude, longitude: loc.coords.longitude },
               seg.end
             );
-            if (dist >= PROXIMITY_THRESHOLD) {
-              // curIdx의 끝점 15m 반경에 못 들었다 — 콜백 공백/점프로 이 세그먼트를
+            // 2026-09 2단계 — 반경 밖이어도 경로 진행률이 이 구간 끝점을 이미
+            // 지났으면(폴리라인 투영 기준) 통과로 인정한다. GPS가 흔들리거나
+            // 끝점을 살짝 비껴 찍어도, 실제로 경로를 따라 지나왔다면 놓치지 않는다.
+            const passedByProgress = routeProgressTracker.maxProgressM() >= segEndArcLength[curIdx];
+            if (dist >= PROXIMITY_THRESHOLD && !passedByProgress) {
+              // curIdx의 끝점 25m 반경에 못 들었다 — 콜백 공백/점프로 이 세그먼트를
               // 그냥 지나쳤을 수 있다(실기기 dt 최대 27.7s 관측, 신호 B 조사).
               // 예전엔 여기서 바로 break해 다음 콜백을 기다렸는데, 그 다음 콜백도
               // curIdx 끝점만 보므로 이미 지나친 지점엔 영원히 다시 가까워지지
@@ -1306,8 +1344,12 @@ export default function NavigationScreen({ navigation, route }: Props) {
                 { latitude: loc.coords.latitude, longitude: loc.coords.longitude },
                 { latitude: endLat, longitude: endLng }
               );
-              if (distToUnitEnd >= PROXIMITY_THRESHOLD) {
-                // routeSegments 루프와 동일한 문제 — curUnitIdx 끝점 15m을 콜백
+              // 2026-09 2단계 — routeSegments 루프와 동일한 보완: 반경 밖이어도
+              // 경로 진행률이 이 unit 끝점을 이미 지났으면 통과로 인정한다.
+              const passedByProgress =
+                routeProgressTracker.maxProgressM() >= unitEndArcLength[curUnitIdx];
+              if (distToUnitEnd >= PROXIMITY_THRESHOLD && !passedByProgress) {
+                // routeSegments 루프와 동일한 문제 — curUnitIdx 끝점 25m을 콜백
                 // 공백/점프로 그냥 지나쳤으면 여기서 break만 해선 이 unit도,
                 // 이후 모든 unit도 영원히 안 닫힌다. 뒤쪽을 미리 훑어 지금
                 // 위치와 실제로 가까운 unit이 있으면 그 지점까지 건너뛴다.
