@@ -72,6 +72,13 @@ _ELEVATOR_ONLY  = {"manual_wheelchair", "electric_wheelchair", "walker"}
 # 에스컬레이터 이용 가능 (우선 안내, 없으면 엘리베이터)
 _ESC_PREFERRED  = {"cane", "leg_injury", "elderly"}
 
+# S7 — 에스컬레이터 운행 방향(CSV "상하행구분" 그대로, _load_escalators 참고).
+# entering(길에서 역으로 내려감) → 하행 에스컬레이터만 실제로 도움이 됨.
+# exiting(플랫폼에서 지상으로 올라옴) → 상행만. 방향 필드가 비어 있는 행은
+# 데이터 결측이지 "이 방향 아님"이 아니므로 양쪽 다 후보로 남긴다.
+_ESC_DOWN = {"하행"}
+_ESC_UP   = {"상행"}
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  출구 번호 정규화
@@ -436,15 +443,53 @@ class SubwayFacilityDB:
         )
 
     # ── 공개 API ─────────────────────────────────────────────────────────────
+    def get_exit_candidates(
+        self,
+        station_name: str,
+        user_type: str,
+        direction: str = "entering",
+    ) -> list[dict]:
+        """
+        user_type·방향 기준으로 이용 가능한 출구 후보 전체(좌표 포함) — 정렬 없음.
+        정렬(최근접/경로비용)은 호출측이 목적에 맞게 한다.
+
+        direction: "entering"(길 → 역, 하행 에스컬레이터만 후보) |
+                   "exiting"(플랫폼 → 지상, 상행만). 방향 필드가 빈 CSV 행은
+                   데이터 결측이지 "이 방향 아님"이 아니므로 양쪽 다 후보로 남긴다.
+        """
+        stn    = _normalize_station(station_name)
+        broken = get_broken_serials()
+        need_dir = _ESC_DOWN if direction == "entering" else _ESC_UP
+
+        if user_type in _ELEVATOR_ONLY:
+            active = self._active(self._elev.get(stn, []), broken)
+            return self._with_coord(stn, active)
+
+        if user_type in _ESC_PREFERRED:
+            active_esc = self._active(self._esc.get(stn, []), broken)
+            dir_matched = [e for e in active_esc if not e.get("direction") or e["direction"] in need_dir]
+            candidates = self._with_coord(stn, dir_matched)
+            if candidates:
+                return candidates
+            # 방향 맞는(또는 방향 미상) 에스컬레이터 없음 → 엘리베이터 폴백
+            active_elev = self._active(self._elev.get(stn, []), broken)
+            return self._with_coord(stn, active_elev)
+
+        return []
+
     def get_best_exit(
         self,
         station_name: str,
         user_type: str,
         user_lat: float,
         user_lon: float,
+        direction: str = "exiting",
     ) -> dict | None:
         """
-        user_type·위치 기준 최적 출구 반환.
+        user_type·위치·방향 기준 최적 출구 반환 — **직선거리 최근접**.
+        지하 구간(플랫폼→지상)은 보행 그래프가 없어 경로비용을 낼 수 없으므로
+        이 방식이 최선이다. 지상 구간(길→역, 진입) 비용 비교가 필요하면
+        get_exit_candidates() + 그래프 라우팅을 쓸 것(app.py /route 참고).
 
         반환 dict:
           type      : "elevator" | "escalator" | "lift"
@@ -454,48 +499,21 @@ class SubwayFacilityDB:
           direction : (에스컬레이터만) "상행" | "하행"
           message   : FE 안내 텍스트
         """
-        stn     = _normalize_station(station_name)
-        broken  = get_broken_serials()
-
-        # ── 수동/전동 휠체어, 워커 → 엘리베이터 전용 ──────────────────────────
-        if user_type in _ELEVATOR_ONLY:
-            elev_entries = self._elev.get(stn, [])
-            active       = self._active(elev_entries, broken)
-            candidates   = self._with_coord(stn, active)
-            best         = self._nearest(candidates, user_lat, user_lon)
-            if best:
-                return {**best, "message": f"{best['exit_no']}번 출구 엘리베이터를 이용하세요."}
-            return None  # 엘리베이터 없음
-
-        # ── 지팡이·다리부상·고령자 → 에스컬레이터 우선, 없으면 엘리베이터 ──────
-        if user_type in _ESC_PREFERRED:
-            esc_entries = self._esc.get(stn, [])
-            active_esc  = self._active(esc_entries, broken)
-            candidates  = self._with_coord(stn, active_esc)
-            best        = self._nearest(candidates, user_lat, user_lon)
-            if best:
-                msg = (
-                    f"{best['exit_no']}번 출구 에스컬레이터를 이용하세요. "
-                    f"({best.get('direction', '')} 방향)"
-                ).strip()
-                return {**best, "message": msg}
-
-            # 에스컬레이터 없음 → 엘리베이터 폴백
-            elev_entries = self._elev.get(stn, [])
-            active_elev  = self._active(elev_entries, broken)
-            candidates   = self._with_coord(stn, active_elev)
-            best         = self._nearest(candidates, user_lat, user_lon)
-            if best:
-                return {
-                    **best,
-                    "message": (
-                        f"{best['exit_no']}번 출구 엘리베이터를 이용하세요. "
-                        "(에스컬레이터 없음)"
-                    ),
-                }
+        candidates = self.get_exit_candidates(station_name, user_type, direction)
+        best = self._nearest(candidates, user_lat, user_lon)
+        if not best:
             return None
 
-        return None
+        if best.get("type") == "escalator":
+            msg = (
+                f"{best['exit_no']}번 출구 에스컬레이터를 이용하세요. "
+                f"({best.get('direction', '')} 방향)"
+            ).strip()
+        elif user_type in _ESC_PREFERRED:
+            msg = f"{best['exit_no']}번 출구 엘리베이터를 이용하세요. (에스컬레이터 없음)"
+        else:
+            msg = f"{best['exit_no']}번 출구 엘리베이터를 이용하세요."
+        return {**best, "message": msg}
 
     def station_summary(self, station_name: str) -> dict:
         """역 시설 현황 요약 (디버그·FE 참고용)"""

@@ -24,7 +24,7 @@ import numpy as np
 from scipy.spatial import KDTree
 
 from config import MAX_DETOUR_RATIO, FORBIDDEN_PENALTY, BASE_DIR
-from routing.cost import USER_TYPES, slope_cost
+from routing.cost import USER_TYPES, slope_cost, is_facility_blocked, is_facility_blocked_for_any_type
 from routing.pathfinder import recalculate_path_slopes
 from routing.basis import precompute_basis_weights, save_basis_weights, load_basis_weights
 
@@ -528,16 +528,23 @@ def build_cch_engine(G, order_cache_path: str | None = None) -> CCHEngine:
         head_np[i] = node_to_id[v]
         length      = data.get("length_m", 1.0)
         sp          = data.get("slope_pct", 0.0)
+        # S7 — is_stairs(OSM 원본 highway=='steps')는 그래프 엣지에 이미 실려
+        #있다(graph.py). 슬로프 기반 forbidden과 별개 축이라 OR로 합친다.
+        is_stairs   = data.get("highway") == "steps"
         dist_wf[i]  = length * WEIGHT_SCALE
         dist_safe_wf[i] = (
             length * FORBIDDEN_PENALTY * WEIGHT_SCALE
-            if is_forbidden_for_any_type(sp)
+            if is_forbidden_for_any_type(sp) or is_facility_blocked_for_any_type(is_stairs)
             else length * WEIGHT_SCALE
         )
         slope_arr[i]  = sp
         length_arr[i] = length
         for ut in USER_TYPES:
-            slope_wf[ut][i] = slope_cost(sp, ut, length) * WEIGHT_SCALE
+            slope_wf[ut][i] = (
+                length * FORBIDDEN_PENALTY * WEIGHT_SCALE
+                if is_facility_blocked(ut, is_stairs)
+                else slope_cost(sp, ut, length) * WEIGHT_SCALE
+            )
 
     # Python list[int] 변환 (routingkit_cch API 요구)
     print(f"[CCH] list 변환 중...")

@@ -1,5 +1,19 @@
 """
 경사도 점수 & 엣지 비용 함수 + 유형별 파라미터 테이블
+
+── S7: 세 경로 종류의 비용함수 정의 ──────────────────────────────────────────
+  shortest(거리)   : length                              — pathfinder.find_route(mode="shortest")/
+                                                             set_edge_weights(alpha=0.0)
+  type(유형별)      : length × f_type(slope) = slope_cost(slope, user_type, length)
+                                                          — set_edge_weights(alpha=1.0)
+  personal(맞춤형)  : c_u(e) — 아직 미구현(S8 예정, user_model_params 기반).
+                       f_type과 user_type 피처를 쓰지 않는다는 게 S8의 요구사항.
+
+  세 함수 모두 시설 정책(FACILITY_POLICY, is_facility_blocked)을 적용한다 —
+  shortest(alpha=0)도 예외 없음. pathfinder.set_edge_weights()가 alpha 보간과
+  무관하게 항상 덮어쓰는 방식으로 구현(코드 참고) — "차단"은 그래프에서 엣지를
+  제거하는 대신 큰 유한 비용(FORBIDDEN_PENALTY × length)을 주는 기존 관례를
+  그대로 따른다(경사 forbidden 처리와 동일 패턴, 우회 가드레일도 그대로 적용됨).
 """
 from config import FORBIDDEN_PENALTY
 
@@ -70,6 +84,13 @@ def is_facility_blocked(user_type: str, is_stairs: bool) -> bool:
     if is_stairs and FACILITY_POLICY.get(user_type, {}).get("stairs") == "block":
         return True
     return False
+
+
+def is_facility_blocked_for_any_type(is_stairs: bool) -> bool:
+    """cch_engine.is_forbidden_for_any_type()와 같은 패턴 — 유형 무관 단일 안전
+    거리 metric(경로②)에 쓴다. 6개 유형 중 하나라도 막으면 True(현재는 전부
+    막으므로 is_stairs와 동치이지만, 유형별로 정책이 갈리면 자동으로 반영됨)."""
+    return any(is_facility_blocked(ut, is_stairs) for ut in USER_TYPES)
 
 
 def slope_score(g_abs: float, direction: str, user_type: str) -> float:

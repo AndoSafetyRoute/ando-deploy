@@ -1321,6 +1321,57 @@ def _shortest_route_card(origin: tuple, dest: tuple, user_type: str,
     }
 
 
+def _pick_best_exit_by_route_cost(
+    origin: tuple, station_name: str, user_type: str,
+) -> dict | None:
+    """
+    S7 — 출구 선택(진입: 길→역)을 직선거리 최근접 대신 origin에서 각 후보
+    출구까지의 실제 경로비용으로 비교한다. 지상 구간이라 그래프가 있어
+    가능한 경우 — 승강장→지상(exiting)은 여전히 get_best_exit의 최근접
+    방식을 쓴다(subway/facility.py 참고, 그래프 없는 지하 구간이라 비용을
+    낼 수 없음).
+
+    비용은 안전거리(CCH metric_dist_safe: 금지구간+계단 배제, alpha=0)로
+    비교한다 — 후보마다 개인화 alpha 이진탐색(최대 6회 CCH 쿼리)을 다 돌리면
+    후보 수만큼 배가돼 느려지므로, 출구 "선택" 단계는 이미 계단·금지구간을
+    배제한 안전 최단 비용으로 비교하고, 실제 표시될 유형별 최적 경로는 이
+    함수가 고른 도착 좌표로 /route 가 평소대로(alpha 이진탐색 포함) 다시 계산한다.
+    후보가 없거나 전부 라우팅 실패하면 None(호출측이 기존 좌표로 폴백).
+    """
+    if _subway_db is None:
+        return None
+    candidates = _subway_db.get_exit_candidates(station_name, user_type, direction="entering")
+    if not candidates:
+        return None
+
+    best, best_cost = None, float("inf")
+    for c in candidates:
+        dest = (c["lon"], c["lat"])
+        try:
+            if _cch is not None:
+                r = _cch.find_distance_route(origin, dest, safe=True)
+            else:
+                r = find_route(G, origin, dest, user_type, mode="shortest")
+        except Exception as e:
+            print(f"[NAV] 출구 후보 {c.get('exit_no')} 비용 계산 실패(스킵): {e}")
+            continue
+        cost = r.get("total_cost")
+        if cost is not None and cost < best_cost:
+            best, best_cost = c, cost
+
+    if best is None:
+        return None
+
+    if best.get("type") == "escalator":
+        msg = (f"{best['exit_no']}번 출구 에스컬레이터를 이용하세요. "
+               f"({best.get('direction', '')} 방향)").strip()
+    elif user_type in ("cane", "leg_injury", "elderly"):  # subway.facility._ESC_PREFERRED
+        msg = f"{best['exit_no']}번 출구 엘리베이터를 이용하세요. (에스컬레이터 없음)"
+    else:
+        msg = f"{best['exit_no']}번 출구 엘리베이터를 이용하세요."
+    return {**best, "message": msg}
+
+
 @app.post("/route")
 def api_route(
     body: RouteRequest,
@@ -1337,12 +1388,20 @@ def api_route(
         dest   = (body.dest_lon,   body.dest_lat)
 
         # 목적지가 지하철역이면, 유형별 최적 출구 좌표로 도착지를 스냅한다.
-        # 해당 역 데이터가 없거나 조회 실패 시 원래 좌표 그대로 사용(폴백).
+        # S7 — 직선거리 최근접이 아니라 origin에서 각 후보까지의 실제 경로비용
+        # (안전 최단, 계단·금지구간 배제)으로 비교한다. 후보 계산 실패/후보
+        # 없음이면 기존 최근접 방식(get_best_exit)으로, 그마저 없으면 원래
+        # 좌표 그대로 사용(다단 폴백).
         if body.end_station_name and _subway_db is not None:
             try:
-                exit_info = _subway_db.get_best_exit(
-                    body.end_station_name, body.user_type, body.dest_lat, body.dest_lon
+                exit_info = _pick_best_exit_by_route_cost(
+                    origin, body.end_station_name, body.user_type,
                 )
+                if not exit_info:
+                    exit_info = _subway_db.get_best_exit(
+                        body.end_station_name, body.user_type, body.dest_lat, body.dest_lon,
+                        direction="entering",
+                    )
                 if exit_info:
                     dest = (exit_info["lon"], exit_info["lat"])
             except Exception as e:
@@ -1723,13 +1782,18 @@ def api_subway_best_exit(
     FE(대중교통 탭)에서 카카오 응답의 하차역 이름으로 조회해
     승강장→출구 안내에 붙여 쓴다. 데이터/서비스 미가용 시 404 → FE는
     답사 기반 하드코딩 정보로 폴백.
+
+    S7 — direction="exiting"(플랫폼→지상, 상행 에스컬레이터만 후보) 명시.
+    이 구간은 그래프에 없는 지하 구간이라 경로비용 비교가 불가능해 최근접
+    방식을 그대로 쓴다(진입 방향 비용비교는 /route 내부의
+    _pick_best_exit_by_route_cost 참고).
     """
     if _subway_db is None:
         raise HTTPException(503, "지하철 편의시설 DB 미초기화 (subway_data 디렉토리 확인 필요)")
     if user_type not in USER_TYPES:
         raise HTTPException(400, f"유효하지 않은 user_type: {user_type}")
 
-    result = _subway_db.get_best_exit(station, user_type, lat, lon)
+    result = _subway_db.get_best_exit(station, user_type, lat, lon, direction="exiting")
     if result is None:
         raise HTTPException(404, f"'{station}' 역에서 {user_type} 유형이 이용 가능한 출구를 찾을 수 없습니다")
     return result

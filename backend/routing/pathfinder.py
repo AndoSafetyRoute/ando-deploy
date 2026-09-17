@@ -3,8 +3,8 @@
 """
 import networkx as nx
 
-from config import MAX_DETOUR_RATIO, FLAT_THRESHOLD
-from routing.cost import USER_TYPES, slope_cost, slope_score
+from config import MAX_DETOUR_RATIO, FLAT_THRESHOLD, FORBIDDEN_PENALTY
+from routing.cost import USER_TYPES, slope_cost, slope_score, is_facility_blocked
 from routing.graph import haversine
 from routing.search import nearest_node, best_origin_node
 
@@ -14,12 +14,20 @@ def set_edge_weights(G: nx.DiGraph, user_type: str, alpha: float = 1.0):
     유형별 slope_cost를 'weight'로 설정.
     precompute_edge_costs() 호출 후에는 선형 보간만 수행 (slope_cost 재계산 없음).
     alpha=1.0 → 경사 비용 전체 반영 / alpha=0.0 → 순수 거리
+
+    S7 — 시설 정책(계단 차단)은 alpha와 무관하게 항상 적용한다("세 비용 함수
+    (shortest/type/personal) 모두 시설 정책 적용" 요구). alpha=0(순수 거리)
+    이어도 계단 통과 불가 유형에게는 큰 유한 비용을 준다 — 이 페널티는
+    slope_cost 보간(w1)과 별개 축이라 보간 이후 덮어쓴다.
     """
     key = f"_w1_{user_type}"
     for u, v, data in G.edges(data=True):
         length = data["length_m"]
         w1 = data.get(key) or slope_cost(data.get("slope_pct", 0.0), user_type, length)
-        data["weight"] = length + alpha * (w1 - length)
+        weight = length + alpha * (w1 - length)
+        if is_facility_blocked(user_type, data.get("highway") == "steps"):
+            weight = max(weight, FORBIDDEN_PENALTY * length)
+        data["weight"] = weight
 
 
 def _heuristic(u, v, G: nx.DiGraph) -> float:
