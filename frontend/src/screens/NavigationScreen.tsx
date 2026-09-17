@@ -51,7 +51,11 @@ import {
   SPEED_SAMPLE_MAX_GAP_S,
   SPEED_SAMPLE_MAX_JUMP_M,
   NEAR_STOP_SPEED_MS,
+  GPS_ACCURACY,
+  GPS_TIME_INTERVAL_MS,
+  GPS_DISTANCE_INTERVAL_M,
 } from "../personalization/config";
+import { useKeepAwake } from "expo-keep-awake";
 import { routeAfterRating } from "../personalization/entry";
 import { APP_VERSION, MEASUREMENT_SCHEMA_VERSION } from "../personalization/config";
 import RoundtripHintBanner from "../personalization/RoundtripHintBanner";
@@ -261,14 +265,17 @@ const PROXIMITY_THRESHOLD = 25;
 // 속도(≤3m/s)로도 최대 ~83m라 5~10m 단위 세그먼트로는 수십 개면 충분히 여유
 // 있게 잡은 값(비용은 haversine 계산 몇 번뿐이라 넉넉하게 잡아도 무리 없음).
 const SEGMENT_CATCHUP_LOOKAHEAD = 50;
-// Accuracy.High는 GPS 하드웨어 단독 픽스만 기다려서 실내·건물 인근·GPS
-// 신호가 약한 곳에서 첫 위치가 잡히지 않고 무한 대기하는 경우가 있다
-// (expo-location Android 알려진 이슈). Balanced는 Wi-Fi/셀룰러 기반
-// fused location provider도 함께 써서 훨씬 빠르게 첫 픽스를 준다.
+// S0(GPS 수신 간격 개선) — accuracy/timeInterval/distanceInterval을 config
+// 상수로 옮김(docs/config_reference.md). ⚠️ 기존엔 Accuracy.High가 "GPS 하드웨어
+// 단독 픽스만 기다려서 실내·건물 인근에서 첫 위치가 무한 대기하는 known 이슈"
+// 때문에 일부러 Balanced를 썼었다 — BestForNavigation은 High보다도 더 엄격한
+// 정확도를 요구해 같은(혹은 더 심한) 인도어 락 지연을 유발할 수 있다. 아래
+// gpsWatchdog(8초 메시지)는 지연을 "알려줄" 뿐 정확도를 낮춰 우회하지 않으므로,
+// S0 실기기 테스트에서 이 회귀가 재현되는지 반드시 함께 확인할 것.
 const GPS_WATCH_OPTIONS = {
-  accuracy:         Location.Accuracy.Balanced,
-  distanceInterval: 5,
-  timeInterval:     3000,
+  accuracy:         GPS_ACCURACY,
+  distanceInterval: GPS_DISTANCE_INTERVAL_M,
+  timeInterval:     GPS_TIME_INTERVAL_MS,
 };
 
 function haversineDistance(a: Coordinate, b: Coordinate): number {
@@ -657,6 +664,11 @@ function makeKakaoMapHtml({
 }
 
 export default function NavigationScreen({ navigation, route }: Props) {
+  // S0(GPS 수신 간격 개선) — 화면이 꺼지면 OS가 GPS 콜백 주기를 늘리므로,
+  // 안내 화면이 떠 있는 동안은 화면 꺼짐을 막는다. 마운트 시 활성화, 언마운트
+  // (안내 종료·뒤로가기 포함 모든 경로) 시 자동 해제 — 훅 자체가 그렇게 동작한다.
+  useKeepAwake();
+
   const insets = useSafeAreaInsets();
 
   const routeId    = route?.params?.routeId     ?? "-";

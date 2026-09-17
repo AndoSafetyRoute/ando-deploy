@@ -1,3 +1,5 @@
+import * as Location from "expo-location";
+
 // 개인화 파일럿 — 연결 스위치 & 백엔드 계약 상수 (한 곳에 모음)
 //
 // BE 구현/동료 WIP 가 준비되면 손대야 할 곳은 두 군데뿐이다:
@@ -105,3 +107,18 @@ export const SPEED_SAMPLE_MAX_JUMP_M = 100;
 // ⚠️ 이건 stop_ms 계산 전용이다. 신호 B(감속) 판정은 v̄_flat×40% 로 학습 시점에
 //    오프라인 계산하며 이 상수와 무관하다 (이름이 비슷하니 혼동 금지, Q&A #5).
 export const NEAR_STOP_SPEED_MS = 0.15;
+
+// ── S0(GPS 수신 간격 개선) ──────────────────────────────────────────────────
+// 목표: 안내 중 콜백 간격 중앙값 ≤2s. 기존 Balanced/timeInterval=3000ms/
+// distanceInterval=5m는 실기기 세션(sess-1789364304261-iy39nwa8, route 169)
+// 실측에서 중앙값 6.9s·p75 12.9s로 목표에 크게 못 미쳤다(위 SPEED_SAMPLE_MAX_GAP_S
+// 주석 인용) — OS 배터리 최적화가 timeInterval 하한을 지키지 않는 상황에서
+// Balanced 정확도·5m 이동 요구가 콜백을 추가로 늦춘 것으로 추정된다(실기기
+// 미검증 추정 — 근거 C등급).
+// BestForNavigation은 GPS 칩에 가장 짧은 갱신주기를 요청해 OS 스케줄링 여유를
+// 줄인다. timeInterval을 요청 가능한 하한(1000ms)으로, distanceInterval을
+// 도보 최소 유의 이동량(1m — 0으로 두면 정지 중 GPS 지터만으로 과다 콜백
+// 발생 우려)으로 좁힌다. S0 실기기 테스트로 실측 후 조정.
+export const GPS_ACCURACY = Location.Accuracy.BestForNavigation;
+export const GPS_TIME_INTERVAL_MS = 1000;
+export const GPS_DISTANCE_INTERVAL_M = 1;
