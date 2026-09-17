@@ -284,6 +284,30 @@ function haversineDistance(a: Coordinate, b: Coordinate): number {
   return 2 * R * Math.asin(Math.sqrt(x));
 }
 
+// navigation_measurements.elapsed_ms P0 수정 — 콜백 수신 시각(now)이 아니라
+// 구간 끝점을 실제로 지난 시각을 추정해 쓴다. GPS 콜백 간격이 벌어질수록(중앙값
+// 6.9s·p75 12.9s, 실기기 최대 27.7s 관측) "이번 콜백을 받은 시각"과 "실제로 그
+// 지점을 지난 시각" 사이 오차가 커져, 마침 그 tick에 unit이 닫히면 그 오차
+// 전체가 elapsed_ms에 그대로 실린다(D 랭킹이 이 값을 그대로 쓰므로 신호 대기
+// 같은 정지 구간이 "느린 구간 1위"로 잘못 뽑히는 원인 중 하나). 직전 콜백
+// 시각(prevTime)·진행률(prevProgressM)과 이번 콜백(currTime·currProgressM) 사이를
+// 등속으로 가정해 boundaryArcLength 지점을 지난 시각을 선형보간한다.
+function interpolateCrossingTime(
+  prevProgressM: number,
+  prevTime: number,
+  currProgressM: number,
+  currTime: number,
+  boundaryArcLength: number,
+): number {
+  // prevTime=0: 세션 첫 콜백(비교 대상 없음). currProgressM<=prevProgressM: 제자리
+  // GPS 지터/뒷걸음(트래커는 단조증가만 하므로 이 경우 사실상 "안 움직임") —
+  // 두 경우 다 보간 근거가 없어 콜백 수신 시각을 그대로 쓴다(기존 동작과 동일).
+  if (!prevTime || currProgressM <= prevProgressM) return currTime;
+  const frac = (boundaryArcLength - prevProgressM) / (currProgressM - prevProgressM);
+  const clamped = Math.min(1, Math.max(0, frac));
+  return prevTime + clamped * (currTime - prevTime);
+}
+
 function getZoneKey(zone?: string, direction?: string): string {
   if (!zone || zone === "flat" || !direction || direction === "flat") return "flat";
   const d = direction === "up" ? "up" : "down";
@@ -1123,6 +1147,12 @@ export default function NavigationScreen({ navigation, route }: Props) {
           // 2026-09 1단계 완화(20m→30m) — 실기기 미검증, 다음 세션에서 실측 확인 필요.
           if (loc.coords.accuracy && loc.coords.accuracy > 30) return;
 
+          // P0(elapsed_ms 보정) — 이번 콜백이 진행률을 얼마나 앞당기는지 보려면
+          // update() 호출 전 시점의 값이 필요하다. lastGpsTimeRef는 신호 B 블록
+          // (아래)에서야 now로 갱신되므로 여기선 아직 "직전 콜백" 시각 그대로다.
+          const prevProgressMForCrossing = routeProgressTracker.maxProgressM();
+          const prevGpsTimeForCrossing   = lastGpsTimeRef.current;
+
           // 2026-09 2단계 — 이 픽스를 경로 진행률 트래커에도 반영(위 useMemo 주석
           // 참고). 아래 두 while 루프의 "반경 밖이어도 경로상 이미 지나쳤으면
           // 통과 인정" 판정이 이 값을 쓴다.
@@ -1388,10 +1418,18 @@ export default function NavigationScreen({ navigation, route }: Props) {
                     }).catch(() => {});
                   }
                 }
+                // 건너뛴 마지막 경계(caughtUpIdx)를 지난 시점을 보간해, 다음
+                // unit의 시작 앵커가 "이번 콜백 수신 시각"이 아니라 "실제로 그
+                // 지점을 지났을 시각"이 되게 한다(P0: elapsed_ms 진입/이탈 시각화).
+                const caughtUpCrossTime = interpolateCrossingTime(
+                  prevProgressMForCrossing, prevGpsTimeForCrossing,
+                  routeProgressTracker.maxProgressM(), now,
+                  unitEndArcLength[caughtUpIdx],
+                );
                 curUnitIdx = caughtUpIdx + 1;
                 currentUnitIdxRef.current = curUnitIdx;
                 if (curUnitIdx < measurementUnits.length) {
-                  unitStartTimesRef.current[curUnitIdx] = now;
+                  unitStartTimesRef.current[curUnitIdx] = caughtUpCrossTime;
                 }
                 continue; // 새 curUnitIdx를 다음 while 반복에서 정상 경로로 재평가
               }
@@ -1410,6 +1448,16 @@ export default function NavigationScreen({ navigation, route }: Props) {
               const unitIdx = curUnitIdx;
               const rid = serverRouteIdRef.current;
 
+              // P0(elapsed_ms 진입/이탈 시각화) — "콜백을 받은 시각(now)"이 아니라
+              // 직전 콜백~이번 콜백 사이를 등속 가정해 이 unit 끝점을 실제로 지난
+              // 시각을 추정한다. isCatchUp이어도 다음 unit의 시작 앵커로 재사용되므로
+              // 항상 계산한다.
+              const crossTime = interpolateCrossingTime(
+                prevProgressMForCrossing, prevGpsTimeForCrossing,
+                routeProgressTracker.maxProgressM(), now,
+                unitEndArcLength[unitIdx],
+              );
+
               const payload: MeasurementSegmentPayload = isCatchUp
                 ? {
                     sessionId: sid ?? "", unitIndex: unitIdx,
@@ -1421,7 +1469,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
                 : {
                     sessionId: sid ?? "", unitIndex: unitIdx,
                     distanceM: unit.distance_m, slopePercent: unit.slope_pct,
-                    status: "measured", elapsedMs: now - unitStartTimesRef.current[unitIdx],
+                    status: "measured", elapsedMs: crossTime - unitStartTimesRef.current[unitIdx],
                     coordStartIdx: unit.coord_start_idx, coordEndIdx: unit.coord_end_idx,
                     startCoords: unit.start_coords, endCoords: unit.end_coords,
                   };
@@ -1439,7 +1487,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
               curUnitIdx += 1;
               currentUnitIdxRef.current = curUnitIdx;
               if (curUnitIdx < measurementUnits.length) {
-                unitStartTimesRef.current[curUnitIdx] = now;
+                unitStartTimesRef.current[curUnitIdx] = crossTime;
               }
             }
 
