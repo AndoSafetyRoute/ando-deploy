@@ -46,6 +46,32 @@ USER_TYPES = {
 }
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 시설 정책 (S6.5) — 계단/에스컬레이터/엘리베이터
+# ──────────────────────────────────────────────────────────────────────────────
+# is_stairs(routing/segments.py NavSegment, routing/measurement_units.py
+# MeasurementUnit)는 OSM 원본 highway=='steps' 태그 기반 "사실 필드"일 뿐이다
+# (경사 임계값 기반 추정 아님 — 실측 결과 계단의 88.2%가 25% 미만 경사로 잡히고
+# 25% 이상 경사의 97.1%가 계단이 아니라 경사와 계단은 대리지표가 될 수 없음이
+# 확인됨). 차단 여부는 사실과 분리해 이 테이블에서만 결정한다 — 나중에 유형별로
+# 달라져도(예: 특정 유형만 완화) 이 테이블만 고치면 되게.
+# 지금은 6개 유형 전부 계단 차단(S7 시설 정책: WHEEL도 AMBUL도 계단 차단).
+FACILITY_POLICY = {
+    user_type: {"stairs": "block"}
+    for user_type in USER_TYPES
+}
+
+
+def is_facility_blocked(user_type: str, is_stairs: bool) -> bool:
+    """이 구간(사실 필드들)이 user_type에게 통행 불가인지 — 순수 정책 판정만.
+    실제 엣지 비용 반영 방식(그래프에서 제거할지, 큰 유한 비용을 줄지)은
+    호출측(S7, pathfinder.py/cch_engine.py)이 기존 관례(FORBIDDEN_PENALTY)에
+    맞춰 정한다 — 이 함수는 "막아야 하는가"만 답한다."""
+    if is_stairs and FACILITY_POLICY.get(user_type, {}).get("stairs") == "block":
+        return True
+    return False
+
+
 def slope_score(g_abs: float, direction: str, user_type: str) -> float:
     """
     구간별 이차함수 점수 (0~100).

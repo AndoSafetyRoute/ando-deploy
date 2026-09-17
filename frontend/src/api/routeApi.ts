@@ -25,6 +25,9 @@ export type MeasurementUnit = {
   unit_index:       number;
   distance_m:       number;
   slope_pct:        number;
+  // S6.5 — OSM 원본 highway=='steps' 태그 기반 사실 필드(경사 추정 아님).
+  // 차단 여부는 BE cost.FACILITY_POLICY가 결정 — FE는 그대로 표시/전달만.
+  is_stairs:        boolean;
   coord_start_idx:  number;
   coord_end_idx:    number;
   start_coords:     [number, number];

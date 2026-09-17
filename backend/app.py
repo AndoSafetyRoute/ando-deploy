@@ -85,6 +85,7 @@ def _nav_segs_and_waypoints(path_nodes: list, user_type: str) -> tuple[list, lis
             "slope_max":         s.slope_max,
             "slope_stddev":      s.slope_stddev,
             "zone":              s.zone,
+            "is_stairs":         s.is_stairs,
             "estimated_seconds": (nav_time["segments"][i]["estimated_seconds"]
                                   if nav_time.get("segments") and i < len(nav_time["segments"])
                                   else 0.0),
@@ -1471,6 +1472,7 @@ def api_route(
                             "unit_index":      u.unit_index,
                             "distance_m":      u.distance_m,
                             "slope_pct":       u.slope_pct,
+                            "is_stairs":       u.is_stairs,
                             "coord_start_idx": _node_to_path_idx.get(u.start_node, 0),
                             "coord_end_idx":   _node_to_path_idx.get(u.end_node, 0),
                             "start_coords":    [round(G.nodes[u.start_node]["lon"], 7),
@@ -1550,6 +1552,7 @@ def api_route(
                     "slope_max":         s.slope_max,
                     "slope_stddev":      s.slope_stddev,
                     "zone":              s.zone,
+                    "is_stairs":         s.is_stairs,
                     "estimated_seconds": (nav_time["segments"][i]["estimated_seconds"]
                                           if nav_time.get("segments") and i < len(nav_time["segments"])
                                           else 0.0),

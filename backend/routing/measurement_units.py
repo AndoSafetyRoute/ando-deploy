@@ -26,6 +26,9 @@ class MeasurementUnit:
     intermediate_nodes:  list = field(default_factory=list)
     distance_m:          float = 0.0
     slope_pct:           float = 0.0
+    # S6.5 — 사실 필드만(차단 여부는 cost.FACILITY_POLICY가 결정). OSM 원본
+    # highway=='steps' 태그 기반. unit 안 엣지 중 하나라도 계단이면 True.
+    is_stairs:           bool  = False
 
     def all_nodes(self) -> list:
         return [self.start_node] + self.intermediate_nodes + [self.end_node]
@@ -54,11 +57,12 @@ def build_measurement_units(
         return []
 
     # ── 1. 누적 거리 기준 분할 ────────────────────────────────────────────────
-    # chunks[i] = (nodes, distance_m, weighted_slope_sum)
-    chunks: list[tuple[list, float, float]] = []
+    # chunks[i] = (nodes, distance_m, weighted_slope_sum, is_stairs)
+    chunks: list[tuple[list, float, float, bool]] = []
     cur_nodes = [path_nodes[0]]
     cur_dist  = 0.0
     cur_wsum  = 0.0   # Σ(slope_pct * length_m) — 거리가중평균의 분자
+    cur_stairs = False
 
     for u, v in zip(path_nodes, path_nodes[1:]):
         cur_nodes.append(v)
@@ -68,30 +72,34 @@ def build_measurement_units(
             slope  = d.get("slope_pct", 0.0)
             cur_dist += length
             cur_wsum += slope * length
+            if d.get("highway") == "steps":
+                cur_stairs = True
 
         if cur_dist >= min_distance_m:
-            chunks.append((cur_nodes, cur_dist, cur_wsum))
+            chunks.append((cur_nodes, cur_dist, cur_wsum, cur_stairs))
             cur_nodes = [v]
             cur_dist  = 0.0
             cur_wsum  = 0.0
+            cur_stairs = False
 
     if len(cur_nodes) >= 2:
         if chunks:
             # 마지막 조각(항상 min_distance_m 미만 — 위 루프가 그 이상이면 이미
             # chunk로 끊었으므로)을 직전 unit에 흡수
-            last_nodes, last_dist, last_wsum = chunks[-1]
+            last_nodes, last_dist, last_wsum, last_stairs = chunks[-1]
             chunks[-1] = (
                 last_nodes + cur_nodes[1:],
                 last_dist + cur_dist,
                 last_wsum + cur_wsum,
+                last_stairs or cur_stairs,
             )
         else:
             # 경로 전체가 30m 미만 — 그 자체로 유일한 unit
-            chunks.append((cur_nodes, cur_dist, cur_wsum))
+            chunks.append((cur_nodes, cur_dist, cur_wsum, cur_stairs))
 
     # ── 2. MeasurementUnit 객체 생성 ─────────────────────────────────────────
     units = []
-    for i, (nodes, dist, wsum) in enumerate(chunks):
+    for i, (nodes, dist, wsum, is_stairs) in enumerate(chunks):
         slope_pct = (wsum / dist) if dist > 0 else 0.0
         units.append(MeasurementUnit(
             unit_index         = i,
@@ -100,5 +108,6 @@ def build_measurement_units(
             intermediate_nodes  = nodes[1:-1],
             distance_m          = round(dist, 1),
             slope_pct           = round(slope_pct, 2),
+            is_stairs           = is_stairs,
         ))
     return units

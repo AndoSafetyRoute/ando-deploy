@@ -132,6 +132,11 @@ class NavSegment:
     slope_max:          float = 0.0
     slope_stddev:       float = 0.0
     zone:               str   = "flat"
+    # S6.5 — 사실 필드만. 차단 여부는 이 값을 참조하는 cost.FACILITY_POLICY가
+    # 결정한다(여기 인코딩하지 않음). OSM 원본 highway=='steps' 태그 기반
+    # (graph.py가 이미 엣지 속성으로 보존 — 근사 아님). 구간 안의 엣지 중
+    # 하나라도 계단이면 True(휠체어는 그 구간의 일부만 계단이어도 통과 불가).
+    is_stairs:          bool  = False
 
     def all_nodes(self) -> list:
         return [self.start_node] + self.intermediate_nodes + [self.end_node]
@@ -144,18 +149,21 @@ def extract_waypoints(G) -> set:
 
 def _compute_stats(G, nodes: list, user_type: str) -> tuple:
     """
-    노드 시퀀스의 엣지들에서 (length_m, slope_mean, slope_max, slope_stddev, zone) 계산.
-    엣지가 없으면 모두 0 / flat.
+    노드 시퀀스의 엣지들에서 (length_m, slope_mean, slope_max, slope_stddev, zone,
+    is_stairs) 계산. 엣지가 없으면 모두 0 / flat / False.
     """
     slopes, total_len = [], 0.0
+    is_stairs = False
     for u, v in zip(nodes, nodes[1:]):
         if G.has_edge(u, v):
             d = G[u][v]
             slopes.append(d.get("slope_pct", 0.0))
             total_len += d.get("length_m", 0.0)
+            if d.get("highway") == "steps":
+                is_stairs = True
 
     if not slopes:
-        return 0.0, 0.0, 0.0, 0.0, "flat"
+        return 0.0, 0.0, 0.0, 0.0, "flat", is_stairs
 
     mean = sum(slopes) / len(slopes)
     mx   = max(abs(s) for s in slopes)
@@ -169,11 +177,11 @@ def _compute_stats(G, nodes: list, user_type: str) -> tuple:
         direction = "down"
     zone = classify_zone(mean, direction, user_type)
 
-    return total_len, round(mean, 3), round(mx, 3), round(std, 3), zone
+    return total_len, round(mean, 3), round(mx, 3), round(std, 3), zone, is_stairs
 
 
 def _make_segment(seg_id: int, nodes: list, G, user_type: str) -> NavSegment:
-    length, mean, mx, std, zone = _compute_stats(G, nodes, user_type)
+    length, mean, mx, std, zone, is_stairs = _compute_stats(G, nodes, user_type)
     return NavSegment(
         segment_id         = seg_id,
         start_node         = nodes[0],
@@ -184,6 +192,7 @@ def _make_segment(seg_id: int, nodes: list, G, user_type: str) -> NavSegment:
         slope_max          = mx,
         slope_stddev       = std,
         zone               = zone,
+        is_stairs          = is_stairs,
     )
 
 
