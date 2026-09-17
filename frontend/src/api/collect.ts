@@ -8,7 +8,11 @@
 // 이 파일은 순수하게 스키마 + HTTP 한 번만 책임진다.
 
 import { BASE_URL, getAuthToken } from "../api";
-import { COLLECT_BATCH_PATH, COLLECT_SESSION_START_PATH } from "../personalization/config";
+import {
+  COLLECT_BATCH_PATH,
+  COLLECT_SESSION_START_PATH,
+  COLLECT_SESSION_GPS_FIX_PATH,
+} from "../personalization/config";
 
 // ── 신호 A: 경사 bin별 통과 관측 ────────────────────────────────────────────────
 export type SlopeObservation = {
@@ -121,6 +125,39 @@ export async function startCollectSession(
     }
   } finally {
     clearTimeout(timer);
+  }
+}
+
+export type GpsFixStageReport = {
+  sessionId: string;
+  stage:     string;   // 'best_nav' | 'high' | 'balanced' | 'none'
+  fixMs:     number;   // watch 시작~첫 픽스 수신까지(ms)
+};
+
+/**
+ * S0 보완 — 정확도 fallback으로 첫 픽스를 받은 단계와 소요시간을 sessions에
+ * 기록(분석 시 "이 세션이 어느 정확도 단계로 시작됐는지" 구분용). 세션당 1회,
+ * 첫 픽스 수신 직후 호출. 실패해도 던지지 않는다(진단용 부가 정보라 안내
+ * 흐름을 막을 이유가 없음 — 다른 best-effort 호출과 동일 원칙).
+ */
+export async function reportGpsFixStage(
+  body: GpsFixStageReport,
+  idToken?: string,
+): Promise<void> {
+  const token = idToken ?? (await getAuthToken());
+  if (!token) return;
+  try {
+    await fetch(`${BASE_URL}${COLLECT_SESSION_GPS_FIX_PATH}`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        session_id: body.sessionId,
+        stage:      body.stage,
+        fix_ms:     body.fixMs,
+      }),
+    });
+  } catch {
+    /* best-effort */
   }
 }
 

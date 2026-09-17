@@ -34,7 +34,7 @@ from database import (
     save_zone_observation, get_user_speed_profile, save_collect_batch,
     delete_user_account, get_personalization_status,
     get_slow_segments, save_segment_hardship_feedback, get_segment_hardship_feedback,
-    start_session, add_navigation_measurement, save_gps_batch,
+    start_session, record_gps_fix_stage, add_navigation_measurement, save_gps_batch,
     get_route_measurements,
 )
 from routing.speed import get_zone_key, estimate_route_time, get_default_speed
@@ -1088,6 +1088,32 @@ def api_collect_session_start(
     )
     if not ok:
         raise HTTPException(503, "DB 미설정")
+    return {"ok": True}
+
+
+class GpsFixStageRequest(BaseModel):
+    session_id: str
+    stage:      str   # 'best_nav' | 'high' | 'balanced' | 'none'
+    fix_ms:     int
+
+
+@app.post("/collect/session/gps-fix")
+def api_collect_session_gps_fix(
+    body: GpsFixStageRequest,
+    db: Session = Depends(get_db),
+    decoded: dict = Depends(_verified),
+):
+    """S0 보완 — GPS 정확도 fallback 중 첫 픽스를 받은 단계 기록(진단용, sessions
+    UPDATE). 세션 소유자가 아니거나 sessions 행이 아직 없으면(레이스 — /collect/
+    session/start보다 먼저 도착) 조용히 무시한다(안내 흐름을 막을 이유가 없는
+    부가 정보라 404로 드러내지 않음, best-effort)."""
+    record_gps_fix_stage(
+        db,
+        session_id=body.session_id,
+        uid=decoded["uid"],
+        stage=body.stage,
+        fix_ms=body.fix_ms,
+    )
     return {"ok": True}
 
 

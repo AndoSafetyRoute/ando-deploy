@@ -56,6 +56,10 @@ export const COLLECT_BATCH_PATH   = "/collect/batch";
 // unknown이었다가 뒤늦게 granted"된 첫 걸음의 세션이 영영 유실된다(실측: uid 9명·
 // route 102개 중 session 1건). 두 경로 모두 session_id가 PK라 중복 호출은 안전.
 export const COLLECT_SESSION_START_PATH = "/collect/session/start";
+// S0 보완 — 정확도 fallback 첫 픽스 단계 기록. sessions 행이 있어야 의미가
+// 있어 collectSessionIdRef(=동의 granted 시에만 존재)가 있을 때만 호출된다 —
+// 신호 A/B와 같은 동의 게이트를 자연히 따름(호출부 NavigationScreen.tsx 참고).
+export const COLLECT_SESSION_GPS_FIX_PATH = "/collect/session/gps-fix";
 export const ROUTE_PATH           = "/route";
 export const ROUTE_CANDIDATES_KEY = "candidates";        // 요청 필드: "single" | "compare"
 export const ROUTE_CANDIDATES_COMPARE = "compare";
@@ -116,9 +120,25 @@ export const NEAR_STOP_SPEED_MS = 0.15;
 // Balanced 정확도·5m 이동 요구가 콜백을 추가로 늦춘 것으로 추정된다(실기기
 // 미검증 추정 — 근거 C등급).
 // BestForNavigation은 GPS 칩에 가장 짧은 갱신주기를 요청해 OS 스케줄링 여유를
-// 줄인다. timeInterval을 요청 가능한 하한(1000ms)으로, distanceInterval을
-// 도보 최소 유의 이동량(1m — 0으로 두면 정지 중 GPS 지터만으로 과다 콜백
-// 발생 우려)으로 좁힌다. S0 실기기 테스트로 실측 후 조정.
+// 줄인다. timeInterval을 요청 가능한 하한(1000ms)으로 좁힌다.
 export const GPS_ACCURACY = Location.Accuracy.BestForNavigation;
 export const GPS_TIME_INTERVAL_MS = 1000;
-export const GPS_DISTANCE_INTERVAL_M = 1;
+// S0 보완(2026-09) — 1m에서 0으로 변경. 정지 중에도 콜백이 계속 와야 S2의
+// stopClassifier가 '정지'(계속 콜백은 오는데 위치가 안 바뀜)와 'GPS 공백'
+// (콜백 자체가 끊김)을 구분할 수 있다 — distanceInterval>0이면 정지 중엔
+// timeInterval만으로 콜백이 오길 기대해야 하는데, expo-location 구현상
+// distanceInterval 조건이 우선시돼 정지 중 콜백이 거의 안 오는 사례가
+// 있었다(팀 실측 근거는 아직 없음 — C등급, S0 재검증 시 확인).
+export const GPS_DISTANCE_INTERVAL_M = 0;
+
+// ── S0 보완: 첫 위치 fallback 단계 ──────────────────────────────────────────
+// BestForNavigation은 실내·건물 인근에서 GPS 하드웨어 단독 픽스를 기다리다
+// 첫 위치가 무한 대기에 빠질 수 있다(옛 Accuracy.High 회피 사유와 동일 문제,
+// 더 심할 수 있음). 첫 콜백이 FIRST_FIX_TIMEOUT_S 안에 안 오면 정확도를
+// 단계적으로 낮춰 watch를 재시작한다 — High → (그래도 없으면) Balanced.
+// 근거 C등급(시간값 임의) — 에뮬레이터로는 이 타임아웃 자체를 검증할 수 없음
+// (에뮬레이터는 geo fix 즉시 반영이라 "무한 대기" 상황이 재현 안 됨) →
+// docs/device_verification_pending.md.
+export const FIRST_FIX_TIMEOUT_S = 15;
+export const GPS_ACCURACY_FALLBACK_1 = Location.Accuracy.High;
+export const GPS_ACCURACY_FALLBACK_2 = Location.Accuracy.Balanced;

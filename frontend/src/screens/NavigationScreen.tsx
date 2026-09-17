@@ -44,7 +44,7 @@ import {
 } from "../api";
 import type { NavSegment, Waypoint, MeasurementUnit } from "../api/routeApi";
 import { CollectSession, drainCollectQueue } from "../utils/collectQueue";
-import { startCollectSession } from "../api/collect";
+import { startCollectSession, reportGpsFixStage } from "../api/collect";
 import { GpsTraceBuffer } from "../utils/gpsTraceBuffer";
 import { SlopeBinTracker } from "../utils/slopeBinTracker";
 import {
@@ -54,6 +54,9 @@ import {
   GPS_ACCURACY,
   GPS_TIME_INTERVAL_MS,
   GPS_DISTANCE_INTERVAL_M,
+  FIRST_FIX_TIMEOUT_S,
+  GPS_ACCURACY_FALLBACK_1,
+  GPS_ACCURACY_FALLBACK_2,
 } from "../personalization/config";
 import { useKeepAwake } from "expo-keep-awake";
 import { routeAfterRating } from "../personalization/entry";
@@ -933,6 +936,12 @@ export default function NavigationScreen({ navigation, route }: Props) {
   // 앱이 백그라운드로 나간 시각 — 복귀 시 공백이 크면 진행 중이던 bin 을 버린다
   const bgAtRef         = useRef<number>(0);
 
+  // S0 보완 — 정확도 단계별 첫 위치 fallback(BestForNavigation → High → Balanced).
+  const firstFixReceivedRef = useRef(false);
+  const fallbackTimerRef    = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const watchStartTimeRef   = useRef(0);
+  const gpsFixStageRef      = useRef<string>("best_nav");
+
   // 개인화 데이터 수집 동의 모달 (이슈 #1). unknown 이고 도보 안내일 때만 뜬다.
   const [consentPrompt, setConsentPrompt] = useState(false);
 
@@ -1124,10 +1133,24 @@ export default function NavigationScreen({ navigation, route }: Props) {
       }
 
       console.log("[GPS] watchPosition 시작");
-      subscriptionRef.current = await Location.watchPositionAsync(
-        GPS_WATCH_OPTIONS,
-        (loc) => {
+      // S0 보완 — handleGpsFix는 세 정확도 단계(startGpsWatch, 아래) 공통 콜백이라
+      // const로 뽑아 재사용한다. 콜백 내부 로직 자체는 기존과 동일.
+      const handleGpsFix = (loc: Location.LocationObject) => {
           if (!mounted) return;
+
+          if (!firstFixReceivedRef.current) {
+            firstFixReceivedRef.current = true;
+            if (fallbackTimerRef.current) { clearTimeout(fallbackTimerRef.current); fallbackTimerRef.current = null; }
+            const fixMs = Date.now() - watchStartTimeRef.current;
+            console.log(`[GPS] 첫 픽스 수신 — stage=${gpsFixStageRef.current} ${fixMs}ms`);
+            const sid = collectSessionIdRef.current;
+            if (sid) {
+              getAuthToken().then((token) => {
+                if (!token) return;
+                reportGpsFixStage({ sessionId: sid, stage: gpsFixStageRef.current, fixMs }, token).catch(() => {});
+              }).catch(() => {});
+            }
+          }
 
           console.log("[GPS] 위치 수신:", loc.coords.latitude, loc.coords.longitude, "정확도:", loc.coords.accuracy);
 
@@ -1560,8 +1583,41 @@ export default function NavigationScreen({ navigation, route }: Props) {
               speak(wp.guidance_text);
             }
           });
+        };
+
+      // S0 보완 — BestForNavigation이 실내·건물 인근에서 첫 픽스를 못 잡고
+      // 무한 대기할 수 있어(옛 Accuracy.High 회피 사유와 동일 문제, 더 심할 수
+      // 있음), FIRST_FIX_TIMEOUT_S 안에 첫 콜백이 없으면 정확도를 낮춰 재시도한다.
+      // 에뮬레이터(geo fix)는 즉시 반영이라 이 타임아웃 경로 자체를 재현할 수
+      // 없다 — docs/device_verification_pending.md.
+      async function startGpsWatch(stageIndex: number): Promise<void> {
+        const stages: { accuracy: Location.Accuracy; label: string }[] = [
+          { accuracy: GPS_ACCURACY,            label: "best_nav" },
+          { accuracy: GPS_ACCURACY_FALLBACK_1, label: "high" },
+          { accuracy: GPS_ACCURACY_FALLBACK_2, label: "balanced" },
+        ];
+        const stage = stages[stageIndex];
+        if (!stage) {
+          // 세 단계 모두 첫 픽스 실패 — 마지막(balanced) 구독은 계속 살아있으니
+          // 나중에 픽스가 오면 handleGpsFix가 정상 처리한다. 기록만 'none'으로.
+          gpsFixStageRef.current = "none";
+          return;
         }
-      );
+        gpsFixStageRef.current = stage.label;
+        watchStartTimeRef.current = Date.now();
+        subscriptionRef.current = await Location.watchPositionAsync(
+          { ...GPS_WATCH_OPTIONS, accuracy: stage.accuracy },
+          handleGpsFix,
+        );
+        fallbackTimerRef.current = setTimeout(() => {
+          if (!mounted || firstFixReceivedRef.current) return;
+          console.log(`[GPS] stage=${stage.label} ${FIRST_FIX_TIMEOUT_S}s 내 첫 픽스 없음 — 다음 단계로 전환`);
+          subscriptionRef.current?.remove();
+          startGpsWatch(stageIndex + 1).catch(() => {});
+        }, FIRST_FIX_TIMEOUT_S * 1000);
+      }
+
+      await startGpsWatch(0);
       console.log("[GPS] watchPosition 구독 성공");
       } catch (err: any) {
         console.log("[GPS] 에러:", err?.message ?? err);
@@ -1596,6 +1652,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
     return () => {
       mounted = false;
       if (gpsWatchdog) clearTimeout(gpsWatchdog);
+      if (fallbackTimerRef.current) clearTimeout(fallbackTimerRef.current);
       appStateSub.remove();
       subscriptionRef.current?.remove();
       subscriptionRef.current = null;

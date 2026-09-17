@@ -545,6 +545,16 @@ def init_db():
                 schema_ver   INT NOT NULL
             )
         """))
+        # S0 보완 — GPS 정확도 fallback(BestForNavigation→High→Balanced) 중
+        # 첫 픽스를 받은 단계와 소요시간. 진단용 — "이 세션이 어느 정확도로
+        # 시작됐는지" 분석 시 구분하는 용도(personalization-data-collection-plan
+        # 밖, 신호 A~D 학습에는 쓰지 않음).
+        conn.execute(text(
+            "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS gps_fix_stage TEXT"
+        ))
+        conn.execute(text(
+            "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS gps_fix_ms INT"
+        ))
 
         # 구간(측정 단위, routing/measurement_units.py) 별 실측/스킵 기록.
         # 기존 navigation_segments를 대체하지 않는다 — navigation_segments는
@@ -1131,6 +1141,26 @@ def start_session(
     })
     db.commit()
     return True
+
+
+_GPS_FIX_STAGES = {"best_nav", "high", "balanced", "none"}
+
+
+def record_gps_fix_stage(db: Session, session_id: str, uid: str, stage: str, fix_ms: int) -> bool:
+    """S0 보완 — GPS 정확도 fallback 중 첫 픽스를 받은 단계 기록. 세션 소유자
+    확인 후 UPDATE(세션당 보통 1회 호출이라 upsert 불필요, 재호출은 덮어씀).
+    """
+    if not engine:
+        return False
+    if stage not in _GPS_FIX_STAGES:
+        return False
+
+    result = db.execute(text("""
+        UPDATE sessions SET gps_fix_stage = :stage, gps_fix_ms = :fix_ms
+        WHERE session_id = :session_id AND uid = :uid
+    """), {"session_id": session_id, "uid": uid, "stage": stage, "fix_ms": fix_ms})
+    db.commit()
+    return result.rowcount > 0
 
 
 def add_navigation_measurement(
