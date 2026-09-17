@@ -20,6 +20,9 @@ export const SLOPE_ZONE_THRESHOLDS: Record<
   cane:                { up: { g_opt: 8.0, g_warn: 12.0 }, down: { g_opt: 8.0, g_warn: 12.0 } },
   leg_injury:          { up: { g_opt: 0.0, g_warn: 5.0  }, down: { g_opt: 5.0, g_warn: 8.0  } },
   elderly:             { up: { g_opt: 5.0, g_warn: 8.0  }, down: { g_opt: 5.0, g_warn: 8.0  } },
+  // S6 — backend routing/cost.py USER_TYPES와 동일한 플레이스홀더(임의값,
+  // 실측 재검토 필요 — 그 파일 주석 참고).
+  general:             { up: { g_opt: 10.0, g_warn: 20.0 }, down: { g_opt: 10.0, g_warn: 20.0 } },
 };
 
 export const SLOPE_FLAT_THRESHOLD_PCT = 0.5; // backend config.py FLAT_THRESHOLD와 동일
@@ -42,6 +45,7 @@ function resolveThresholdKey(walkerType?: string): string {
       지팡이: "cane",
       고령자: "elderly",
       다리부상: "leg_injury",
+      일반: "general",
     };
     const mapped = KOREAN_MAP[walkerType];
     if (mapped && SLOPE_ZONE_THRESHOLDS[mapped]) return mapped;

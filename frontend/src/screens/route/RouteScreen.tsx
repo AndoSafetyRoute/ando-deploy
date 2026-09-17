@@ -101,6 +101,7 @@ const WALKER_TYPES = [
   { key: "cane", label: "지팡이", icon: "🦯" },
   { key: "leg_injury", label: "목발 사용자", icon: "🩹" },
   { key: "elderly", label: "고령자", icon: "👴" },
+  { key: "general", label: "일반", icon: "🧍" },
 ];
 
 function safeParseRouteData(routeData?: string) {

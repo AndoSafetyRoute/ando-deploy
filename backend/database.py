@@ -68,6 +68,13 @@ def init_db():
             ("display_name",  "TEXT"),
             ("photo_url",     "TEXT"),
             ("last_login_at", "TIMESTAMPTZ DEFAULT NOW()"),
+            # S6 — 파일럿 참가자 구분. is_tester=팀 내부 테스트 계정(학습 데이터 오염
+            # 방지용 배제 플래그), participant_cohort=파일럿 코호트 라벨(NULL=파일럿
+            # 외 일반 사용자). 둘 다 이 마이그레이션에서 값을 채우지 않는다 — 누가
+            # 테스터/참가자인지는 파일럿 운영진이 수동 지정(SQL/관리 화면, 이 세션
+            # 범위 밖).
+            ("is_tester",          "BOOLEAN NOT NULL DEFAULT FALSE"),
+            ("participant_cohort", "TEXT"),
         ]:
             conn.execute(text(
                 f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {definition}"
@@ -202,10 +209,10 @@ def init_db():
             conn.execute(text(stmt))
 
         # ── CHECK / FK 제약 추가 (이미 있으면 무시) ─────────────────────────
-        _user_type_vals = "'manual_wheelchair','electric_wheelchair','walker','cane','leg_injury','elderly'"
+        # S6 — 'general'(일반) 추가(routing/cost.py USER_TYPES와 동일 목록 유지).
+        _user_type_vals = "'manual_wheelchair','electric_wheelchair','walker','cane','leg_injury','elderly','general'"
         for tbl, name, definition in [
             ("routes",              "chk_route_mode", "CHECK (mode IN ('walk','transit','car','accessibility'))"),
-            ("users",               "chk_user_type",  f"CHECK (user_type IS NULL OR user_type IN ({_user_type_vals}))"),
             ("navigation_segments", "chk_zone",       "CHECK (zone IS NULL OR zone IN ('flat','optimal','warning','forbidden'))"),
             ("navigation_segments", "chk_direction",  "CHECK (direction IS NULL OR direction IN ('flat','up','down'))"),
             ("feedback",            "fk_feedback_uid","FOREIGN KEY (uid) REFERENCES users(uid) ON DELETE CASCADE"),
@@ -228,6 +235,13 @@ def init_db():
         conn.execute(text(
             "ALTER TABLE routes ADD CONSTRAINT chk_status "
             "CHECK (status IN ('in_progress','completed','completed_partial','abandoned'))"
+        ))
+
+        # chk_user_type도 동일 사유(값 목록이 늘 때 재정의 필요) — S6에서 'general' 추가.
+        conn.execute(text("ALTER TABLE users DROP CONSTRAINT IF EXISTS chk_user_type"))
+        conn.execute(text(
+            f"ALTER TABLE users ADD CONSTRAINT chk_user_type "
+            f"CHECK (user_type IS NULL OR user_type IN ({_user_type_vals}))"
         ))
 
         # ── 부분 인덱스 ───────────────────────────────────────────────────────
@@ -350,6 +364,11 @@ def init_db():
         conn.execute(text(
             "ALTER TABLE trip_slope_observations ADD COLUMN IF NOT EXISTS valid BOOLEAN"
         ))
+        # S6 — slope 0/NULL/교량 구분('dem'|'bridge_zero'|'missing', routing/graph.py
+        # 참고). 구버전 FE가 보낸 행은 NULL로 남는다(단정 못 함 — 값을 소급 추정하지 않음).
+        conn.execute(text(
+            "ALTER TABLE trip_slope_observations ADD COLUMN IF NOT EXISTS slope_source TEXT"
+        ))
 
         # 신호 B: 순간속도 원본 (판정값 저장 금지 — 3.8절 원칙 1)
         conn.execute(text("""
@@ -449,8 +468,36 @@ def init_db():
             )
         """))
 
+        # S6 — route_kind는 지금까지 컬럼만 있고 어디서도 채워진 적이 없었다(전수
+        # grep 확인). sessions.phase와 동일한 3값 — 그 세션이 학습/비교/자유
+        # 이용 중 무엇이었는지를 라우트 단위로도 남긴다(trip_slope_observations는
+        # session_id 없이 route_id만으로도 조회하는 경로가 있어, 세션 조인 없이
+        # 바로 필터링하려면 route 쪽에도 있어야 함). 기존 행(전부 NULL)은 'free'로
+        # 채우고 NOT NULL을 건다 — 과거 데이터는 전부 파일럿 이전 일반 이용이었다.
         conn.execute(text(
             "ALTER TABLE routes ADD COLUMN IF NOT EXISTS route_kind TEXT"
+        ))
+        conn.execute(text(
+            "UPDATE routes SET route_kind = 'free' WHERE route_kind IS NULL"
+        ))
+        conn.execute(text(
+            "ALTER TABLE routes ALTER COLUMN route_kind SET DEFAULT 'free'"
+        ))
+        conn.execute(text(
+            "ALTER TABLE routes ALTER COLUMN route_kind SET NOT NULL"
+        ))
+        conn.execute(text("ALTER TABLE routes DROP CONSTRAINT IF EXISTS chk_route_kind"))
+        conn.execute(text(
+            "ALTER TABLE routes ADD CONSTRAINT chk_route_kind "
+            "CHECK (route_kind IN ('learning','comparison','free'))"
+        ))
+        # S6 — 모델 롤아웃 추적(S10/S12에서 사용). 파일럿 전엔 전부 NULL로 둔다
+        # (아직 어떤 arm/버전도 배정하지 않음 — 값을 임의로 채우지 않는다).
+        conn.execute(text(
+            "ALTER TABLE routes ADD COLUMN IF NOT EXISTS model_arm TEXT"
+        ))
+        conn.execute(text(
+            "ALTER TABLE routes ADD COLUMN IF NOT EXISTS model_version TEXT"
         ))
 
         # /collect/batch 멱등 처리용 — (uid, session_id, seq) 중복 배치 무시
@@ -647,6 +694,24 @@ def init_db():
         conn.execute(text(
             "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS gps_fix_ms INT"
         ))
+        # S6 — 파일럿 걷기 종류 구분. phase 기본값 'free'(기존 일반 이용과 완전히
+        # 동일 동작 유지 — 학습/비교 보행은 S9에서 FE가 명시적으로 지정해야 나옴).
+        # comparison_pair_id: 같은 OD를 두 유형/모델로 비교하는 짝(S9) 식별자.
+        # walk_order: 그 짝 안에서 몇 번째로 걸었는지(1|2) — 순서효과 분석용.
+        conn.execute(text(
+            "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS phase TEXT NOT NULL DEFAULT 'free'"
+        ))
+        conn.execute(text(
+            "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS comparison_pair_id TEXT"
+        ))
+        conn.execute(text(
+            "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS walk_order INT"
+        ))
+        conn.execute(text("ALTER TABLE sessions DROP CONSTRAINT IF EXISTS chk_session_phase"))
+        conn.execute(text(
+            "ALTER TABLE sessions ADD CONSTRAINT chk_session_phase "
+            "CHECK (phase IN ('learning','comparison','free'))"
+        ))
 
         # 구간(측정 단위, routing/measurement_units.py) 별 실측/스킵 기록.
         # 기존 navigation_segments를 대체하지 않는다 — navigation_segments는
@@ -745,6 +810,27 @@ def init_db():
                 received_at TIMESTAMPTZ DEFAULT NOW(),
                 PRIMARY KEY (uid, session_id, seq)
             )
+        """))
+
+        # S6 — 학습에 실제로 쓸 신호 A 행만 골라내는 뷰. 4개 조건 전부(AND):
+        #   valid=TRUE(stopClassifier gps_gap/uncertain 제외), facility=FALSE
+        #   (계단 등 시설 구간 제외 — slope 판정을 신뢰 못 함), is_tester=FALSE
+        #   (팀 내부 테스트 계정 배제), participant_cohort IS NOT NULL(파일럿
+        #   참가자로 등록된 사용자만), phase='learning'(학습 보행 세션만 — 비교/
+        #   자유 이용 걸음은 다른 목적이라 섞으면 안 됨).
+        # valid/facility가 NULL(구버전 FE 행)이면 안전하지 않다고 보고 제외한다
+        # (거짓으로 단정하지 않음 — IS TRUE/IS FALSE는 NULL을 자동으로 걸러냄).
+        conn.execute(text("""
+            CREATE OR REPLACE VIEW learning_rows_v AS
+            SELECT tso.*
+            FROM trip_slope_observations tso
+            JOIN sessions s ON s.session_id = tso.session_id
+            JOIN users    u ON u.uid = tso.uid
+            WHERE tso.valid IS TRUE
+              AND tso.facility IS FALSE
+              AND u.is_tester = FALSE
+              AND u.participant_cohort IS NOT NULL
+              AND s.phase = 'learning'
         """))
 
         conn.commit()
@@ -1711,12 +1797,12 @@ def save_collect_batch(
                 (uid, route_id, session_id, user_type, distance_m, elapsed_ms, gps_sample_n,
                  slope_mean, slope_max, ascent_m, descent_m,
                  step_delta, stop_class, dwell_ms, moving_ms, avg_gps_accuracy,
-                 device_model, near_crossing, facility, valid)
+                 device_model, near_crossing, facility, valid, slope_source)
             VALUES
                 (:uid, :route_id, :session_id, :user_type, :distance_m, :elapsed_ms, :gps_sample_n,
                  :slope_mean, :slope_max, :ascent_m, :descent_m,
                  :step_delta, :stop_class, :dwell_ms, :moving_ms, :avg_gps_accuracy,
-                 :device_model, :near_crossing, :facility, :valid)
+                 :device_model, :near_crossing, :facility, :valid, :slope_source)
         """), {
             "uid":          uid,
             "route_id":     obs.get("route_id"),
@@ -1738,6 +1824,7 @@ def save_collect_batch(
             "near_crossing":    obs.get("near_crossing"),
             "facility":         obs.get("facility"),
             "valid":            obs.get("valid"),
+            "slope_source":     obs.get("slope_source"),
         })
 
     # ── user_speed_profile EMA 갱신 (인계 v2 §4.5 B-2 + Q&A #4) ────────────────

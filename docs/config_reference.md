@@ -117,4 +117,97 @@ NULL)은 이 필터에서 자동 제외된다 — 과거 데이터로는 D 랭�
   재사용)으로 작성했고 `tsc --noEmit` 통과까지만 확인함. 실기기/에뮬레이터
   화면 흐름 확인은 `docs/device_verification_pending.md`로.
 
-## (이후 S6~S15 상수는 해당 항목 작업 시 이 문서에 추가)
+## S6. 스키마 보강 · route_kind · learning_rows_v
+
+파일: `backend/database.py::init_db`, `backend/routing/graph.py`,
+`backend/routing/pathfinder.py`, `backend/routing/cost.py`,
+`backend/subway/facility.py`, `frontend/src/utils/distanceRowTracker.ts`,
+`frontend/src/screens/NavigationScreen.tsx`, `frontend/src/utils/slopeZone.ts`
+
+**1) `slope_source` ('dem'|'bridge_zero'|'missing') — slope 0/NULL/교량 구분**
+
+| 상수/필드 | 값 | 근거 등급 | 근거 | 실기기 검증 |
+|---|---|---|---|---|
+| `graph.py` 엣지 `slope_source` | `bridge=="T"→bridge_zero`, `slope_pct 없음→missing`, 그 외`→dem` | A | 사실 분류(추정 아님) — OSM/DEM 원본 태그 그대로 반영 | 그래프 재빌드 불필요(런타임 계산) — 로컬 회귀만 확인 |
+| `distanceRowTracker.ts` 행 집계 | worst-wins(`missing > bridge_zero > dem`) | A | 행(25m) 안에 여러 raw edge가 섞이므로 "가장 못 믿을 값"으로 행 전체를 표시해야 과대신뢰 방지 | 헤드리스 테스트 통과(`distanceRowTracker_test.ts` [7]), 실기기 미검증 |
+
+경로: `graph.py`(엣지 생성 3곳: `_build_graph_densified`/`_connect_components`
+브리지 커넥터/`_snap_nearby_nodes`) → `pathfinder.py::recalculate_path_slopes`
+(`segments[i].slope_source`) → `app.py::_segments_payload`(FE routeSegments에
+포함) → FE `NavigationScreen.tsx::normalizeSegments`(RouteSegment.slope_source)
+→ `distanceRowTrackerRef.completeSegment(..., slopeSource)` → worst-wins 집계
+→ `buildSlopeObservationPayload` → `SlopeObservationPayload.slope_source`(BE,
+optional/하위호환) → `trip_slope_observations.slope_source`(nullable TEXT).
+
+**버그 수정(이 패스에서 발견)**: `normalizeSegments()`가 raw API 세그먼트의
+`is_stairs`를 새 객체로 복사하지 않고 있었다 — S6.5부터 타입 선언만 있고
+실제 매핑이 빠져서, `completeSegment()` 호출 시점엔 `seg.is_stairs`가 항상
+`undefined`(=`false`)였다. 즉 계단 통과 시 신호 A 행의 `facility` 플래그가
+한 번도 `true`가 된 적이 없었다(에뮬레이터/실기기 무관 — 로직 자체 결함).
+`slope_source`를 넣는 김에 같은 곳에서 함께 수정.
+
+**2) `general`(일반 보행자) 유형 추가 — C등급 플레이스홀더**
+
+`routing/cost.py::USER_TYPES["general"]`(g_opt/g_warn=10.0/20.0%, r=0.50)을
+그대로 미러링: `frontend/src/utils/slopeZone.ts`, `storage.ts`, `settings.tsx`,
+`RouteScreen.tsx`. `subway/facility.py::_ESC_PREFERRED`에도 추가(AMBUL과 동일
+취급). **버그 수정**: `database.py`의 `chk_user_type` CHECK 제약이 목록에
+`'general'`을 포함하지 않아 이 유형으로 가입/변경 시 DB에서 거부될 뻔했다 —
+`chk_status`와 동일한 DROP+ADD 패턴으로 재정의.
+
+| 항목 | 값 | 근거 등급 | 비고 |
+|---|---|---|---|
+| `general` g_opt/g_warn | 10.0 / 20.0 (up/down 동일) | **C** | 실측 없음 — 파일럿 로그로 재검토 필요 |
+| `general` r_up/r_down | 0.50 | **C** | 동상 |
+
+**3) 파일럿 스키마 보강**
+
+| 테이블.컬럼 | 타입/기본값 | 용도 |
+|---|---|---|
+| `users.is_tester` | `BOOLEAN NOT NULL DEFAULT FALSE` | 팀 내부 테스트 계정 배제 플래그. **값은 이 세션에서 채우지 않음** — 파일럿 운영진이 수동 지정 |
+| `users.participant_cohort` | `TEXT` (nullable) | 파일럿 참가자 코호트 라벨. NULL=파일럿 비참가자 |
+| `sessions.phase` | `TEXT NOT NULL DEFAULT 'free'`, CHECK IN (`learning`,`comparison`,`free`) | 학습/비교/자유 이용 구분. 기존·현재 트래픽은 전부 `free`(기본값, 명시 지정 전까지 동작 변화 없음) |
+| `sessions.comparison_pair_id` | `TEXT` (nullable) | S9(비교 보행)에서 같은 OD 짝을 묶는 식별자 — 아직 미사용 |
+| `sessions.walk_order` | `INT` (nullable) | 짝 안에서 순서(1|2), 순서효과 분석용 — 아직 미사용 |
+| `routes.route_kind` | `TEXT NOT NULL DEFAULT 'free'`, CHECK IN (`learning`,`comparison`,`free`) | 기존 행(전부 NULL)은 마이그레이션 시 `'free'`로 백필 후 NOT NULL 적용. **현재 모든 경로 생성 호출부가 이 컬럼을 명시하지 않으므로 DEFAULT로만 채워진다** — S9에서 비교 보행 플로우를 구현할 때 `start_navigation()`에 파라미터를 추가해 `'comparison'`/`'learning'`을 명시적으로 넘기도록 해야 함(지금은 그 흐름이 없어 과설계 방지 차원에서 파라미터를 만들지 않음) |
+| `routes.model_arm` / `model_version` | `TEXT` (nullable) | S10/S12(모델 롤아웃) 대비 컬럼만 선점. 값은 아직 아무도 채우지 않음 |
+| `trip_slope_observations.slope_source` | `TEXT` (nullable) | 위 1) 참고 |
+
+**`MEASUREMENT_SCHEMA_VERSION` 유지(1 → 유지, 2로 올리지 않음)**: 이 파일
+자체 주석(`config.ts`)에 "필드·엔드포인트가 하위호환 없이 바뀔 때만 올린다"는
+기준이 명시돼 있고, S2/S3/S6에서 추가한 필드는 전부 optional(구버전 FE도
+그대로 동작, BE도 없으면 None 처리)이라 이 기준에 해당하지 않는다. 이전
+세션 요약에 "2로 올린다"는 계획이 있었으나, 실제 코드의 명시된 정책과
+배치되어 이번 패스에서 계획을 폐기하고 1을 유지했다.
+
+**4) `learning_rows_v` 뷰**
+
+```sql
+CREATE OR REPLACE VIEW learning_rows_v AS
+SELECT tso.*
+FROM trip_slope_observations tso
+JOIN sessions s ON s.session_id = tso.session_id
+JOIN users    u ON u.uid = tso.uid
+WHERE tso.valid IS TRUE
+  AND tso.facility IS FALSE
+  AND u.is_tester = FALSE
+  AND u.participant_cohort IS NOT NULL
+  AND s.phase = 'learning'
+```
+
+5개 조건 전부 AND. `valid`/`facility`가 NULL(구버전 FE 행)이면 안전하지
+않다고 보고 제외(`IS TRUE`/`IS FALSE`는 NULL을 자동으로 걸러냄 — 거짓으로
+단정하지 않음). 검증: `backend/scripts/learning_rows_v_test.py`(8케이스 —
+정상 포함 + 5조건 각각 단독 위반 케이스 5개 + phase 값 2종) 전부 통과.
+
+**검증 방식**: 로컬 dev Postgres(`ando-local-pg`, `localhost:5433`)에
+`init_db()` 2회 실행(신규 적용 + 멱등성 확인) + 제약/뷰 직접 조회 +
+`chk_user_type`에 `'general'` insert 성공 확인 + 기존 회귀
+(`facility_policy_test.py`/`slow_segments_v2_test.py`/
+`segment_hardest_pick_test.py`) 전부 재통과 + 신규
+`learning_rows_v_test.py` 통과. 프런트는 `tsc --noEmit` + 전체 헤드리스
+테스트(`distanceRowTracker_test.ts`/`stepRingBuffer_test.ts`/
+`stopClassifier_test.ts`) 재통과. **실기기/에뮬레이터 UI 미검증**(Metro
+OOM 회피 방침 유지) — `docs/device_verification_pending.md` 참고.
+
+## (이후 S8~S15 상수는 해당 항목 작업 시 이 문서에 추가)

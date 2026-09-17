@@ -124,6 +124,16 @@ def _build_graph_densified(data: dict) -> nx.DiGraph:
         layer          = props.get("layer", 0)
         bridge         = props.get("bridge", "F")
         tunnel         = props.get("tunnel", "F")
+        # S6 — slope 0과 NULL/교량 구분. 원본에 slope_pct 자체가 없었으면(DEM
+        # 조회 실패 등) "missing", 실재 OSM 교량(bridge="T", DEM이 다리 아래
+        # 지형을 잰 것이라 신뢰 못함)이면 "bridge_zero", 그 외엔 DEM 실측값
+        # 그대로 "dem"(0%도 포함 — 진짜 평지일 수 있음).
+        if bridge == "T":
+            slope_source = "bridge_zero"
+        elif "slope_pct" not in props:
+            slope_source = "missing"
+        else:
+            slope_source = "dem"
 
         if u not in G:
             G.add_node(u, lon=lon1, lat=lat1, elevation=elevation_start)
@@ -139,6 +149,7 @@ def _build_graph_densified(data: dict) -> nx.DiGraph:
             elevation_end=elevation_end,
             highway=highway, name=name,
             layer=layer, bridge=bridge, tunnel=tunnel,
+            slope_source=slope_source,
         )
         rev = dict(fwd,
             slope_pct=-slope_pct,
@@ -307,7 +318,10 @@ def _snap_nearby_nodes(G: nx.DiGraph, tol_m: float) -> int:
         sp = mag if (ev - eu) >= 0 else -mag
         base = dict(length_m=round(d, 2), slope_abs=mag,
                     highway="snap", name="", snap=True,
-                    layer=0, bridge="F", tunnel="F")
+                    layer=0, bridge="F", tunnel="F",
+                    # S6 — 인접 실제 엣지에서 상속한 추정값이라 0-임의값도 결측도
+                    # 아님 — "dem"(실측 기반 추정)으로 분류.
+                    slope_source="dem")
         G.add_edge(u, v, slope_pct=sp,
                    elevation_start=eu, elevation_end=ev, **base)
         G.add_edge(v, u, slope_pct=-sp,
@@ -417,7 +431,11 @@ def _connect_components(G: nx.DiGraph, bridge_gap_m: float) -> nx.DiGraph:
             bd = dict(length_m=best_dist, slope_pct=0.0, slope_abs=0.0,
                       elevation_start=eu, elevation_end=ev,
                       highway="bridge", name="",
-                      layer=0, bridge="F", tunnel="F")
+                      layer=0, bridge="F", tunnel="F",
+                      # S6 — 인공 연결(그래프 단절 보정)이라 slope_pct=0이 DEM
+                      # 실측이 아니다 — bridge_zero로 분류(실재 OSM 교량과 같은
+                      # "0을 못 믿는" 사유 카테고리 재사용).
+                      slope_source="bridge_zero")
             G.add_edge(best_u, best_v, **bd)
             G.add_edge(best_v, best_u, **dict(bd, elevation_start=ev, elevation_end=eu))
             main_set.update(small_list)

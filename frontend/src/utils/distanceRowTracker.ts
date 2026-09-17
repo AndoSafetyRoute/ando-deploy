@@ -7,6 +7,14 @@
 
 export const ROW_LEN_M = 25;
 
+export type SlopeSource = "dem" | "bridge_zero" | "missing";
+// "최악"= 이 행의 slope_mean을 가장 못 믿게 만드는 값. missing(결측 추정) >
+// bridge_zero(교량/인공연결 0-임의값) > dem(실측, 0%도 포함).
+const SLOPE_SOURCE_SEVERITY: Record<SlopeSource, number> = { dem: 0, bridge_zero: 1, missing: 2 };
+function worseSlopeSource(a: SlopeSource, b: SlopeSource): SlopeSource {
+  return SLOPE_SOURCE_SEVERITY[b] > SLOPE_SOURCE_SEVERITY[a] ? b : a;
+}
+
 export type DistanceRowObservation = {
   route_id?:   number | null;
   distance_m:  number;
@@ -22,6 +30,8 @@ export type DistanceRowObservation = {
   end_ms:      number;
   // 이 행을 구성한 raw edge 중 하나라도 계단(S6.5 is_stairs)이면 true.
   facility:    boolean;
+  // S6 — 행을 구성한 raw edge 중 가장 신뢰도 낮은 slope_source(worst-wins).
+  slope_source: SlopeSource;
 };
 
 function mergeObservations(a: DistanceRowObservation, b: DistanceRowObservation): DistanceRowObservation {
@@ -38,6 +48,7 @@ function mergeObservations(a: DistanceRowObservation, b: DistanceRowObservation)
     start_ms:    Math.min(a.start_ms, b.start_ms),
     end_ms:      Math.max(a.end_ms, b.end_ms),
     facility:    a.facility || b.facility,
+    slope_source: worseSlopeSource(a.slope_source, b.slope_source),
   };
 }
 
@@ -49,6 +60,7 @@ export class DistanceRowTracker {
   private ascent = 0;
   private descent = 0;
   private facility = false;
+  private slopeSource: SlopeSource = "dem";
   private poisoned = false;
   // 방금 완성된 행을 바로 내보내지 않고 한 틱 보류한다 — 경로 끝의 자투리
   // (<ROW_LEN_M)를 "다음 행"이 아니라(스트리밍이라 다음 행이 없을 수 있음)
@@ -73,6 +85,7 @@ export class DistanceRowTracker {
   private resetAccum(now: number): void {
     this.dist = 0; this.wsum = 0; this.slopeMax = 0; this.ascent = 0; this.descent = 0;
     this.facility = false;
+    this.slopeSource = "dem";
     this.startTime = now;
   }
 
@@ -82,6 +95,7 @@ export class DistanceRowTracker {
    * 행"이다(1행 지연 스트리밍 — pending 필드 주석 참고). 오염된 상태로
    * 완성된 행은 버려진다(다음 경계부터 다시 시작).
    * isStairs: 이 raw edge(S6.5 is_stairs) — 행 안 어느 하나라도 true면 facility=true.
+   * slopeSource: 이 raw edge의 S6 slope_source — 행 전체는 worst-wins로 집계.
    */
   completeSegment(
     segLengthM: number,
@@ -89,12 +103,14 @@ export class DistanceRowTracker {
     now: number,
     routeId?: number | null,
     isStairs = false,
+    slopeSource: SlopeSource = "dem",
   ): DistanceRowObservation | null {
     const len = segLengthM > 0 ? segLengthM : 0;
     this.dist += len;
     this.wsum += slopePct * len;
     this.slopeMax = Math.max(this.slopeMax, Math.abs(slopePct));
     if (isStairs) this.facility = true;
+    this.slopeSource = worseSlopeSource(this.slopeSource, slopeSource);
     const deltaElevM = (slopePct / 100) * len;
     if (deltaElevM > 0) this.ascent += deltaElevM; else this.descent += -deltaElevM;
 
@@ -146,6 +162,7 @@ export class DistanceRowTracker {
       start_ms:   this.startTime,
       end_ms:     now,
       facility:   this.facility,
+      slope_source: this.slopeSource,
     };
   }
 }

@@ -34,6 +34,8 @@ export type SlopeObservation = {
   near_crossing?:   boolean;
   facility?:        boolean;
   valid?:           boolean;
+  // S6 — 이 행(worst-wins 집계, utils/distanceRowTracker.ts)의 slope 신뢰도.
+  slope_source?:    "dem" | "bridge_zero" | "missing";
 };
 
 // ── 신호 B: 순간속도 원본 (판정값 저장 금지 — §3.8) ───────────────────────────

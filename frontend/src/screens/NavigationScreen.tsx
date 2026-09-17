@@ -53,7 +53,7 @@ import {
 } from "../utils/stopClassifier";
 import { GpsTraceBuffer } from "../utils/gpsTraceBuffer";
 import { binCenter } from "../utils/slopeBinTracker";
-import { DistanceRowTracker, type DistanceRowObservation } from "../utils/distanceRowTracker";
+import { DistanceRowTracker, type DistanceRowObservation, type SlopeSource } from "../utils/distanceRowTracker";
 import {
   SPEED_SAMPLE_MAX_GAP_S,
   IMPLIED_SPEED_JUMP_MPS,
@@ -106,6 +106,8 @@ type RouteSegment = {
   outsideSeoul?: boolean;
   // S6.5 — OSM 원본 highway=='steps' 태그 기반 사실 필드(경사 추정 아님).
   is_stairs?: boolean;
+  // S6 — slope 0/NULL/교량 구분(routing/graph.py 참고).
+  slope_source?: SlopeSource;
 };
 
 // slopeMean/zone 추가 — 오르막/내리막 화살표 표시용
@@ -197,6 +199,12 @@ function normalizeSegments(raw: any): RouteSegment[] {
       // 하이브리드(서울 밖) 직선 구간 — 경사 데이터 없음. 다운스트림(경사색·신호 D)이
       // slope=0 을 실측값으로 오인하지 않도록 표식만 넘긴다.
       outsideSeoul: seg.outside_seoul === true,
+      // 버그 수정(S6): 이 필드들이 raw→RouteSegment 변환에서 누락돼 있었다 —
+      // is_stairs는 S6.5부터 타입 선언만 있고 여기서 복사가 안 돼 완성 세그먼트
+      // 시점(§1479)엔 항상 undefined(=false)였다(계단 facility 판정이 신호 A에서
+      // 죽어 있었음). slope_source는 S6 신규 필드.
+      is_stairs: seg.is_stairs === true,
+      slope_source: (seg.slope_source as SlopeSource | undefined) ?? "missing",
     }))
     .filter(
       (s: RouteSegment) =>
@@ -1027,6 +1035,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
         near_crossing: rowAgg.nearCrossing,
         facility:    rowAgg.facility,
         valid:       rowAgg.valid,
+        slope_source: obs.slope_source,
       };
     },
     [],
@@ -1477,6 +1486,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
                 segCrossTime,
                 serverRouteIdRef.current,
                 seg.is_stairs ?? false,
+                seg.slope_source ?? "missing",
               );
               if (obs) {
                 collectSessionRef.current?.addSlopeObservation(buildSlopeObservationPayload(obs));

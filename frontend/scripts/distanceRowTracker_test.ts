@@ -73,11 +73,23 @@ function testAnchorStartResetsWithoutEmitting() {
   console.log("[6] anchorStart: 누적만 리셋, 방출 없음(첫 행 elapsed_ms 오염 방지)");
 }
 
+function testSlopeSourceWorstWins() {
+  const t = new DistanceRowTracker(0);
+  t.completeSegment(10, 2.0, 1000, undefined, false, "dem");
+  const r = t.completeSegment(15, -2.0, 2000, undefined, false, "bridge_zero"); // 아직 방출 안 됨(1행 지연)
+  assert(r === null, "아직 방출 전인데 값이 나옴");
+  const flushed = t.completeSegment(25, 0, 3000, undefined, false, "dem");
+  assert(flushed !== null && flushed.slope_source === "bridge_zero",
+    `worst-wins 실패(dem+bridge_zero → bridge_zero여야): ${flushed?.slope_source}`);
+  console.log("[7] slope_source: 행 안에 섞이면 worst-wins(missing>bridge_zero>dem) 확인");
+}
+
 testNoEmitBeforeThreshold();
 testEmitAfterThresholdIsDelayedByOne();
 testSlopeMeanWeightedAndAscDescent();
 testPoisonedRowDropped();
 testFinalizeMergesShortTail();
 testAnchorStartResetsWithoutEmitting();
+testSlopeSourceWorstWins();
 console.log(`\n(ROW_LEN_M=${ROW_LEN_M})`);
 console.log("ALL OK");

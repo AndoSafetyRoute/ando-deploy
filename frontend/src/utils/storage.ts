@@ -84,6 +84,10 @@ export const USER_TYPE_MAP: Record<string, string> = {
   '지팡이':  'cane',
   '고령자':  'elderly',
   '다리부상': 'leg_injury',
+  // S6 — 실험 참가자(비보행약자) 그룹. 시설 정책은 AMBUL과 동일(계단 차단,
+  // 에스컬레이터 우선). 슬로프 임계값은 backend routing/cost.py USER_TYPES
+  // 참고 — 플레이스홀더 값이라 실측 전 재검토 필요.
+  '일반':    'general',
 };
 
 export async function saveUserType(koreanType: string): Promise<void> {

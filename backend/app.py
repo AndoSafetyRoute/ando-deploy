@@ -1076,6 +1076,9 @@ class SlopeObservationPayload(BaseModel):
     near_crossing:    bool | None = None
     facility:         bool | None = None
     valid:            bool | None = None
+    # S6 — slope 0/NULL/교량 구분('dem'|'bridge_zero'|'missing'). 구버전 FE는
+    # 이 필드를 안 보내므로 하위호환 optional(BE에서 None→'missing'으로 보정).
+    slope_source:     str | None = None
 
 
 class SpeedSamplePayload(BaseModel):
@@ -1359,6 +1362,7 @@ def _segments_payload(segments: list, user_type: str) -> list:
             "slope":  round(slope_pct, 2),
             "length": round(s["length_m"], 1),
             "is_stairs": s.get("is_stairs", False),
+            "slope_source": s.get("slope_source", "missing"),
         })
     return out
 

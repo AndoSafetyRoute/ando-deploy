@@ -87,6 +87,10 @@ def recalculate_path_slopes(G: nx.DiGraph, path_nodes: list) -> list:
             # S3 — 신호 A 행(FE distanceRowTracker)의 facility 판정용. S6.5와
             # 동일 사실 필드(OSM 원본 highway=='steps').
             "is_stairs":     edge.get("highway") == "steps",
+            # S6 — slope 0/NULL/교량 구분(graph.py 참고). 레거시 그래프 경로 등
+            # 속성이 없는 엣지는 "missing"으로 보수적 처리(값을 신뢰 못 한다는
+            # 뜻이지 실제로 결측이라 단정하는 건 아님 — 확인 불가 케이스).
+            "slope_source":  edge.get("slope_source") or "missing",
         }
         segments.append(seg)
 

@@ -70,7 +70,8 @@ _OPERATING_OK   = {"M"}            # M=사용가능  (나머지: D삭제 S보수
 # 엘리베이터만 사용 가능
 _ELEVATOR_ONLY  = {"manual_wheelchair", "electric_wheelchair", "walker"}
 # 에스컬레이터 이용 가능 (우선 안내, 없으면 엘리베이터)
-_ESC_PREFERRED  = {"cane", "leg_injury", "elderly"}
+# S6 — 'general'(실험 참가자, 비보행약자)도 AMBUL과 동일 정책(스펙 명시).
+_ESC_PREFERRED  = {"cane", "leg_injury", "elderly", "general"}
 
 # S7 — 에스컬레이터 운행 방향(CSV "상하행구분" 그대로, _load_escalators 참고).
 # entering(길에서 역으로 내려감) → 하행 에스컬레이터만 실제로 도움이 됨.
