@@ -2,7 +2,11 @@
 // 스키마·순수 로직은 src/utils/slowSegmentModel.ts, 화면은 SlowSegmentFeedbackScreen.
 
 import { BASE_URL, getAuthToken } from "../api";
-import { SLOW_SEGMENTS_PATH, SEGMENT_HARDSHIP_FEEDBACK_PATH } from "../personalization/config";
+import {
+  SLOW_SEGMENTS_PATH,
+  SEGMENT_HARDSHIP_FEEDBACK_PATH,
+  SEGMENT_HARDEST_PICK_PATH,
+} from "../personalization/config";
 import type {
   SlowSegmentsResponse,
   SegmentHardshipPayload,
@@ -120,6 +124,49 @@ export async function getSegmentHardshipFeedback(
       throw new Error(`segment-hardship-feedback(get) ${res.status}: ${text.slice(0, 200)}`);
     }
     return (await res.json()) as GetSegmentHardshipFeedbackResponse;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ── S5 — "가장 힘들었던 구간" ─────────────────────────────────────────────────
+
+export type SegmentHardestPickPayload = {
+  session_id:        string | null;
+  shown_seg_indices: number[];
+  picked_seg_index:  number | null;
+  picked_none:       boolean;
+};
+
+export type SegmentHardestPickResponse = { ok: boolean };
+
+/**
+ * POST /navigation/{routeId}/segment-hardest-pick
+ * 3버튼 흐름(segment-hardship-feedback)과 별도 엔드포인트 — 설계 이유는
+ * database.py save_segment_hardest_pick 참고. route_id당 1회(upsert).
+ */
+export async function postSegmentHardestPick(
+  routeId: number | string,
+  body: SegmentHardestPickPayload,
+  idToken?: string,
+): Promise<SegmentHardestPickResponse> {
+  const token = idToken ?? (await getAuthToken());
+  if (!token) throw new Error("no-auth-token");
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12_000);
+  try {
+    const res = await fetch(`${BASE_URL}${SEGMENT_HARDEST_PICK_PATH(routeId)}`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body:    JSON.stringify(body),
+      signal:  controller.signal,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`segment-hardest-pick ${res.status}: ${text.slice(0, 200)}`);
+    }
+    return (await res.json()) as SegmentHardestPickResponse;
   } finally {
     clearTimeout(timer);
   }

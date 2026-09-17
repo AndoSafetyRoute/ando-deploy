@@ -30,13 +30,22 @@ export type SlowSegment = {
   zone:          string;   // "flat" | "optimal" | "warning" | "forbidden" ...
   name?:         string;
   elapsed_ms:    number;   // 묶은 구간 실측 소요 합
-  pace_s_per_m:  number;   // (elapsed_ms/1000) / distance_m
+  pace_s_per_m:  number;   // (elapsed_ms/1000) / distance_m (S4부터 이동시간 기준)
+  // S4 — 순위(rank) + 무작위 대조(random) 구성. asked_by로 구분. 화면 표시
+  // 순서는 rank가 아니라 question_order(순위/대조를 섞음 — 버튼 순서는 항상 고정
+  // 이라 이 순서와 무관). rank_position은 asked_by==='random'이면 null.
+  asked_by:       "rank" | "random";
+  question_order: number;
+  rank_position:  number | null;
 };
 
 export type SlowSegmentsMeta = {
   total_segments:    number;   // 묶인 구간 수
-  eligible_segments: number;   // 질문 후보 구간 수(2026-09~ 경사 무관, GPS 이상치만 제외)
-  ranked:            number;   // 실제 순위 매긴 수 = min(SLOW_SEG_MAX_RANKED, eligible_segments)
+  eligible_segments: number;   // 질문 후보 구간 수(valid AND NOT facility, GPS 이상치 제외)
+  ranked:            number;   // 순위 문항 수 = min(SLOW_SEG_MAX_RANKED, eligible_segments)
+  random_asked?:     number;   // 무작위 대조 문항 수 = min(SLOW_SEG_RANDOM, 남은 유효 단위)
+  target_total?:     number;   // 목표 문항 수(5+2=7)
+  asked_total?:      number;   // 실제 문항 수(target_total 미만이면 유효 단위 부족)
 };
 
 export type SlowSegmentsResponse = {
@@ -60,6 +69,9 @@ export type SegmentHardshipAnswer = {
   slope_pct:         number;
   zone:              string;
   verdict:           Verdict;
+  // S4 — 이 응답이 순위 문항이었는지 무작위 대조였는지(모델 학습 시 구분 필요).
+  asked_by:          "rank" | "random";
+  rank_position:     number | null;
 };
 
 export type SegmentHardshipPayload = {
@@ -101,6 +113,8 @@ export function buildSegmentAnswers(
       slope_pct:     s.slope_pct,
       zone:          s.zone,
       verdict:       verdictByIndex[s.seg_index] as Verdict,
+      asked_by:      s.asked_by,
+      rank_position: s.rank_position,
     }));
   return { session_id: sessionId ?? null, answers };
 }

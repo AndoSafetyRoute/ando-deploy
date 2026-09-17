@@ -34,6 +34,7 @@ from database import (
     save_zone_observation, get_user_speed_profile, save_collect_batch,
     delete_user_account, get_personalization_status,
     get_slow_segments, save_segment_hardship_feedback, get_segment_hardship_feedback,
+    save_segment_hardest_pick, get_segment_hardest_pick,
     start_session, record_gps_fix_stage, add_navigation_measurement, save_gps_batch,
     get_route_measurements,
 )
@@ -958,6 +959,9 @@ class SegmentHardshipAnswer(BaseModel):
     # 저차 보정항이라 못 씀, ③ 지금 병목은 응답률(2단계 최대 탭10 → 1단계 최대
     # 탭5). 파일럿 전이라 하위호환 불필요 — 구버전 요청은 그냥 422.
     verdict:           int
+    # S4 — 이 문항이 순위였는지 무작위 대조였는지(GET 스냅샷 되싣기).
+    asked_by:          str | None = None   # 'rank' | 'random'
+    rank_position:     int | None = None
 
 
 class SegmentHardshipRequest(BaseModel):
@@ -1000,6 +1004,49 @@ def api_get_segment_hardship_feedback(
     result = get_segment_hardship_feedback(db, route_id, decoded["uid"])
     if result is None:
         raise HTTPException(404, "경로를 찾을 수 없거나 권한이 없습니다")
+    return result
+
+
+class SegmentHardestPickRequest(BaseModel):
+    session_id:        str | None = None
+    shown_seg_indices: list[int]
+    picked_seg_index:  int | None = None
+    picked_none:       bool = False
+
+
+@app.post("/navigation/{route_id}/segment-hardest-pick")
+def api_segment_hardest_pick(
+    route_id: int,
+    body: SegmentHardestPickRequest,
+    db: Session = Depends(get_db),
+    decoded: dict = Depends(_verified),
+):
+    """S5 — "가장 힘들었던 구간" 응답 저장(route_id당 1행, upsert). 3버튼 흐름
+    (segment-hardship-feedback)과 별도 엔드포인트 — 설계 이유는 database.py
+    save_segment_hardest_pick 참고."""
+    try:
+        result = save_segment_hardest_pick(
+            db, route_id=route_id, uid=decoded["uid"], session_id=body.session_id,
+            shown_seg_indices=body.shown_seg_indices,
+            picked_seg_index=body.picked_seg_index, picked_none=body.picked_none,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if result is None:
+        raise HTTPException(404, "경로를 찾을 수 없거나 권한이 없습니다")
+    return result
+
+
+@app.get("/navigation/{route_id}/segment-hardest-pick")
+def api_get_segment_hardest_pick(
+    route_id: int,
+    db: Session = Depends(get_db),
+    decoded: dict = Depends(_verified),
+):
+    """이 경로의 "가장 힘들었던 구간" 응답(RouteDetailScreen 참고용)."""
+    result = get_segment_hardest_pick(db, route_id, decoded["uid"])
+    if result is None:
+        raise HTTPException(404, "경로를 찾을 수 없거나 응답이 없습니다")
     return result
 
 

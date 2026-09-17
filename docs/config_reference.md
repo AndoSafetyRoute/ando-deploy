@@ -80,4 +80,41 @@ DB 미기동으로 실행 확인 못 함).
 
 **1행 지연 스트리밍**: 경로 끝의 자투리(<25m)를 "짧은 행 단독 방출" 대신 직전 행에 병합하기 위해, `DistanceRowTracker.completeSegment()`는 "방금 완성된 행"이 아니라 "그 직전에 완성됐던 행"을 반환한다(`finalize()`가 마지막 보류 행 + 자투리를 병합해 마무리). 헤드리스 테스트(`frontend/scripts/distanceRowTracker_test.ts`)로 검증 완료.
 
-## (이후 S4~S15 상수는 해당 항목 작업 시 이 문서에 추가)
+## S4. 신호 D 질문 구성 (순위 + 무작위 대조)
+
+파일: `backend/database.py`
+
+| 상수 | 값 | 근거 등급 | 근거 |
+|---|---|---|---|
+| `SLOW_SEG_MAX_RANKED`(기존) | `5` | C | 유지 |
+| `SLOW_SEG_RANDOM` | `2` | C | 스펙 지정값 |
+
+**랭킹 기준 변경**: `_route_measurement_groups`/`_slow_seg_eligible`이 이제
+`navigation_measurements.valid`/`facility`/`moving_ms`를 직접 읽는다 — 랭킹
+대상은 `valid=true AND facility=false`만, 정렬은 `moving_ms`(정지시간 제외 이동
+시간) 기준 pace. **주의**: 이 컬럼들은 S2가 채우므로, S2 도입 이전 행(`valid`
+NULL)은 이 필터에서 자동 제외된다 — 과거 데이터로는 D 랭킹이 비어 보일 수 있음.
+
+**seed 재현성**: `_rank_and_store_slow_segments(seed=...)`에 seed를 안 주면
+`random.SystemRandom()`으로 새로 뽑아 DB에 저장 — 같은 seed로 재호출하면
+순위 대조 선정·제시 순서(question_order)가 완전히 동일함을 테스트로 확인
+(`backend/scripts/slow_segments_v2_test.py`).
+
+## S5. "가장 힘들었던 구간" 문항
+
+파일: `frontend/src/screens/route/SegmentHardestPickScreen.tsx`,
+`backend/database.py::save_segment_hardest_pick`
+
+- 3버튼 흐름(`segment-hardship-feedback`)과 **분리된 엔드포인트**로 구현 —
+  문항 저장 단위가 "구간마다 1개"가 아니라 "경로 전체에서 1개"라 애초에
+  스키마가 다르고, 둘 다 실패해도 서로 무관하게 재시도 가능한 게 더 단순함.
+- `segment_hardest_pick`은 `route_id`당 1행(upsert) — 재제출하면 덮어씀.
+- 검증: `backend/scripts/segment_hardest_pick_test.py`(저장/조회/upsert/소유자
+  검증/제약조건 위반 케이스) 전부 통과.
+- **에뮬레이터 화면 흐름 미검증**: 이 세션에서 Metro가 메모리 부족으로 한 번
+  죽어 재현 위험을 피하려고 라이브 UI 테스트를 하지 않았다 — 코드는 기존
+  `SlowSegmentFeedbackScreen`과 동일 패턴(expo-router 어댑터, RouteMapView
+  재사용)으로 작성했고 `tsc --noEmit` 통과까지만 확인함. 실기기/에뮬레이터
+  화면 흐름 확인은 `docs/device_verification_pending.md`로.
+
+## (이후 S6~S15 상수는 해당 항목 작업 시 이 문서에 추가)

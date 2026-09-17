@@ -99,10 +99,19 @@ export default function SlowSegmentFeedbackScreen({ navigation, route }: Props) 
   const [idx, setIdx] = useState(0); // 지금 보여주는 카드 = segments[idx]
   const wentNext = useRef(false);
 
+  // S5 — 3버튼 흐름 다음은 RouteDetail이 아니라 "가장 힘들었던 구간" 문항
+  // (SegmentHardestPickScreen). 같은 params를 그대로 넘겨 그 화면이 독립적으로
+  // /slow-segments를 다시 조회할 수 있게 한다(자체적으로 eligible 판정).
   const goNext = () => {
     if (wentNext.current) return;
     wentNext.current = true;
-    navigation?.navigate("RouteDetail", { routeId: p.nextRouteId ?? "" });
+    navigation?.navigate("SegmentHardestPick", {
+      routeSegments:  p.routeSegments,
+      measurementUnits: p.measurementUnits,
+      serverRouteId:  p.serverRouteId,
+      nextRouteId:    p.nextRouteId,
+      sessionId:      p.sessionId,
+    });
   };
 
   // 마운트 시 조회. route_id 없으면 곧장 통과.

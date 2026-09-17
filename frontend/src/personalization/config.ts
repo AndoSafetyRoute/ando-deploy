@@ -42,6 +42,11 @@ export const SLOW_SEGMENTS_PATH = (routeId: number | string) =>
   `/navigation/${routeId}/slow-segments`;
 export const SEGMENT_HARDSHIP_FEEDBACK_PATH = (routeId: number | string) =>
   `/navigation/${routeId}/segment-hardship-feedback`;
+// S5 — "가장 힘들었던 구간" 문항. 3버튼(segment-hardship-feedback) 흐름 뒤에
+// 이어지는 별도 화면·별도 엔드포인트(설계 이유는 database.py
+// save_segment_hardest_pick 참고).
+export const SEGMENT_HARDEST_PICK_PATH = (routeId: number | string) =>
+  `/navigation/${routeId}/segment-hardest-pick`;
 
 // RouteDetailScreen — navigation_measurements(BE 실측) 조회. 동의 무관하게
 // 호출은 가능하나, 동의 안 했거나 서버 저장 실패면 segments가 빈 배열로 온다.

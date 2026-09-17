@@ -1,5 +1,6 @@
 import json
 import os
+import random
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 from routing.speed import (
@@ -498,6 +499,20 @@ def init_db():
         conn.execute(text(
             "ALTER TABLE route_slow_segments ADD COLUMN IF NOT EXISTS seg_index_end INT"
         ))
+        # S4 — 순위 5개 + 무작위 대조 2개, 제시 순서는 섞음. rank(PK)는 1~5=순위,
+        # 6~7=대조로 계속 쓰고, 분석에 필요한 구분자만 새로 추가한다.
+        conn.execute(text(
+            "ALTER TABLE route_slow_segments ADD COLUMN IF NOT EXISTS asked_by TEXT"
+        ))
+        conn.execute(text(
+            "ALTER TABLE route_slow_segments ADD COLUMN IF NOT EXISTS question_order SMALLINT"
+        ))
+        conn.execute(text(
+            "ALTER TABLE route_slow_segments ADD COLUMN IF NOT EXISTS rank_position SMALLINT"
+        ))
+        conn.execute(text(
+            "ALTER TABLE route_slow_segments ADD COLUMN IF NOT EXISTS seed BIGINT"
+        ))
 
         # 구간별 체감 난이도 응답. 2단계(불편했나요 예/아니오 → 1~10점)에서 1단계
         # 3버튼(편했어요/보통이었어요/힘들었어요, verdict -1/0/+1)으로 재설계 —
@@ -532,6 +547,14 @@ def init_db():
         """))
         conn.execute(text(
             "ALTER TABLE segment_hardship_feedback ADD COLUMN IF NOT EXISTS seg_index_end INT"
+        ))
+        # S4 — 이 응답이 순위 문항이었는지 무작위 대조였는지. "느린 구간만 물어봐서
+        # 생기는 편향"을 모델에서 보정하려면 필수(순위 문항만 있으면 구분 불가).
+        conn.execute(text(
+            "ALTER TABLE segment_hardship_feedback ADD COLUMN IF NOT EXISTS asked_by TEXT"
+        ))
+        conn.execute(text(
+            "ALTER TABLE segment_hardship_feedback ADD COLUMN IF NOT EXISTS rank_position SMALLINT"
         ))
         # ── 구 스키마(was_uncomfortable/hardship_score) → verdict 마이그레이션 ──
         # 파일럿 시작 전이라 실 데이터가 1행뿐이라 비용이 사실상 0(2026-09-14
@@ -571,6 +594,29 @@ def init_db():
         conn.execute(text("""
             CREATE INDEX IF NOT EXISTS idx_seg_hardship_analysis
             ON segment_hardship_feedback (slope_pct, pace_s_per_m, verdict)
+        """))
+
+        # S5 — "가장 힘들었던 구간" 문항. 3버튼(segment_hardship_feedback) 흐름을
+        # 마친 뒤, 같은 구간 목록에서 하나를 고르거나 "비슷했어요"를 고른다.
+        # route_id당 1회(재응답은 upsert) — 문항 자체가 "그 경로에서 딱 하나"를
+        # 묻는 것이라 구간별 행이 아니라 경로별 행 하나.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS segment_hardest_pick (
+                id                 SERIAL PRIMARY KEY,
+                uid                TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+                route_id           INT  NOT NULL REFERENCES routes(id) ON DELETE CASCADE,
+                session_id         TEXT,
+                shown_seg_indices  INT[] NOT NULL,
+                picked_seg_index   INT,
+                picked_none        BOOLEAN NOT NULL DEFAULT FALSE,
+                answered_at        TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (route_id),
+                CONSTRAINT chk_hardest_pick_consistency
+                    CHECK (
+                        (picked_none = TRUE AND picked_seg_index IS NULL) OR
+                        (picked_none = FALSE AND picked_seg_index IS NOT NULL)
+                    )
+            )
         """))
 
         # ── 측정 파이프라인 v2 (Supabase 콘솔에서 먼저 생성·검증한 스키마를 그대로
@@ -1887,13 +1933,14 @@ SLOW_SEG_MAX_RANKED = 5      # 상위 몇 구간까지 물어볼지 — 파일�
                              # (아래 정렬 후 슬라이스가 자연히 그렇게 동작함).
 SLOW_SEG_SPEED_MIN  = 0.05   # m/s — 거리/시간 이 범위 밖이면 GPS 점프/정지 이상치
 SLOW_SEG_SPEED_MAX  = 2.50   # (routing/speed.py _SPEED_MIN/_MAX 와 동일)
+SLOW_SEG_RANDOM = 2          # S4 — 순위 미포함 유효 단위에서 뽑는 무작위 대조 문항 수
 
 _SLOW_SEG_SELECT = """
     SELECT rank, seg_index, seg_index_end, distance_m, slope_pct, direction, zone,
-           name, elapsed_ms, pace_s_per_m
+           name, elapsed_ms, pace_s_per_m, asked_by, question_order, rank_position
     FROM route_slow_segments
     WHERE route_id = :rid
-    ORDER BY rank
+    ORDER BY question_order
 """
 
 
@@ -1911,86 +1958,120 @@ def _route_measurement_groups(db: Session, route_id: int) -> list[dict]:
     분류하고 name은 빈 값으로 둔다(지어내지 않음 — street name은 알 수 없음).
     """
     rows = db.execute(text("""
-        SELECT unit_index, distance_m, slope_pct, elapsed_ms
+        SELECT unit_index, distance_m, slope_pct, elapsed_ms, moving_ms, valid, facility
         FROM navigation_measurements
         WHERE route_id = :rid AND status = 'measured'
         ORDER BY unit_index ASC
     """), {"rid": route_id}).fetchall()
 
     groups = []
-    for unit_index, dist, slope, elapsed in rows:
+    for unit_index, dist, slope, elapsed, moving_ms, valid, facility in rows:
         dist    = float(dist or 0.0)
         elapsed = int(elapsed or 0)
         slope   = 0.0 if slope is None else float(slope)
         if dist <= 0 or elapsed <= 0:
             continue
+        # S4 — 랭킹 대상은 valid=true AND facility=false만(스펙 고정). S2가 채운
+        # 값이라 구버전 행(이 컬럼 도입 전)은 valid가 NULL → 여기서 자연히 제외된다.
+        moving = int(moving_ms) if moving_ms is not None else elapsed
         direction = "flat" if abs(slope) < FLAT_THRESHOLD else ("up" if slope > 0 else "down")
         groups.append({
             "seg_index":     int(unit_index),
             "seg_index_end": int(unit_index),
             "distance_m":    dist,
             "elapsed_ms":    elapsed,
+            "moving_ms":     moving,
+            "valid":         bool(valid) if valid is not None else False,
+            "facility":      bool(facility) if facility is not None else False,
             "slope_pct":     slope,
             "direction":     direction,
             "zone":          None,   # 랭킹 후 최종 선정된 것만 classify_zone으로 채움
             "name":          "",
-            "pace_s_per_m":  round((elapsed / 1000.0) / dist, 4),
+            "pace_s_per_m":  round((moving / 1000.0) / dist, 4) if moving > 0 else None,
         })
     return groups
 
 
 def _slow_seg_eligible(g: dict) -> bool:
-    """랭킹 대상 구간인지 — 충분히 길고, 속도가 현실적인지(GPS 이상치 배제).
-
-    경사 유무는 더 이상 필터 조건이 아니다(2026-09 설계 확장, 위 주석 참고) —
-    평지 구간도 pace 기준으로 "상대적으로 느렸던 구간"이 될 수 있다.
+    """랭킹/대조 대상 구간인지 — S4: valid=true AND facility=false만(경사 유무는
+    필터 아님, 2026-09 설계 확장). 그 위에 충분한 길이·현실적인 이동속도(GPS
+    이상치 배제)까지 확인한다. moving_ms 기반 pace라 이동시간이 0이면(전부
+    정지) pace를 못 내 여기서 걸러진다.
     """
-    d, e = g["distance_m"], g["elapsed_ms"]
-    if d < SLOW_SEG_MIN_DIST_M or e <= 0:
+    if not g["valid"] or g["facility"]:
         return False
-    spd = d / (e / 1000.0)
+    d, moving, pace = g["distance_m"], g["moving_ms"], g["pace_s_per_m"]
+    if d < SLOW_SEG_MIN_DIST_M or moving <= 0 or pace is None:
+        return False
+    spd = d / (moving / 1000.0)
     return SLOW_SEG_SPEED_MIN < spd < SLOW_SEG_SPEED_MAX
 
 
-def _rank_and_store_slow_segments(db: Session, route_id: int) -> int:
+def _rank_and_store_slow_segments(db: Session, route_id: int, seed: int | None = None) -> int:
     """
-    navigation_measurements → 1m당 소요시간(pace) 큰 순으로 상위
-    SLOW_SEG_MAX_RANKED 구간을 route_slow_segments 에 저장한다. 유효 구간이 그보다
-    적으면 그 전부(슬라이스가 자연히 그렇게 됨). 정렬: pace 내림차순 → 거리 큰 순 →
-    unit_index 오름차순. 커밋은 호출측 책임.
+    navigation_measurements → 이동 pace(moving_ms 기준, 정지시간 제외) 큰 순으로
+    상위 SLOW_SEG_MAX_RANKED 구간 + 무작위 대조 SLOW_SEG_RANDOM 구간을
+    route_slow_segments 에 저장한다(S4). 정렬: pace 내림차순 → 거리 큰 순 →
+    unit_index 오름차순. 대조는 순위에 안 든 유효 단위 중 무작위(seed 고정,
+    재현 가능) — 유효 단위가 부족하면 있는 만큼만(하한 아님). 제시 순서
+    (question_order)는 순위/대조를 섞은 무작위 순서, 버튼 순서는 항상 고정이라
+    이 순서와 무관. 커밋은 호출측 책임.
     """
+    if seed is None:
+        seed = random.SystemRandom().getrandbits(31)
+    rng = random.Random(seed)
+
+    eligible = [g for g in _route_measurement_groups(db, route_id) if _slow_seg_eligible(g)]
     ranked = sorted(
-        (g for g in _route_measurement_groups(db, route_id) if _slow_seg_eligible(g)),
+        eligible,
         key=lambda g: (-g["pace_s_per_m"], -g["distance_m"], g["seg_index"]),
     )[:SLOW_SEG_MAX_RANKED]
+    ranked_idx = {g["seg_index"] for g in ranked}
+
+    remaining = [g for g in eligible if g["seg_index"] not in ranked_idx]
+    rng.shuffle(remaining)
+    control = remaining[:SLOW_SEG_RANDOM]
 
     db.execute(text("DELETE FROM route_slow_segments WHERE route_id = :rid"),
                {"rid": route_id})
 
-    if ranked:
-        user_type_row = db.execute(
-            text("SELECT user_type FROM routes WHERE id = :rid"), {"rid": route_id}
-        ).fetchone()
-        user_type = (user_type_row[0] if user_type_row and user_type_row[0] else "elderly")
+    selected = [(g, "rank", i + 1) for i, g in enumerate(ranked)] + \
+               [(g, "random", None) for g in control]
+    if not selected:
+        return 0
 
-    for rank, g in enumerate(ranked, start=1):
+    # 제시 순서 — 순위/대조를 구분 못 하게 섞는다(같은 seed로 재현 가능).
+    order = list(range(1, len(selected) + 1))
+    rng.shuffle(order)
+
+    user_type_row = db.execute(
+        text("SELECT user_type FROM routes WHERE id = :rid"), {"rid": route_id}
+    ).fetchone()
+    user_type = (user_type_row[0] if user_type_row and user_type_row[0] else "elderly")
+
+    for i, (g, asked_by, rank_position) in enumerate(selected):
+        db_rank = i + 1  # route_slow_segments PK(route_id, rank) — 1..5=순위, 6..7=대조
         zone = classify_zone(g["slope_pct"], g["direction"], user_type)
         db.execute(text("""
             INSERT INTO route_slow_segments
                 (route_id, rank, seg_index, seg_index_end, distance_m, slope_pct,
-                 direction, zone, name, elapsed_ms, pace_s_per_m)
+                 direction, zone, name, elapsed_ms, pace_s_per_m,
+                 asked_by, question_order, rank_position, seed)
             VALUES
                 (:rid, :rank, :seg_index, :seg_index_end, :distance_m, :slope_pct,
-                 :direction, :zone, :name, :elapsed_ms, :pace)
+                 :direction, :zone, :name, :elapsed_ms, :pace,
+                 :asked_by, :question_order, :rank_position, :seed)
         """), {
-            "rid": route_id, "rank": rank,
+            "rid": route_id, "rank": db_rank,
             "seg_index": g["seg_index"], "seg_index_end": g["seg_index_end"],
             "distance_m": round(g["distance_m"], 1), "slope_pct": g["slope_pct"],
             "direction": g["direction"], "zone": zone,
             "name": g["name"] or None,
             "elapsed_ms": g["elapsed_ms"], "pace": g["pace_s_per_m"],
+            "asked_by": asked_by, "question_order": order[i], "rank_position": rank_position,
+            "seed": seed,
         })
-    return len(ranked)
+    return len(selected)
 
 
 def get_slow_segments(db: Session, route_id: int, uid: str) -> dict | None:
@@ -2026,22 +2107,31 @@ def get_slow_segments(db: Session, route_id: int, uid: str) -> dict | None:
         rows = db.execute(text(_SLOW_SEG_SELECT), {"rid": route_id}).fetchall()
 
     segments = [{
-        "rank":          int(r[0]),
-        "seg_index":     int(r[1]),
-        "seg_index_end": int(r[2]) if r[2] is not None else int(r[1]),
-        "distance_m":    round(float(r[3]), 1),
-        "slope_pct":     round(float(r[4]), 2),
-        "direction":     r[5],
-        "zone":          r[6],
-        "name":          r[7],
-        "elapsed_ms":    int(r[8]),
-        "pace_s_per_m":  round(float(r[9]), 3),
+        "rank":           int(r[0]),
+        "seg_index":      int(r[1]),
+        "seg_index_end":  int(r[2]) if r[2] is not None else int(r[1]),
+        "distance_m":     round(float(r[3]), 1),
+        "slope_pct":      round(float(r[4]), 2),
+        "direction":      r[5],
+        "zone":           r[6],
+        "name":           r[7],
+        "elapsed_ms":     int(r[8]),
+        "pace_s_per_m":   round(float(r[9]), 3),
+        "asked_by":       r[10],
+        "question_order": int(r[11]) if r[11] is not None else int(r[0]),
+        "rank_position":  int(r[12]) if r[12] is not None else None,
     } for r in rows]
 
+    ranked_count = sum(1 for s in segments if s["asked_by"] == "rank")
+    random_count = sum(1 for s in segments if s["asked_by"] == "random")
     meta = {
         "total_segments":    total_groups,       # 경로를 묶었을 때의 구간 수
-        "eligible_segments": eligible_groups,    # 그중 질문 후보인 구간 수(경사 무관, GPS 이상치만 제외)
-        "ranked":            len(segments),      # 실제로 물어본 구간 수 (min(SLOW_SEG_MAX_RANKED, eligible))
+        "eligible_segments": eligible_groups,    # 그중 질문 후보인 구간 수(valid AND NOT facility, GPS 이상치 제외)
+        "ranked":            ranked_count,        # 순위 문항 수 (min(SLOW_SEG_MAX_RANKED, eligible))
+        "random_asked":      random_count,        # 무작위 대조 문항 수 (min(SLOW_SEG_RANDOM, 남은 유효 단위))
+        # S4 — 목표(5+2=7)에 못 미치면(유효 단위 부족) 그 차이를 보고 필드로 노출.
+        "target_total":      SLOW_SEG_MAX_RANKED + SLOW_SEG_RANDOM,
+        "asked_total":       len(segments),
     }
 
     if not segments:
@@ -2134,13 +2224,16 @@ def save_segment_hardship_feedback(
         seg_end = a.get("seg_index_end")
         seg_end = int(seg_end) if seg_end is not None else None
 
+        rank_position = a.get("rank_position")
+        rank_position = int(rank_position) if rank_position is not None else None
+
         db.execute(text("""
             INSERT INTO segment_hardship_feedback
                 (uid, route_id, session_id, seg_index, seg_index_end, rank, pace_s_per_m,
-                 elapsed_ms, distance_m, slope_pct, zone, verdict)
+                 elapsed_ms, distance_m, slope_pct, zone, verdict, asked_by, rank_position)
             VALUES
                 (:uid, :route_id, :session_id, :seg_index, :seg_end, :rank, :pace,
-                 :elapsed_ms, :distance_m, :slope_pct, :zone, :verdict)
+                 :elapsed_ms, :distance_m, :slope_pct, :zone, :verdict, :asked_by, :rank_position)
             ON CONFLICT (route_id, seg_index) DO UPDATE SET
                 session_id    = EXCLUDED.session_id,
                 seg_index_end = EXCLUDED.seg_index_end,
@@ -2151,6 +2244,8 @@ def save_segment_hardship_feedback(
                 slope_pct     = EXCLUDED.slope_pct,
                 zone          = EXCLUDED.zone,
                 verdict       = EXCLUDED.verdict,
+                asked_by      = EXCLUDED.asked_by,
+                rank_position = EXCLUDED.rank_position,
                 answered_at   = NOW()
         """), {
             "uid": uid, "route_id": route_id, "session_id": session_id,
@@ -2158,6 +2253,7 @@ def save_segment_hardship_feedback(
             "pace": float(a["pace_s_per_m"]), "elapsed_ms": int(a["elapsed_ms"]),
             "distance_m": float(a["distance_m"]), "slope_pct": float(a["slope_pct"]),
             "zone": a.get("zone"), "verdict": verdict,
+            "asked_by": a.get("asked_by"), "rank_position": rank_position,
         })
         count += 1
 
@@ -2197,3 +2293,74 @@ def get_segment_hardship_feedback(db: Session, route_id: int, uid: str) -> dict 
     } for r in rows]
 
     return {"route_id": route_id, "answers": answers}
+
+
+def save_segment_hardest_pick(
+    db: Session,
+    route_id: int,
+    uid: str,
+    session_id: str | None,
+    shown_seg_indices: list[int],
+    picked_seg_index: int | None,
+    picked_none: bool,
+) -> dict | None:
+    """S5 — "가장 힘들었던 구간" 응답 저장(route_id당 1행, upsert). 3버튼 흐름
+    (segment_hardship_feedback)과 별개 엔드포인트로 분리했다 — 문항 성격이
+    "구간마다 1개씩"이 아니라 "이 경로 전체에서 1개"라 저장 단위 자체가
+    다르고, 3버튼 제출이 이미 끝난 뒤에만 보여줄 화면이라 순서 의존성만
+    지키면 되지 원자적으로 묶어야 할 이유가 없다(둘 다 실패해도 서로 무관하게
+    재시도 가능 — 부분 실패 시 복구가 오히려 더 단순함).
+    소유자가 아니거나 경로가 없으면 None."""
+    if not engine:
+        return None
+    if picked_none and picked_seg_index is not None:
+        raise ValueError("picked_none=true면 picked_seg_index는 없어야 합니다")
+    if not picked_none and picked_seg_index is None:
+        raise ValueError("picked_none=false면 picked_seg_index가 필요합니다")
+
+    owns = db.execute(
+        text("SELECT 1 FROM routes WHERE id = :id AND uid = :uid"),
+        {"id": route_id, "uid": uid},
+    ).fetchone()
+    if not owns:
+        return None
+
+    db.execute(text("""
+        INSERT INTO segment_hardest_pick
+            (uid, route_id, session_id, shown_seg_indices, picked_seg_index, picked_none)
+        VALUES
+            (:uid, :route_id, :session_id, :shown, :picked, :picked_none)
+        ON CONFLICT (route_id) DO UPDATE SET
+            session_id        = EXCLUDED.session_id,
+            shown_seg_indices = EXCLUDED.shown_seg_indices,
+            picked_seg_index  = EXCLUDED.picked_seg_index,
+            picked_none       = EXCLUDED.picked_none,
+            answered_at       = NOW()
+    """), {
+        "uid": uid, "route_id": route_id, "session_id": session_id,
+        "shown": shown_seg_indices, "picked": picked_seg_index, "picked_none": picked_none,
+    })
+    db.commit()
+    return {"ok": True}
+
+
+def get_segment_hardest_pick(db: Session, route_id: int, uid: str) -> dict | None:
+    """이 경로의 "가장 힘들었던 구간" 응답. 소유자가 아니거나 없으면 None."""
+    if not engine:
+        return None
+
+    row = db.execute(text("""
+        SELECT shown_seg_indices, picked_seg_index, picked_none
+        FROM segment_hardest_pick sp
+        JOIN routes r ON r.id = sp.route_id
+        WHERE sp.route_id = :rid AND r.uid = :uid
+    """), {"rid": route_id, "uid": uid}).fetchone()
+    if not row:
+        return None
+
+    return {
+        "route_id":          route_id,
+        "shown_seg_indices": list(row[0]),
+        "picked_seg_index":  int(row[1]) if row[1] is not None else None,
+        "picked_none":       bool(row[2]),
+    }

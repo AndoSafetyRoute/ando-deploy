@@ -15,6 +15,10 @@ export default function SlowSegmentFeedbackPage() {
   const navigationAdapter = {
     goBack: () => router.back(),
     navigate: (screenName: string, screenParams?: Record<string, any>) => {
+      if (screenName === "SegmentHardestPick") {
+        router.replace({ pathname: "/segment-hardest-pick", params: screenParams });
+        return;
+      }
       if (screenName === "RouteDetail") {
         router.replace({ pathname: "/route-detail", params: screenParams });
         return;
