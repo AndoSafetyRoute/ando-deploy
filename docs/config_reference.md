@@ -41,4 +41,29 @@ DB 미기동으로 실행 확인 못 함).
 
 ---
 
-## (이후 S1~S15 상수는 해당 항목 작업 시 이 문서에 추가)
+## S1. 걸음 수 수집
+
+파일: `frontend/src/utils/stepRingBuffer.ts`
+
+| 상수 | 값 | 근거 등급 | 근거 |
+|---|---|---|---|
+| `RING_WINDOW_MS` | `60_000` | C | 스펙 지정값(최근 60초) 그대로 |
+
+## S2. 저속 구간 판정 통합 (stopClassifier)
+
+파일: `frontend/src/utils/stopClassifier.ts`
+
+| 상수 | 값 | 근거 등급 | 근거 | 실기기 검증 |
+|---|---|---|---|---|
+| `GAP_SEC` | `20` | A(값 자체는 재사용) | 기존 `SPEED_SAMPLE_MAX_GAP_S`와 동일값 — 실기기 세션(sess-1789364304261-iy39nwa8) 실측 근거를 그대로 물려받음 | 재검증 안 함(기존 값 재사용) |
+| `STEP_MOVING_MIN` | `3` | C | 창(5~6s) 동안 3걸음 이상이면 이동 확정 — 임의값 | ⬜ 대기 |
+| `MIN_SAMPLES` | `3` | C | 스펙 지정값 | ⬜ 대기 |
+| `ACC_STOP_MAX` | `15`(m) | C | 스펙 지정값 | ⬜ 대기 |
+| `SPREAD_STOP_MAX` | `5`(m) | C | 스펙 지정값 | ⬜ 대기 |
+| `NEAR_CROSSING_MAX_M` | `15`(m) | C | 스펙 지정값. **주의**: 횡단보도 노드 거리 데이터 소스가 현재 코드에 없음(그래프에 횡단보도 태그 없음, 확인 불가) — 이 상수 자체는 정의돼 있지만 실제로 값이 공급되는 경로가 아직 없어 `near_crossing`은 항상 `false`로 저장됨. 데이터 소스 마련 전까지는 미완성 기능. |
+| `V_STOP_FLOOR` / `V_STOP_PERSONAL_RATIO` / `V_STOP_DEFAULT` | `0.3` / `0.4` / `0.4`(m/s) | C | 스펙 지정값. 개인 평지속도(`user_speed_profile.flat`)가 FE에 연동돼 있지 않아 현재는 항상 기본값(0.4) 사용 — S8/S10에서 개인화 연동 재검토 필요 | ⬜ 대기 |
+| `CLASSIFY_WINDOW_SEC` | `6` | C | S0 목표(콜백 간격 중앙값 ≤2s) 달성 전제, 스펙의 "5~6s 중 상단" | S0 실측 결과에 따라 조정 필요 |
+
+**미해결 데이터 갭**: `near_crossing`(횡단보도 근접 여부)을 계산하려면 "가장 가까운 횡단보도 노드까지 거리"가 필요한데, 이 프로젝트의 그래프(`graph.py`)에는 횡단보도를 나타내는 태그가 없다(계단의 `highway=='steps'`처럼 확인해본 적 없음 — 별도 조사 필요). 현재 `classifyElapsed()` 호출부(`NavigationScreen.tsx`)는 이 인자에 항상 `null`을 넘긴다.
+
+## (이후 S3~S15 상수는 해당 항목 작업 시 이 문서에 추가)

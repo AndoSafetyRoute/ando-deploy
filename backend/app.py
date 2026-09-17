@@ -732,6 +732,15 @@ class NavigationSegmentRequest(BaseModel):
     start_lon: float | None = None
     end_lat:   float | None = None
     end_lon:   float | None = None
+    # S2(stopClassifier) 집계 결과 — FE utils/stopClassifier.ts::aggregateRow()가
+    # 계산해 그대로 보낸다(판정 로직 중복 구현 안 함). status='measured'일 때만
+    # 의미 있음 — 구버전 FE는 안 보내 전부 None(nullable, 하위호환).
+    valid:         bool | None = None
+    dwell_ms:      int  | None = None
+    moving_ms:     int  | None = None
+    facility:      bool | None = None
+    stop_class:    str  | None = None   # 'moving'|'gps_gap'|'uncertain'|'confirmed_stop'
+    near_crossing: bool | None = None
     # ── 레거시 navigation_segments(마이페이지 표시용) 병행 기록에만 쓰는 필드 ──
     zone:       str | None = None
     direction:  str | None = None
@@ -760,6 +769,9 @@ def api_add_segment(
         raise HTTPException(400, "status='measured'는 elapsed_ms가 필요합니다")
     if body.status == "skipped" and body.elapsed_ms is not None:
         raise HTTPException(400, "status='skipped'는 elapsed_ms를 보내면 안 됩니다")
+    _STOP_CLASSES = ("moving", "gps_gap", "uncertain", "confirmed_stop")
+    if body.stop_class is not None and body.stop_class not in _STOP_CLASSES:
+        raise HTTPException(400, f"stop_class는 {_STOP_CLASSES} 중 하나여야 합니다")
 
     ok = add_navigation_measurement(
         db,
@@ -777,6 +789,12 @@ def api_add_segment(
         start_lon=body.start_lon,
         end_lat=body.end_lat,
         end_lon=body.end_lon,
+        valid=body.valid,
+        dwell_ms=body.dwell_ms,
+        moving_ms=body.moving_ms,
+        facility=body.facility,
+        stop_class=body.stop_class,
+        near_crossing=body.near_crossing,
     )
     if not ok:
         raise HTTPException(

@@ -46,6 +46,11 @@ import type { NavSegment, Waypoint, MeasurementUnit } from "../api/routeApi";
 import { CollectSession, drainCollectQueue } from "../utils/collectQueue";
 import { startCollectSession, reportGpsFixStage } from "../api/collect";
 import { StepTracker } from "../utils/stepTracker";
+import {
+  classifyElapsed,
+  computeVStop,
+  type GpsFix as StopClassifierGpsFix,
+} from "../utils/stopClassifier";
 import { GpsTraceBuffer } from "../utils/gpsTraceBuffer";
 import { SlopeBinTracker } from "../utils/slopeBinTracker";
 import {
@@ -948,6 +953,13 @@ export default function NavigationScreen({ navigation, route }: Props) {
   // 않음 — 센서 구독/해제 생명주기와 null fallback 경로만 이번에 검증한다.
   const stepTrackerRef = useRef<StepTracker | null>(null);
 
+  // S2(stopClassifier) — 최근 GPS 픽스 보관(신호 D 측정단위 판정용). gpsTraceBufferRef
+  // 와 별개다: 저건 서버 업로드용 write-only 큐(플러시하면 비워짐), 이건 판정
+  // 시점에 "그 구간 동안의 픽스들"을 다시 읽어야 해서 별도로 들고 있는다.
+  // CLASSIFY_WINDOW_SEC*몇 배 정도만 있으면 되므로 90초로 넉넉히 자른다.
+  const recentFixesRef = useRef<StopClassifierGpsFix[]>([]);
+  const RECENT_FIXES_KEEP_MS = 90_000;
+
   // 개인화 데이터 수집 동의 모달 (이슈 #1). unknown 이고 도보 안내일 때만 뜬다.
   const [consentPrompt, setConsentPrompt] = useState(false);
 
@@ -1184,6 +1196,19 @@ export default function NavigationScreen({ navigation, route }: Props) {
             accuracy_m: loc.coords.accuracy ?? null,
             speed_mps:  loc.coords.speed ?? null,
           });
+
+          // S2 — stopClassifier용 최근 픽스 보관(별도 목적, 위 주석 참고).
+          recentFixesRef.current.push({
+            t_ms:       now,
+            lat:        loc.coords.latitude,
+            lon:        loc.coords.longitude,
+            accuracy_m: loc.coords.accuracy ?? null,
+            speed_mps:  loc.coords.speed ?? null,
+          });
+          const fixCutoff = now - RECENT_FIXES_KEEP_MS;
+          while (recentFixesRef.current.length > 1 && recentFixesRef.current[1].t_ms < fixCutoff) {
+            recentFixesRef.current.shift();
+          }
 
           // GPS 콜백을 받았다는 것 자체가 "이 구간엔 GPS 커버리지가 있었다"는 신호다.
           // accuracy 필터(위치 신뢰도) 앞에서 세므로, 정확도 낮은 픽스도 gps_sample_n
@@ -1505,6 +1530,19 @@ export default function NavigationScreen({ navigation, route }: Props) {
                 unitEndArcLength[unitIdx],
               );
 
+              // S2 — stopClassifier로 이 unit의 valid/dwell/moving/facility 집계.
+              // catch-up(unit을 건너뜀)이면 계산할 근거(온전한 창)가 없어 생략 —
+              // 어차피 status='skipped'라 BE가 이 필드들을 안 받는다.
+              const unitAgg = isCatchUp ? null : classifyElapsed(
+                recentFixesRef.current,
+                unitStartTimesRef.current[unitIdx],
+                crossTime,
+                computeVStop(null), // 개인 평지속도 미연동 — 기본값(S8/S10에서 재검토)
+                (t0, t1) => stepTrackerRef.current?.stepsBetween(t0, t1) ?? null,
+                unit.is_stairs,
+                null, // 횡단보도 노드 거리 데이터 소스 없음 — 확인 불가(항상 생략)
+              );
+
               const payload: MeasurementSegmentPayload = isCatchUp
                 ? {
                     sessionId: sid ?? "", unitIndex: unitIdx,
@@ -1517,6 +1555,8 @@ export default function NavigationScreen({ navigation, route }: Props) {
                     sessionId: sid ?? "", unitIndex: unitIdx,
                     distanceM: unit.distance_m, slopePercent: unit.slope_pct,
                     status: "measured", elapsedMs: crossTime - unitStartTimesRef.current[unitIdx],
+                    valid: unitAgg!.valid, dwellMs: unitAgg!.dwellMs, movingMs: unitAgg!.movingMs,
+                    facility: unitAgg!.facility, stopClass: unitAgg!.stopClass, nearCrossing: unitAgg!.nearCrossing,
                     coordStartIdx: unit.coord_start_idx, coordEndIdx: unit.coord_end_idx,
                     startCoords: unit.start_coords, endCoords: unit.end_coords,
                   };

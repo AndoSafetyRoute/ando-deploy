@@ -602,6 +602,33 @@ def init_db():
                 f"ALTER TABLE navigation_measurements ADD COLUMN IF NOT EXISTS {col} DOUBLE PRECISION"
             ))
 
+        # S2(stopClassifier) 집계 결과 — utils/stopClassifier.ts의 aggregateRow()가
+        # FE에서 계산해 그대로 보낸다(판정 로직은 FE/BE 어디서도 중복 구현하지
+        # 않음 — 신호 A 행이 생기면 그쪽도 같은 FE 함수를 재사용해야 함, S3).
+        # valid=false는 삭제가 아니라 플래그(학습 시점에 걸러내는 용도, P0-2와
+        # 동일 원칙). 전부 nullable — 이 컬럼 추가 이전 행과 호환.
+        conn.execute(text(
+            "ALTER TABLE navigation_measurements ADD COLUMN IF NOT EXISTS valid BOOLEAN"
+        ))
+        conn.execute(text(
+            "ALTER TABLE navigation_measurements ADD COLUMN IF NOT EXISTS dwell_ms BIGINT"
+        ))
+        conn.execute(text(
+            "ALTER TABLE navigation_measurements ADD COLUMN IF NOT EXISTS moving_ms BIGINT"
+        ))
+        conn.execute(text(
+            "ALTER TABLE navigation_measurements ADD COLUMN IF NOT EXISTS facility BOOLEAN"
+        ))
+        conn.execute(text(
+            "ALTER TABLE navigation_measurements ADD COLUMN IF NOT EXISTS stop_class TEXT"
+        ))
+        conn.execute(text(
+            "ALTER TABLE navigation_measurements ADD COLUMN IF NOT EXISTS near_crossing BOOLEAN"
+        ))
+        # stop_class 값 검증은 status와 같은 방식으로 API 계층(app.py)에서 한다 —
+        # CHECK 제약을 서버 재기동마다 DROP+ADD 하는 건 컬럼 추가보다 무거워서
+        # (동시 연결 중 잠깐 제약이 없는 창이 생김) 피한다.
+
         # GPS 원본 궤적 — /collect/gps-batch 배치 삽입.
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS gps_traces (
@@ -1179,6 +1206,12 @@ def add_navigation_measurement(
     start_lon: float | None = None,
     end_lat: float | None = None,
     end_lon: float | None = None,
+    valid: bool | None = None,
+    dwell_ms: int | None = None,
+    moving_ms: int | None = None,
+    facility: bool | None = None,
+    stop_class: str | None = None,
+    near_crossing: bool | None = None,
 ) -> bool:
     """구간(측정 단위) 완료/스킵 시 navigation_measurements에 행 삽입 — 멱등.
 
@@ -1210,10 +1243,12 @@ def add_navigation_measurement(
     db.execute(text("""
         INSERT INTO navigation_measurements
             (route_id, session_id, unit_index, distance_m, slope_pct, elapsed_ms, status,
-             coord_start_idx, coord_end_idx, start_lat, start_lon, end_lat, end_lon)
+             coord_start_idx, coord_end_idx, start_lat, start_lon, end_lat, end_lon,
+             valid, dwell_ms, moving_ms, facility, stop_class, near_crossing)
         VALUES
             (:route_id, :session_id, :unit_index, :distance_m, :slope_pct, :elapsed_ms, :status,
-             :coord_start_idx, :coord_end_idx, :start_lat, :start_lon, :end_lat, :end_lon)
+             :coord_start_idx, :coord_end_idx, :start_lat, :start_lon, :end_lat, :end_lon,
+             :valid, :dwell_ms, :moving_ms, :facility, :stop_class, :near_crossing)
         ON CONFLICT (route_id, unit_index) DO NOTHING
     """), {
         "route_id":        route_id,
@@ -1229,6 +1264,12 @@ def add_navigation_measurement(
         "start_lon":       start_lon,
         "end_lat":         end_lat,
         "end_lon":         end_lon,
+        "valid":           valid,
+        "dwell_ms":        dwell_ms,
+        "moving_ms":       moving_ms,
+        "facility":        facility,
+        "stop_class":      stop_class,
+        "near_crossing":   near_crossing,
     })
     db.commit()
     return True

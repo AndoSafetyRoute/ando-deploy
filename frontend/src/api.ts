@@ -292,6 +292,15 @@ export interface MeasurementSegmentPayload {
   slopePercent: number;          // 거리가중평균, 부호 포함(양수=오르막)
   status:       'measured' | 'skipped';
   elapsedMs?:   number;          // status='measured'일 때만 필수
+  // S2(stopClassifier) 집계 결과 — status='measured'일 때만 채워짐. utils/
+  // stopClassifier.ts의 aggregateRow() 참고. valid=false는 삭제가 아니라
+  // 플래그(학습 시점에 걸러내는 용도).
+  valid?:       boolean;
+  dwellMs?:     number;          // 확정 정지(confirmed_stop)로 판정된 시간 합
+  movingMs?:    number;          // elapsedMs - dwellMs
+  facility?:    boolean;         // 이 unit이 시설 간선(계단 등) 위인지 — measurement_units[i].is_stairs
+  stopClass?:   'moving' | 'gps_gap' | 'uncertain' | 'confirmed_stop';  // 행 내 최악 분류
+  nearCrossing?: boolean;
   // measurement_units[i].coord_start_idx/coord_end_idx를 그대로 되돌려 보낸다 —
   // gps_traces를 경로에 사후 투영해 소요시간을 재계산하려면 이 unit이 경로상
   // 어디였는지 DB에 남아 있어야 한다(session_route_profile로 역산하면 동의
@@ -321,6 +330,12 @@ export async function submitSegment(
       slope_pct:       seg.slopePercent,
       status:          seg.status,
       elapsed_ms:      seg.elapsedMs,
+      valid:           seg.valid,
+      dwell_ms:        seg.dwellMs,
+      moving_ms:       seg.movingMs,
+      facility:        seg.facility,
+      stop_class:      seg.stopClass,
+      near_crossing:   seg.nearCrossing,
       coord_start_idx: seg.coordStartIdx,
       coord_end_idx:   seg.coordEndIdx,
       start_lon:       seg.startCoords?.[0] ?? null,
