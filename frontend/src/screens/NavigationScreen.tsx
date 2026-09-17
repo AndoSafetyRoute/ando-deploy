@@ -44,7 +44,7 @@ import {
 } from "../api";
 import type { NavSegment, Waypoint, MeasurementUnit } from "../api/routeApi";
 import { CollectSession, drainCollectQueue } from "../utils/collectQueue";
-import { startCollectSession, reportGpsFixStage } from "../api/collect";
+import { startCollectSession, reportGpsFixStage, type SlopeObservation } from "../api/collect";
 import { StepTracker } from "../utils/stepTracker";
 import {
   classifyElapsed,
@@ -52,10 +52,12 @@ import {
   type GpsFix as StopClassifierGpsFix,
 } from "../utils/stopClassifier";
 import { GpsTraceBuffer } from "../utils/gpsTraceBuffer";
-import { SlopeBinTracker } from "../utils/slopeBinTracker";
+import { binCenter } from "../utils/slopeBinTracker";
+import { DistanceRowTracker, type DistanceRowObservation } from "../utils/distanceRowTracker";
 import {
   SPEED_SAMPLE_MAX_GAP_S,
-  SPEED_SAMPLE_MAX_JUMP_M,
+  IMPLIED_SPEED_JUMP_MPS,
+  JUMP_ACCURACY_MAX_M,
   NEAR_STOP_SPEED_MS,
   GPS_ACCURACY,
   GPS_TIME_INTERVAL_MS,
@@ -102,6 +104,8 @@ type RouteSegment = {
   // 하이브리드(서울 밖) 직선 구간 — 경사 데이터 없음.
   // 소요시간 측정·구간 피드백·신호 A/D 판단에서 제외한다(중도 종료 구간과 동일 취급).
   outsideSeoul?: boolean;
+  // S6.5 — OSM 원본 highway=='steps' 태그 기반 사실 필드(경사 추정 아님).
+  is_stairs?: boolean;
 };
 
 // slopeMean/zone 추가 — 오르막/내리막 화살표 표시용
@@ -322,6 +326,22 @@ function interpolateCrossingTime(
   const frac = (boundaryArcLength - prevProgressM) / (currProgressM - prevProgressM);
   const clamped = Math.min(1, Math.max(0, frac));
   return prevTime + clamped * (currTime - prevTime);
+}
+
+// S3 — 신호 A 행의 device_model. 새 네이티브 모듈(expo-device) 추가 없이
+// React Native 코어에 이미 있는 Platform.constants만 쓴다(제조사/모델 확인 —
+// 안드로이드 타겟 기준, iOS는 모델명 대신 시스템 버전만 나옴).
+function getDeviceModel(): string | null {
+  try {
+    if (Platform.OS === "android") {
+      const c = Platform.constants as { Manufacturer?: string; Model?: string };
+      const parts = [c?.Manufacturer, c?.Model].filter(Boolean);
+      return parts.length ? parts.join(" ") : null;
+    }
+    return `iOS ${Platform.Version}`;
+  } catch {
+    return null;
+  }
 }
 
 function getZoneKey(zone?: string, direction?: string): string {
@@ -927,11 +947,12 @@ export default function NavigationScreen({ navigation, route }: Props) {
   const segGapPendingRef = useRef<boolean>(false);
 
   // ── 개인화 계측 (인계 §5 ⑪, ando_ml_plan_v2 §3.2 신호 A) ────────────────────
-  // zone(3단계 안전 분류) 단위로 뭉치면 경사 축 해상도가 파괴된다(§3.1). 대신
-  // 0.5% 폭 bin 이 바뀌는 시점을 경계로 관측 1행씩 만든다 — 로직은 SlopeBinTracker
-  // (순수 클래스, 단위 검증됨), 이 컴포넌트는 GPS 이벤트만 넣어준다. 전송은 배치만.
+  // zone(3단계 안전 분류) 단위로 뭉치면 경사 축 해상도가 파괴된다(§3.1). S3부터는
+  // 0.5% bin 변화가 아니라 고정 거리(ROW_LEN_M=25m)를 경계로 관측 1행씩 만든다
+  // — 로직은 DistanceRowTracker(순수 클래스, 단위 검증됨), 이 컴포넌트는 GPS
+  // 이벤트만 넣어준다. 전송은 배치만.
   const collectSessionRef = useRef<CollectSession | null>(null);
-  const binTrackerRef     = useRef<SlopeBinTracker | null>(null);
+  const distanceRowTrackerRef = useRef<DistanceRowTracker | null>(null);
   // GPS 원본 궤적(gps_traces) 배치 큐 — 측정 파이프라인 v2. collectSessionRef와
   // 같은 session_id를 쓰고(beginCollection에서 함께 생성) 같은 동의 게이트를
   // 따른다 — 위치 원본이라 신호 A~D보다 민감도가 낮지 않다.
@@ -959,9 +980,57 @@ export default function NavigationScreen({ navigation, route }: Props) {
   // CLASSIFY_WINDOW_SEC*몇 배 정도만 있으면 되므로 90초로 넉넉히 자른다.
   const recentFixesRef = useRef<StopClassifierGpsFix[]>([]);
   const RECENT_FIXES_KEEP_MS = 90_000;
+  // S3 — 세션 내내 고정값이라 한 번만 계산해 ref에 캐싱.
+  const deviceModelRef = useRef<string | null>(getDeviceModel());
 
   // 개인화 데이터 수집 동의 모달 (이슈 #1). unknown 이고 도보 안내일 때만 뜬다.
   const [consentPrompt, setConsentPrompt] = useState(false);
+
+  /**
+   * S3 — DistanceRowObservation(거리/경사 통계만) → 서버 전송용 SlopeObservation
+   * (stopClassifier 집계 + 걸음수 + 기기정보까지 채운 완전한 행)으로 변환.
+   * recentFixesRef/stepTrackerRef/deviceModelRef는 전부 컴포넌트 스코프 ref라
+   * 어느 콜백(GPS 루프, 언마운트 cleanup, handleEndNavigation)에서 불러도 안전.
+   */
+  const buildSlopeObservationPayload = useCallback(
+    (obs: DistanceRowObservation): SlopeObservation => {
+      const rowAgg = classifyElapsed(
+        recentFixesRef.current,
+        obs.start_ms, obs.end_ms,
+        computeVStop(null),
+        (t0, t1) => stepTrackerRef.current?.stepsBetween(t0, t1) ?? null,
+        obs.facility,
+        null, // 횡단보도 데이터 소스 없음 — 확인 불가(항상 생략)
+      );
+      const fixesInRow = recentFixesRef.current.filter(
+        (f) => f.t_ms >= obs.start_ms && f.t_ms <= obs.end_ms,
+      );
+      const accInRow = fixesInRow.map((f) => f.accuracy_m).filter((a): a is number => a != null);
+      const avgAccuracy = accInRow.length ? accInRow.reduce((s, a) => s + a, 0) / accInRow.length : null;
+      const stepDelta = stepTrackerRef.current?.stepsBetween(obs.start_ms, obs.end_ms) ?? null;
+
+      return {
+        route_id:    obs.route_id,
+        distance_m:  obs.distance_m,
+        slope_mean:  obs.slope_mean,
+        slope_max:   obs.slope_max,
+        ascent_m:    obs.ascent_m,
+        descent_m:   obs.descent_m,
+        elapsed_ms:  obs.elapsed_ms,
+        gps_sample_n: fixesInRow.length,
+        step_delta:  stepDelta,
+        stop_class:  rowAgg.stopClass,
+        dwell_ms:    rowAgg.dwellMs,
+        moving_ms:   rowAgg.movingMs,
+        avg_gps_accuracy: avgAccuracy,
+        device_model: deviceModelRef.current,
+        near_crossing: rowAgg.nearCrossing,
+        facility:    rowAgg.facility,
+        valid:       rowAgg.valid,
+      };
+    },
+    [],
+  );
 
   /**
    * 개인화 계측 세션을 실제로 시작한다 — 동의(granted)한 경우에만 호출된다.
@@ -999,7 +1068,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
       }, token).catch(() => {});
     }).catch(() => {});
     gpsTraceBufferRef.current = new GpsTraceBuffer(collectSessionRef.current.sessionId);
-    binTrackerRef.current = new SlopeBinTracker(routeSegments[0]?.slope ?? 0, initTime);
+    distanceRowTrackerRef.current = new DistanceRowTracker(initTime);
     try {
       collectSessionRef.current.setRouteProfile({
         route_id: serverRouteIdRef.current,
@@ -1210,11 +1279,8 @@ export default function NavigationScreen({ navigation, route }: Props) {
             recentFixesRef.current.shift();
           }
 
-          // GPS 콜백을 받았다는 것 자체가 "이 구간엔 GPS 커버리지가 있었다"는 신호다.
-          // accuracy 필터(위치 신뢰도) 앞에서 세므로, 정확도 낮은 픽스도 gps_sample_n
-          // 에는 반영된다 — validate_observation 의 _MIN_GPS_N 은 터널/무신호 관측을
-          // 걸러내려는 것이지 정밀도 필터가 아님 (이슈 §1-B).
-          binTrackerRef.current?.noteGpsSample();
+          // S3 — gps_sample_n(콜백 횟수) 카운팅은 recentFixesRef 기반 집계로
+          // 옮겨감(classifyElapsed 호출 시 자동으로 셈) — 별도 카운터 불필요.
 
           // 2026-09 1단계 완화(20m→30m) — 실기기 미검증, 다음 세션에서 실측 확인 필요.
           if (loc.coords.accuracy && loc.coords.accuracy > 30) return;
@@ -1238,7 +1304,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
             segmentStartTimesRef.current[0] = now;
             // 첫 bin 의 elapsed 도 "실제 이동 시작"에 맞춘다 — GPS 락 대기 시간이
             // 첫 bin 속도에 섞여 들어가지 않도록(§3.2 신호 A는 distance/elapsed 기반).
-            binTrackerRef.current?.anchorStart(now);
+            distanceRowTrackerRef.current?.anchorStart(now);
           }
           // measurementUnits 트래킹도 같은 "실제 이동 시작" 시각으로 앵커한다 —
           // routeSegments와 별개 배열이라 인덱스는 독립이지만, 기준 시각은 같아야
@@ -1248,7 +1314,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
           }
 
           // 신호 B — 순간속도 원본 저장 (판정 없음, §3.2 / §3.8).
-          // 직전 픽스와의 거리/시간으로 순간속도를 구해 현재 bin에 귀속시킨다.
+          // 직전 픽스와의 거리/시간으로 순간속도를 구해 현재 구간 경사 bin에 귀속시킨다.
           {
             const curPos = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
             const prevPos = lastGpsPosRef.current;
@@ -1256,15 +1322,21 @@ export default function NavigationScreen({ navigation, route }: Props) {
             if (prevPos && prevT) {
               const d  = haversineDistance(prevPos, curPos);
               const dt = (now - prevT) / 1000;
-              if (dt > 0 && dt < SPEED_SAMPLE_MAX_GAP_S && d < SPEED_SAMPLE_MAX_JUMP_M) {
-                const v = d / dt;
+              // S3 — GPS 점프 판정을 고정거리(100m)에서 암묵속도/정확도 기준으로
+              // 교체(config.ts 주석 참고). d/dt(암묵속도)가 도보로 낼 수 없는
+              // 속도이거나, 정확도 자체가 나쁘면 이 픽스가 만든 이동은 못 믿는다.
+              const impliedSpeed = dt > 0 ? d / dt : Infinity;
+              const accuracyM = loc.coords.accuracy ?? null;
+              const isJump = impliedSpeed > IMPLIED_SPEED_JUMP_MPS ||
+                (accuracyM != null && accuracyM > JUMP_ACCURACY_MAX_M);
+              if (dt > 0 && dt < SPEED_SAMPLE_MAX_GAP_S && !isJump) {
+                const v = impliedSpeed;
                 collectSessionRef.current?.addSpeedSample({
                   route_id:       serverRouteIdRef.current ?? undefined,
-                  slope_bin:      binTrackerRef.current?.currentBin ?? 0,
+                  slope_bin:      binCenter(routeSegments[currentSegIdxRef.current]?.slope ?? 0),
                   sub_distance_m: d,
                   speed_ms:       v,
                 });
-                if (v < NEAR_STOP_SPEED_MS) binTrackerRef.current?.noteStop(dt * 1000); // stop_ms 누적
                 // 정상 판정이 한 번이라도 성공하면 오염 플래그를 바로 내린다 — 원래는
                 // 이 unit이 닫힐 때(아래 gapConsumed)까지 기다렸는데, 실기기 콜백 간격이
                 // SPEED_SAMPLE_MAX_GAP_S 근처/이상으로 흔해서(sess-1789364304261-iy39nwa8
@@ -1280,10 +1352,10 @@ export default function NavigationScreen({ navigation, route }: Props) {
                 // 낫다고 판단.
                 unitGapPendingRef.current = false;
                 segGapPendingRef.current  = false;
-              } else if (dt >= SPEED_SAMPLE_MAX_GAP_S || d >= SPEED_SAMPLE_MAX_JUMP_M) {
-                // GPS 점프/장시간 공백 — 이 표본만이 아니라 진행 중이던 bin 관측
+              } else if (dt >= SPEED_SAMPLE_MAX_GAP_S || isJump) {
+                // GPS 점프/장시간 공백 — 이 표본만이 아니라 진행 중이던 행 관측
                 // 전체를 버린다 (점프 앞뒤로 거리·시간 오염, Q&A #5).
-                binTrackerRef.current?.invalidateCurrent(now);
+                distanceRowTrackerRef.current?.invalidateCurrent(now);
                 // measurementUnits 쪽도 같은 이유로 오염 — 지금 진행 중이던 unit이
                 // 다음에 닫힐 때 elapsed에 이 공백/점프 구간 전체가 섞여 들어간다
                 // (DB 분석에서 찾은 "9.9m 구간에 27700ms" 패턴). 그 unit이 닫히는
@@ -1291,7 +1363,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
                 // 루프(로컬 SegmentTime)도 같은 공백을 겪으므로 별도 플래그로 동일 표시.
                 unitGapPendingRef.current = true;
                 segGapPendingRef.current  = true;
-                if (__DEV__) console.warn(`[collect] GPS 점프/공백으로 bin 무효화 (dt=${dt.toFixed(1)}s d=${d.toFixed(0)}m)`);
+                if (__DEV__) console.warn(`[collect] GPS 점프/공백으로 행 무효화 (dt=${dt.toFixed(1)}s d=${d.toFixed(0)}m impliedV=${impliedSpeed.toFixed(1)}m/s)`);
               }
             }
             lastGpsPosRef.current  = curPos;
@@ -1347,7 +1419,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
               // "미통과·부분통과 → 저장 안 함") 따로 표시할 것도 없다 — signal A(bin)
               // 쪽만 outsideSeoul과 동일하게 무효화해 거리·시간이 다음 bin에 안 섞이게 한다.
               for (let k = curIdx; k <= caughtUpIdx; k++) {
-                binTrackerRef.current?.invalidateCurrent(now);
+                distanceRowTrackerRef.current?.invalidateCurrent(now);
               }
               curIdx = caughtUpIdx + 1;
               currentSegIdxRef.current = curIdx;
@@ -1357,7 +1429,14 @@ export default function NavigationScreen({ navigation, route }: Props) {
               continue; // 새 curIdx를 다음 while 반복에서 정상 경로로 재평가
             }
 
-            const elapsed = now - segmentStartTimesRef.current[curIdx];
+            // P0-1과 동일한 경계 보간(S3 요구) — "콜백 수신 시각"이 아니라 이
+            // 구간 끝점을 실제로 지난 시각을 추정해 쓴다.
+            const segCrossTime = interpolateCrossingTime(
+              prevProgressMForCrossing, prevGpsTimeForCrossing,
+              routeProgressTracker.maxProgressM(), now,
+              segEndArcLength[curIdx],
+            );
+            const elapsed = segCrossTime - segmentStartTimesRef.current[curIdx];
             const nextSeg = curIdx + 1 < routeSegments.length ? routeSegments[curIdx + 1] : null;
 
             // 오염 사유 둘 — 아래 measurementUnits 루프("skip 사유 둘")와 동일한 논리:
@@ -1374,7 +1453,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
             if (seg.outsideSeoul) {
               // 서울 밖(경사 데이터 없는 직선) 구간 — 측정·제출·신호 A/D 판단에서 제외.
               // GPS 공백/중도 종료 구간과 동일하게 현재 bin 을 무효화하고 그냥 지나간다.
-              binTrackerRef.current?.invalidateCurrent(now);
+              distanceRowTrackerRef.current?.invalidateCurrent(now);
             } else {
               // 오염된 세그먼트는 measuredMsRef에 아예 안 남긴다(null 유지) — 종료
               // 시 "미통과·부분통과 → 저장 안 함"(§1441)과 같은 경로로 자연스럽게
@@ -1389,16 +1468,18 @@ export default function NavigationScreen({ navigation, route }: Props) {
               // 기준(아래 별도 while 루프)으로만 나간다. measuredMsRef는 로컬 기록
               // (SegmentTime, 마이페이지 표시용)에만 계속 쓰인다.
 
-              // 신호 A — 이 구간을 현재 bin 에 누적하고, bin 경계면 관측 1행을 돌려받는다.
-              // (다음 구간이 서울 밖이면 그 경사(0)는 넘기지 않는다.)
-              const obs = binTrackerRef.current?.completeSegment(
+              // 신호 A(S3) — 이 구간을 현재 행(고정 25m)에 누적하고, ROW_LEN_M을
+              // 넘기면 "직전에 완성된 행"(1행 지연 스트리밍, distanceRowTracker.ts
+              // 참고)을 돌려받는다.
+              const obs = distanceRowTrackerRef.current?.completeSegment(
                 seg.length ?? 5,
-                nextSeg && !nextSeg.outsideSeoul ? (nextSeg.slope ?? 0) : null,
-                now,
+                seg.slope ?? 0,
+                segCrossTime,
                 serverRouteIdRef.current,
+                seg.is_stairs ?? false,
               );
               if (obs) {
-                collectSessionRef.current?.addSlopeObservation(obs);
+                collectSessionRef.current?.addSlopeObservation(buildSlopeObservationPayload(obs));
                 // 안전 음성 안내는 zone 기준 유지 (self-dedupe)
                 announceZoneEntry(nextSeg ? getZoneKey(nextSeg.zone, nextSeg.direction) : null);
               }
@@ -1689,7 +1770,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
         const gapS = (Date.now() - bgAtRef.current) / 1000;
         bgAtRef.current = 0;
         if (gapS >= SPEED_SAMPLE_MAX_GAP_S) {
-          binTrackerRef.current?.invalidateCurrent(Date.now());
+          distanceRowTrackerRef.current?.invalidateCurrent(Date.now());
           lastGpsPosRef.current = null;
           lastGpsTimeRef.current = 0;
           // 진행 중이던 measurementUnit/routeSegment 둘 다 같은 공백을 그대로
@@ -1716,11 +1797,11 @@ export default function NavigationScreen({ navigation, route }: Props) {
       // 진행 중이던 bin + 버퍼를 마지막으로 확정해 배치로 내보낸다.
       const cs = collectSessionRef.current;
       if (cs) {
-        const obs = binTrackerRef.current?.finalize(Date.now(), serverRouteIdRef.current);
-        if (obs) cs.addSlopeObservation(obs);
+        const finalObs = distanceRowTrackerRef.current?.finalize(Date.now(), serverRouteIdRef.current) ?? [];
+        for (const obs of finalObs) cs.addSlopeObservation(buildSlopeObservationPayload(obs));
         void cs.flush({ final: true });
         collectSessionRef.current = null;
-        binTrackerRef.current = null;
+        distanceRowTrackerRef.current = null;
       }
       if (gpsTraceBufferRef.current) {
         void gpsTraceBufferRef.current.flush({ final: true });
@@ -1800,11 +1881,11 @@ export default function NavigationScreen({ navigation, route }: Props) {
           // 세션 종료 플러시. 개별 POST 없이 /collect/batch 로만 나간다(인계 §5 ⑫).
           const cs = collectSessionRef.current;
           if (cs) {
-            const obs = binTrackerRef.current?.finalize(now, serverRouteIdRef.current);
-            if (obs) cs.addSlopeObservation(obs);
+            const finalObs = distanceRowTrackerRef.current?.finalize(now, serverRouteIdRef.current) ?? [];
+            for (const obs of finalObs) cs.addSlopeObservation(buildSlopeObservationPayload(obs));
             cs.flush({ final: true }).catch(() => {});
             collectSessionRef.current = null;
-            binTrackerRef.current = null;
+            distanceRowTrackerRef.current = null;
           }
           if (gpsTraceBufferRef.current) {
             gpsTraceBufferRef.current.flush({ final: true }).catch(() => {});

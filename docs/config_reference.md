@@ -66,4 +66,18 @@ DB 미기동으로 실행 확인 못 함).
 
 **미해결 데이터 갭**: `near_crossing`(횡단보도 근접 여부)을 계산하려면 "가장 가까운 횡단보도 노드까지 거리"가 필요한데, 이 프로젝트의 그래프(`graph.py`)에는 횡단보도를 나타내는 태그가 없다(계단의 `highway=='steps'`처럼 확인해본 적 없음 — 별도 조사 필요). 현재 `classifyElapsed()` 호출부(`NavigationScreen.tsx`)는 이 인자에 항상 `null`을 넘긴다.
 
-## (이후 S3~S15 상수는 해당 항목 작업 시 이 문서에 추가)
+## S3. 신호 A 행 구조 변경
+
+파일: `frontend/src/utils/distanceRowTracker.ts`, `frontend/src/personalization/config.ts`
+
+| 상수 | 값 | 근거 등급 | 근거 | 실기기 검증 |
+|---|---|---|---|---|
+| `ROW_LEN_M` | `25`(m) | C | 스펙 지정값 | ⬜ 대기 |
+| `IMPLIED_SPEED_JUMP_MPS` | `3.0`(m/s) | C | 도보 순간최고속도를 넉넉히 웃도는 선(임의). 기존 `SPEED_SAMPLE_MAX_JUMP_M`(100m 고정거리)을 대체 — dt에 무관한 기준으로 전환 | ⬜ 대기 |
+| `JUMP_ACCURACY_MAX_M` | `20`(m) | C | 스펙 지정값 | ⬜ 대기 |
+
+**행 구조 변경 요약**: `slope_bin`(0.5% 폭 bin 변화 시 방출) → 고정거리 25m마다 방출. 저장값도 `slope_bin` 단일값 대신 `slope_mean`(거리가중평균)·`slope_max`(절댓값 최대)·`ascent_m`/`descent_m`(연속값)로 변경 — bin은 학습 시점에 `slope_mean`으로부터 계산(FE는 더 이상 bin을 모름). `trip_slope_observations.slope_bin` 컬럼은 nullable로 완화(기존 행 보존, 신규 행은 NULL).
+
+**1행 지연 스트리밍**: 경로 끝의 자투리(<25m)를 "짧은 행 단독 방출" 대신 직전 행에 병합하기 위해, `DistanceRowTracker.completeSegment()`는 "방금 완성된 행"이 아니라 "그 직전에 완성됐던 행"을 반환한다(`finalize()`가 마지막 보류 행 + 자투리를 병합해 마무리). 헤드리스 테스트(`frontend/scripts/distanceRowTracker_test.ts`)로 검증 완료.
+
+## (이후 S4~S15 상수는 해당 항목 작업 시 이 문서에 추가)

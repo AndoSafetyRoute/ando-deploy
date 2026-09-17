@@ -247,11 +247,11 @@ export class CollectSession {
       this.seg = [];
       this.routeProfile = null;
       if (IS_DEV) {
-        const bins = batch.slope_observations?.map((o) => o.slope_bin) ?? [];
+        const means = batch.slope_observations?.map((o) => o.slope_mean) ?? [];
         const dist = batch.slope_observations?.reduce((s, o) => s + o.distance_m, 0) ?? 0;
         console.log(
           `[collect] flush ${batch.session_id} seq=${batch.seq}` +
-          ` slopeObs=${batch.slope_observations?.length ?? 0}(bins:${JSON.stringify(bins)} Σ${dist.toFixed(1)}m)` +
+          ` slopeObs=${batch.slope_observations?.length ?? 0}(means:${JSON.stringify(means)} Σ${dist.toFixed(1)}m)` +
           ` speed=${batch.speed_samples?.length ?? 0}` +
           ` choice=${batch.route_choice ? "Y" : "N"}` +
           ` segFb=${batch.segment_feedback?.length ?? 0}` +

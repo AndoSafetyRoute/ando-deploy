@@ -84,6 +84,9 @@ def recalculate_path_slopes(G: nx.DiGraph, path_nodes: list) -> list:
             "direction":     direction,
             "name":          edge.get("name", ""),
             "score_by_type": {ut: slope_score(g_eval, d_eval, ut) for ut in USER_TYPES},
+            # S3 — 신호 A 행(FE distanceRowTracker)의 facility 판정용. S6.5와
+            # 동일 사실 필드(OSM 원본 highway=='steps').
+            "is_stairs":     edge.get("highway") == "steps",
         }
         segments.append(seg)
 

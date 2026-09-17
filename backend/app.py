@@ -1009,12 +1009,26 @@ def api_get_segment_hardship_feedback(
 # 아니라 1종으로 통합했다.
 
 class SlopeObservationPayload(BaseModel):
+    """S3 — 고정거리(25m) 행. 0.5% bin 방출(slope_bin)을 대체 — 연속값으로
+    저장하고 bin은 학습 시점에 계산한다(FE utils/distanceRowTracker.ts)."""
     route_id:     int | None = None
-    slope_bin:    float
     distance_m:   float
+    slope_mean:   float             # 거리가중평균(부호 있음, %)
+    slope_max:    float             # 절댓값 최대(%)
+    ascent_m:     float = 0.0
+    descent_m:    float = 0.0
     elapsed_ms:   int
-    stop_ms:      int = 0
     gps_sample_n: int
+    # S2(stopClassifier) 집계 — 전부 optional(구버전 FE 호환, 하위호환).
+    step_delta:       int | None = None
+    stop_class:       str | None = None   # 'moving'|'gps_gap'|'uncertain'|'confirmed_stop'
+    dwell_ms:         int | None = None
+    moving_ms:        int | None = None
+    avg_gps_accuracy: float | None = None
+    device_model:     str | None = None
+    near_crossing:    bool | None = None
+    facility:         bool | None = None
+    valid:            bool | None = None
 
 
 class SpeedSamplePayload(BaseModel):
@@ -1297,6 +1311,7 @@ def _segments_payload(segments: list, user_type: str) -> list:
             "end":   {"latitude": v_lat, "longitude": v_lon},
             "slope":  round(slope_pct, 2),
             "length": round(s["length_m"], 1),
+            "is_stairs": s.get("is_stairs", False),
         })
     return out
 

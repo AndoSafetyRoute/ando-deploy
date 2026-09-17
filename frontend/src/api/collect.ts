@@ -14,14 +14,26 @@ import {
   COLLECT_SESSION_GPS_FIX_PATH,
 } from "../personalization/config";
 
-// ── 신호 A: 경사 bin별 통과 관측 ────────────────────────────────────────────────
+// ── 신호 A: 고정거리(25m) 행 관측(S3 — 0.5% bin 방출을 대체) ────────────────────
 export type SlopeObservation = {
   route_id?:     number | null;   // 서버 routes(id). 세션 시작 응답이 늦거나 실패하면 생략 가능
-  slope_bin:     number;          // bin 중심값 (부호 포함, 0.5% 폭). 예: -2.5, 0, 2.5
   distance_m:    number;
+  slope_mean:    number;          // 거리가중평균(부호 있음, %). bin은 학습 시점에 계산.
+  slope_max:     number;          // 절댓값 최대(%)
+  ascent_m:      number;
+  descent_m:     number;
   elapsed_ms:    number;
-  stop_ms?:      number;          // bin 안에서 멈춰 있던 시간(추정). 생략 시 서버가 0 처리
   gps_sample_n:  number;
+  // S2(stopClassifier) 집계 — utils/stopClassifier.ts::aggregateRow() 결과 그대로.
+  step_delta?:      number | null;
+  stop_class?:      "moving" | "gps_gap" | "uncertain" | "confirmed_stop";
+  dwell_ms?:        number;
+  moving_ms?:       number;
+  avg_gps_accuracy?: number | null;
+  device_model?:    string | null;
+  near_crossing?:   boolean;
+  facility?:        boolean;
+  valid?:           boolean;
 };
 
 // ── 신호 B: 순간속도 원본 (판정값 저장 금지 — §3.8) ───────────────────────────

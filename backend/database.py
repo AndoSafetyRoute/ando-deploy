@@ -303,6 +303,52 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_tso_uid_bin
             ON trip_slope_observations (uid, slope_bin)
         """))
+        # S3 — 행 방출 기준이 0.5% bin 변화 → 고정거리(25m)로 바뀌면서 slope_bin을
+        # 더 이상 FE가 안 채운다(학습 시점에 slope_mean으로 계산) — nullable로 완화.
+        # 기존 행(slope_bin 있음)은 그대로 남고, 새 행은 NULL + slope_mean/slope_max로 대체.
+        conn.execute(text(
+            "ALTER TABLE trip_slope_observations ALTER COLUMN slope_bin DROP NOT NULL"
+        ))
+        conn.execute(text(
+            "ALTER TABLE trip_slope_observations ADD COLUMN IF NOT EXISTS slope_mean DOUBLE PRECISION"
+        ))
+        conn.execute(text(
+            "ALTER TABLE trip_slope_observations ADD COLUMN IF NOT EXISTS slope_max DOUBLE PRECISION"
+        ))
+        conn.execute(text(
+            "ALTER TABLE trip_slope_observations ADD COLUMN IF NOT EXISTS ascent_m DOUBLE PRECISION"
+        ))
+        conn.execute(text(
+            "ALTER TABLE trip_slope_observations ADD COLUMN IF NOT EXISTS descent_m DOUBLE PRECISION"
+        ))
+        # S2(stopClassifier) 집계 — D(navigation_measurements)와 동일 컬럼 세트.
+        conn.execute(text(
+            "ALTER TABLE trip_slope_observations ADD COLUMN IF NOT EXISTS step_delta INT"
+        ))
+        conn.execute(text(
+            "ALTER TABLE trip_slope_observations ADD COLUMN IF NOT EXISTS stop_class TEXT"
+        ))
+        conn.execute(text(
+            "ALTER TABLE trip_slope_observations ADD COLUMN IF NOT EXISTS dwell_ms BIGINT"
+        ))
+        conn.execute(text(
+            "ALTER TABLE trip_slope_observations ADD COLUMN IF NOT EXISTS moving_ms BIGINT"
+        ))
+        conn.execute(text(
+            "ALTER TABLE trip_slope_observations ADD COLUMN IF NOT EXISTS avg_gps_accuracy DOUBLE PRECISION"
+        ))
+        conn.execute(text(
+            "ALTER TABLE trip_slope_observations ADD COLUMN IF NOT EXISTS device_model TEXT"
+        ))
+        conn.execute(text(
+            "ALTER TABLE trip_slope_observations ADD COLUMN IF NOT EXISTS near_crossing BOOLEAN"
+        ))
+        conn.execute(text(
+            "ALTER TABLE trip_slope_observations ADD COLUMN IF NOT EXISTS facility BOOLEAN"
+        ))
+        conn.execute(text(
+            "ALTER TABLE trip_slope_observations ADD COLUMN IF NOT EXISTS valid BOOLEAN"
+        ))
 
         # 신호 B: 순간속도 원본 (판정값 저장 금지 — 3.8절 원칙 1)
         conn.execute(text("""
@@ -1616,21 +1662,36 @@ def save_collect_batch(
     for obs in slope_observations:
         db.execute(text("""
             INSERT INTO trip_slope_observations
-                (uid, route_id, session_id, user_type, slope_bin, distance_m,
-                 elapsed_ms, stop_ms, gps_sample_n)
+                (uid, route_id, session_id, user_type, distance_m, elapsed_ms, gps_sample_n,
+                 slope_mean, slope_max, ascent_m, descent_m,
+                 step_delta, stop_class, dwell_ms, moving_ms, avg_gps_accuracy,
+                 device_model, near_crossing, facility, valid)
             VALUES
-                (:uid, :route_id, :session_id, :user_type, :slope_bin, :distance_m,
-                 :elapsed_ms, :stop_ms, :gps_sample_n)
+                (:uid, :route_id, :session_id, :user_type, :distance_m, :elapsed_ms, :gps_sample_n,
+                 :slope_mean, :slope_max, :ascent_m, :descent_m,
+                 :step_delta, :stop_class, :dwell_ms, :moving_ms, :avg_gps_accuracy,
+                 :device_model, :near_crossing, :facility, :valid)
         """), {
             "uid":          uid,
             "route_id":     obs.get("route_id"),
             "session_id":   session_id,
             "user_type":    user_type,
-            "slope_bin":    obs["slope_bin"],
             "distance_m":   obs["distance_m"],
             "elapsed_ms":   obs["elapsed_ms"],
-            "stop_ms":      obs.get("stop_ms", 0),
             "gps_sample_n": obs["gps_sample_n"],
+            "slope_mean":   obs["slope_mean"],
+            "slope_max":    obs.get("slope_max"),
+            "ascent_m":     obs.get("ascent_m"),
+            "descent_m":    obs.get("descent_m"),
+            "step_delta":       obs.get("step_delta"),
+            "stop_class":       obs.get("stop_class"),
+            "dwell_ms":         obs.get("dwell_ms"),
+            "moving_ms":        obs.get("moving_ms"),
+            "avg_gps_accuracy": obs.get("avg_gps_accuracy"),
+            "device_model":     obs.get("device_model"),
+            "near_crossing":    obs.get("near_crossing"),
+            "facility":         obs.get("facility"),
+            "valid":            obs.get("valid"),
         })
 
     # ── user_speed_profile EMA 갱신 (인계 v2 §4.5 B-2 + Q&A #4) ────────────────
@@ -1646,11 +1707,11 @@ def save_collect_batch(
         for obs in slope_observations:
             speed = validate_observation(
                 obs["distance_m"], obs["elapsed_ms"], obs["gps_sample_n"],
-                obs.get("stop_ms", 0),
+                obs.get("dwell_ms", 0) or 0,
             )
             if speed is None:
                 continue
-            zk = _zone_key_for_slope(float(obs["slope_bin"]), user_type)
+            zk = _zone_key_for_slope(float(obs["slope_mean"]), user_type)
             _apply_speed_ema(db, uid, zk, speed, user_type, float(obs["distance_m"]))
             speed_ema_applied += 1
 
