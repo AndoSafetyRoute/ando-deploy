@@ -45,6 +45,7 @@ import {
 import type { NavSegment, Waypoint, MeasurementUnit } from "../api/routeApi";
 import { CollectSession, drainCollectQueue } from "../utils/collectQueue";
 import { startCollectSession, reportGpsFixStage } from "../api/collect";
+import { StepTracker } from "../utils/stepTracker";
 import { GpsTraceBuffer } from "../utils/gpsTraceBuffer";
 import { SlopeBinTracker } from "../utils/slopeBinTracker";
 import {
@@ -942,6 +943,11 @@ export default function NavigationScreen({ navigation, route }: Props) {
   const watchStartTimeRef   = useRef(0);
   const gpsFixStageRef      = useRef<string>("best_nav");
 
+  // S1(걸음 수) — 신호 A/B와 같은 동의 게이트(beginCollection)에서 시작, 언마운트 시
+  // 반드시 정지. stepsBetween()은 S2(stopClassifier)가 아직 없어 지금은 소비하지
+  // 않음 — 센서 구독/해제 생명주기와 null fallback 경로만 이번에 검증한다.
+  const stepTrackerRef = useRef<StepTracker | null>(null);
+
   // 개인화 데이터 수집 동의 모달 (이슈 #1). unknown 이고 도보 안내일 때만 뜬다.
   const [consentPrompt, setConsentPrompt] = useState(false);
 
@@ -952,6 +958,12 @@ export default function NavigationScreen({ navigation, route }: Props) {
   const beginCollection = useCallback((initTime: number) => {
     if (collectSessionRef.current) return;              // 중복 방지
     collectSessionRef.current = new CollectSession(route?.params?.collectSessionId);
+    // S1 — 걸음 수 구독도 같은 동의 시점에 시작. 실패해도(센서 없음/권한 거부)
+    // 안내 흐름을 막지 않는다 — start()가 내부에서 삼킴.
+    stepTrackerRef.current = new StepTracker();
+    stepTrackerRef.current.start().then((ok) => {
+      console.log(`[StepTracker] 시작 ${ok ? "성공" : "실패(null fallback)"}`);
+    });
     // 세션이 안내 종료 시 null 로 비워진 뒤에도 구간평가(신호 D) POST 가 session_id 를
     // 실을 수 있도록 문자열만 따로 보존한다 (신호 A/B 와 조인용).
     collectSessionIdRef.current = collectSessionRef.current.sessionId;
@@ -1653,6 +1665,8 @@ export default function NavigationScreen({ navigation, route }: Props) {
       mounted = false;
       if (gpsWatchdog) clearTimeout(gpsWatchdog);
       if (fallbackTimerRef.current) clearTimeout(fallbackTimerRef.current);
+      stepTrackerRef.current?.stop();
+      stepTrackerRef.current = null;
       appStateSub.remove();
       subscriptionRef.current?.remove();
       subscriptionRef.current = null;
