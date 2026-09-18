@@ -48,6 +48,10 @@ const MAX_PENDING_BATCHES = 40;
 // 중간 플러시 임계값
 const FLUSH_INTERVAL_MS = 120_000;   // 2분
 const FLUSH_ROW_LIMIT   = 200;       // 200행
+// AsyncStorage 저장이 계속 실패할 때, 재시도를 위해 메모리 버퍼를 비우지 않고
+// 들고 있는 것도 한도가 있어야 한다 — 이 횟수를 넘기면 그 세션의 미저장분은
+// 포기하고 버퍼를 비운다(무한정 누적 방지). 2분 간격 기준 최대 약 10분치.
+const MAX_SAVE_RETRIES = 5;
 
 type PendingBatch = CollectBatch;
 
@@ -79,7 +83,14 @@ async function loadPending(): Promise<PendingBatch[]> {
 let droppedBatchCount = 0;
 export function getDroppedBatchCount(): number { return droppedBatchCount; }
 
-async function savePending(list: PendingBatch[]): Promise<void> {
+/**
+ * AsyncStorage에 실제로 쓰기 성공했는지 boolean으로 알려준다 — 예전엔 실패를
+ * 완전히 삼켜서(catch에서 아무것도 안 함), 호출부(enqueuePending)가 "저장됐다"고
+ * 착각하고 메모리 버퍼를 비웠다. 그러면 바로 뒤 drainCollectQueue()의
+ * loadPending()이 이 실패를 반영 안 한 예전 상태를 읽어, 배치가 로그도 재시도도
+ * 없이 완전히 사라졌다(9/17 왕복 세션 신호 A/B 0건 원인).
+ */
+async function savePending(list: PendingBatch[]): Promise<boolean> {
   try {
     if (list.length > MAX_PENDING_BATCHES) {
       const dropped = list.slice(0, list.length - MAX_PENDING_BATCHES);
@@ -101,20 +112,20 @@ async function savePending(list: PendingBatch[]): Promise<void> {
     // (9/17 왕복 세션 신호 A/B 0건 조사).
     console.warn(`[collect][DEBUG] savePending 쓰기 시도 — batches=${trimmed.length} bytes=${serialized.length}`);
     await AsyncStorage.setItem(PENDING_KEY, serialized);
+    return true;
   } catch (e: any) {
-    // 디버그용, 검증 후 제거 예정 — 원래 "스토리지 실패는 조용히 무시"였는데,
-    // 이 실패가 조용하면 바로 뒤 drainCollectQueue()의 loadPending()이 방금
-    // 쓰려던 배치가 반영 안 된 예전 상태를 읽어 배치가 흔적 없이 사라질 수
-    // 있다(9/17 왕복 세션 신호 A/B 0건 조사 중 발견). 최소한 로그로는 남긴다.
-    console.warn(`[collect][DEBUG] savePending 실패(배치 유실 가능) — ${String(e?.message ?? e).slice(0, 200)}`);
+    console.error(`[collect] savePending 실패(배치 유실 가능) — ${String(e?.message ?? e).slice(0, 200)}`);
+    return false;
   }
 }
 
-function enqueuePending(batch: PendingBatch): Promise<void> {
+/** 저장 성공 여부를 그대로 돌려준다 — 실패 시 호출부(flush)가 메모리 버퍼를
+ * 비우지 않고 다음 flush 때 재시도하도록 판단 근거로 쓴다. */
+function enqueuePending(batch: PendingBatch): Promise<boolean> {
   return withQueueLock(async () => {
     const list = await loadPending();
     list.push(batch);
-    await savePending(list);
+    return savePending(list);
   });
 }
 
@@ -190,6 +201,9 @@ export class CollectSession {
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private closed = false;
+  // enqueuePending(=AsyncStorage 저장)이 연속으로 실패한 횟수. flush()가 이걸
+  // 보고 저장 실패 시 버퍼를 비울지(재시도 포기) 말지(다음 flush에서 재시도) 판단.
+  private saveFailCount = 0;
 
   constructor(sessionId?: string) {
     this.sessionId = sessionId ?? newSessionId();
@@ -255,19 +269,13 @@ export class CollectSession {
     if (this.bufferedRows() > 0 || this.routeProfile) {
       const batch: PendingBatch = {
         session_id:         this.sessionId,
-        seq:                this.seq++,
+        seq:                this.seq,
         slope_observations: this.slope,
         speed_samples:      this.speed,
         route_choice:       this.choice,
         segment_feedback:   this.seg,
         route_profile:      this.routeProfile,
       };
-      // 버퍼를 먼저 비운다 — 전송 실패해도 배치는 큐에 남으므로 유실 없음
-      this.slope = [];
-      this.speed = [];
-      this.choice = null;
-      this.seg = [];
-      this.routeProfile = null;
       if (IS_DEV) {
         const means = batch.slope_observations?.map((o) => o.slope_mean) ?? [];
         const dist = batch.slope_observations?.reduce((s, o) => s + o.distance_m, 0) ?? 0;
@@ -280,7 +288,44 @@ export class CollectSession {
           (final ? " [final]" : ""),
         );
       }
-      await enqueuePending(batch);
+      // 예전엔 여기서 결과를 안 보고 무조건 버퍼를 비웠다 — savePending이 조용히
+      // 실패하면(9/17 왕복 세션 원인) 방금 만든 batch가 로컬에도 안 남고 메모리
+      // 버퍼도 이미 빈 상태라 완전히 사라졌다. 이제 저장 성공을 확인한 뒤에만
+      // 비운다 — 실패하면 버퍼를 그대로 둬 다음 flush(2분 뒤 또는 다음 200행
+      // 도달 시)가 누적된 채로 다시 저장을 시도한다(seq도 그대로 재사용).
+      const saved = await enqueuePending(batch);
+      if (saved) {
+        this.seq += 1;
+        this.slope = [];
+        this.speed = [];
+        this.choice = null;
+        this.seg = [];
+        this.routeProfile = null;
+        this.saveFailCount = 0;
+      } else {
+        this.saveFailCount += 1;
+        if (this.saveFailCount >= MAX_SAVE_RETRIES) {
+          // 계속 실패하면 버퍼가 무한정 쌓이므로(메모리), 상한을 넘기면 이번
+          // 미저장분은 포기하고 비운다 — MAX_PENDING_BATCHES(디스크 큐 상한)와
+          // 같은 원칙의 메모리 버퍼 버전. 무통보 손실이므로 최소한 로그는 남긴다.
+          console.error(
+            `[collect] savePending ${MAX_SAVE_RETRIES}회 연속 실패 — session=${this.sessionId} ` +
+            `미저장 ${this.bufferedRows()}행 포기(무한 누적 방지).`,
+          );
+          this.seq += 1;
+          this.slope = [];
+          this.speed = [];
+          this.choice = null;
+          this.seg = [];
+          this.routeProfile = null;
+          this.saveFailCount = 0;
+        } else {
+          console.warn(
+            `[collect] enqueuePending 실패(${this.saveFailCount}/${MAX_SAVE_RETRIES}) — ` +
+            `버퍼 유지, 다음 flush에서 재시도.`,
+          );
+        }
+      }
     }
 
     if (final) {
