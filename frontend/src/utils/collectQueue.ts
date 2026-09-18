@@ -97,8 +97,12 @@ async function savePending(list: PendingBatch[]): Promise<void> {
     }
     const trimmed = list.slice(-MAX_PENDING_BATCHES);
     await AsyncStorage.setItem(PENDING_KEY, JSON.stringify(trimmed));
-  } catch {
-    /* 스토리지 실패는 조용히 무시 — 다음 플러시에서 재시도 */
+  } catch (e: any) {
+    // 디버그용, 검증 후 제거 예정 — 원래 "스토리지 실패는 조용히 무시"였는데,
+    // 이 실패가 조용하면 바로 뒤 drainCollectQueue()의 loadPending()이 방금
+    // 쓰려던 배치가 반영 안 된 예전 상태를 읽어 배치가 흔적 없이 사라질 수
+    // 있다(9/17 왕복 세션 신호 A/B 0건 조사 중 발견). 최소한 로그로는 남긴다.
+    console.warn(`[collect][DEBUG] savePending 실패(배치 유실 가능) — ${String(e?.message ?? e).slice(0, 200)}`);
   }
 }
 
@@ -122,6 +126,10 @@ export async function drainCollectQueue(idToken?: string): Promise<void> {
       drainRequested = false;
       await withQueueLock(async () => {
         const pending = await loadPending();
+        // 디버그용, 검증 후 제거 예정 — IS_DEV(__DEV__) 게이트 없이 항상 찍는다.
+        // 배치가 만들어졌는지(flush 쪽 로그)와 큐에서 실제로 뭘 읽었는지를
+        // 대조해 "만들었는데 여기서 안 보임"을 확정하기 위함.
+        console.warn(`[collect][DEBUG] drainCollectQueue: pending=${pending.length}`);
         if (pending.length === 0) return;
 
         const kept: PendingBatch[] = [];
@@ -229,6 +237,16 @@ export class CollectSession {
    */
   async flush(opts?: { final?: boolean; idToken?: string }): Promise<void> {
     const final = opts?.final ?? false;
+
+    // 디버그용, 검증 후 제거 예정 — IS_DEV 게이트 없이 항상 찍는다. flush()가
+    // 실제로 몇 번 "호출"됐는지, 호출 시점에 버퍼가 비어 있었는지(=addSlopeObservation/
+    // addSpeedSample이 애초에 안 불렸다는 뜻)를 다음 실기기 테스트에서 확정하기 위함
+    // (9/17 왕복 세션 신호 A/B 0건 조사).
+    console.warn(
+      `[collect][DEBUG] flush() 호출 session=${this.sessionId} seq=${this.seq} ` +
+      `slope=${this.slope.length} speed=${this.speed.length} seg=${this.seg.length} ` +
+      `choice=${this.choice ? "Y" : "N"} profile=${this.routeProfile ? "Y" : "N"} final=${final}`,
+    );
 
     if (this.bufferedRows() > 0 || this.routeProfile) {
       const batch: PendingBatch = {
