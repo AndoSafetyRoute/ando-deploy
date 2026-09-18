@@ -87,7 +87,7 @@ export async function requestRoute({
   endStationName,
 }: RouteRequest) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 30_000);
+  const timer = setTimeout(() => controller.abort(), 60_000);
 
   const origin_lat = Number(startLatitude);
   const origin_lon = Number(startLongitude);
@@ -143,7 +143,7 @@ export async function requestWalkLeg({
   light = false,
 }: RouteRequest) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 30_000);
+  const timer = setTimeout(() => controller.abort(), 60_000);
 
   try {
     const response = await fetch(`${API_BASE_URL}/route/safe`, {
