@@ -96,7 +96,11 @@ async function savePending(list: PendingBatch[]): Promise<void> {
       );
     }
     const trimmed = list.slice(-MAX_PENDING_BATCHES);
-    await AsyncStorage.setItem(PENDING_KEY, JSON.stringify(trimmed));
+    const serialized = JSON.stringify(trimmed);
+    // 디버그용, 검증 후 제거 예정 — 배치 크기와 저장 성공/실패 상관관계 확인용
+    // (9/17 왕복 세션 신호 A/B 0건 조사).
+    console.warn(`[collect][DEBUG] savePending 쓰기 시도 — batches=${trimmed.length} bytes=${serialized.length}`);
+    await AsyncStorage.setItem(PENDING_KEY, serialized);
   } catch (e: any) {
     // 디버그용, 검증 후 제거 예정 — 원래 "스토리지 실패는 조용히 무시"였는데,
     // 이 실패가 조용하면 바로 뒤 drainCollectQueue()의 loadPending()이 방금
