@@ -346,7 +346,12 @@ export default function WalkContent({
         cs.setRouteChoice(
           buildRouteChoicePayload(shown, shown.length > 1 ? selectedCand : null)
         );
-        cs.flush().catch(() => {});
+        // final:true — NavigationScreen이 같은 session_id로 새 CollectSession을
+        // 만들 것이므로 이 인스턴스는 여기서 완전히 끝내야 한다. 예전엔 non-final
+        // flush 뒤 collectRef만 null로 비웠는데, setInterval 콜백은 여전히 이
+        // 인스턴스(this)를 직접 참조해 clearInterval 없이는 안 멎는다 — 화면
+        // 전환 후에도 "유령" 2분 타이머가 빈 배치로 계속 돌던 원인(진단 로그로 확인).
+        cs.flush({ final: true }).catch(() => {});
       } catch {
         /* 로깅 실패는 안내 흐름을 막지 않는다 */
       }

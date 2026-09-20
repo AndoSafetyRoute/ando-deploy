@@ -127,7 +127,8 @@ export default function RouteCompareScreen({ navigation, route }: Props) {
     const cs = collectRef.current;
     if (cs && chosen) {
       cs.setRouteChoice(buildRouteChoicePayload(shown, chosen));
-      cs.flush().catch(() => {});
+      // final:true — WalkContent.tsx와 동일 이유(유령 2분 타이머 방지).
+      cs.flush({ final: true }).catch(() => {});
     }
     const sessionId = cs?.sessionId;
     collectRef.current = null; // 아래 navigate 로 언마운트되므로 cleanup 의 flush 중복 방지
