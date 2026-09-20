@@ -369,6 +369,12 @@ def init_db():
         conn.execute(text(
             "ALTER TABLE trip_slope_observations ADD COLUMN IF NOT EXISTS slope_source TEXT"
         ))
+        # 2026-09 완화 — valid는 이제 gps_gap만 깎고 uncertain은 안 깎는다(FE
+        # utils/stopClassifier.ts aggregateRow 참고). 그 대신 uncertain 사유를
+        # 남겨서 low_sample/low_accuracy/step_deadzone 비중을 사후에 구분한다.
+        conn.execute(text(
+            "ALTER TABLE trip_slope_observations ADD COLUMN IF NOT EXISTS uncertain_reason TEXT"
+        ))
 
         # 신호 B: 순간속도 원본 (판정값 저장 금지 — 3.8절 원칙 1)
         conn.execute(text("""
@@ -1797,12 +1803,12 @@ def save_collect_batch(
                 (uid, route_id, session_id, user_type, distance_m, elapsed_ms, gps_sample_n,
                  slope_mean, slope_max, ascent_m, descent_m,
                  step_delta, stop_class, dwell_ms, moving_ms, avg_gps_accuracy,
-                 device_model, near_crossing, facility, valid, slope_source)
+                 device_model, near_crossing, facility, valid, slope_source, uncertain_reason)
             VALUES
                 (:uid, :route_id, :session_id, :user_type, :distance_m, :elapsed_ms, :gps_sample_n,
                  :slope_mean, :slope_max, :ascent_m, :descent_m,
                  :step_delta, :stop_class, :dwell_ms, :moving_ms, :avg_gps_accuracy,
-                 :device_model, :near_crossing, :facility, :valid, :slope_source)
+                 :device_model, :near_crossing, :facility, :valid, :slope_source, :uncertain_reason)
         """), {
             "uid":          uid,
             "route_id":     obs.get("route_id"),
@@ -1825,6 +1831,7 @@ def save_collect_batch(
             "facility":         obs.get("facility"),
             "valid":            obs.get("valid"),
             "slope_source":     obs.get("slope_source"),
+            "uncertain_reason": obs.get("uncertain_reason"),
         })
 
     # ── user_speed_profile EMA 갱신 (인계 v2 §4.5 B-2 + Q&A #4) ────────────────

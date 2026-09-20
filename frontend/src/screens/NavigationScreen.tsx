@@ -1035,6 +1035,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
         near_crossing: rowAgg.nearCrossing,
         facility:    rowAgg.facility,
         valid:       rowAgg.valid,
+        uncertain_reason: rowAgg.uncertainReason ?? null,
         slope_source: obs.slope_source,
       };
     },

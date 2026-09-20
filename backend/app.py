@@ -1079,6 +1079,9 @@ class SlopeObservationPayload(BaseModel):
     # S6 — slope 0/NULL/교량 구분('dem'|'bridge_zero'|'missing'). 구버전 FE는
     # 이 필드를 안 보내므로 하위호환 optional(BE에서 None→'missing'으로 보정).
     slope_source:     str | None = None
+    # 2026-09 — stop_class=='uncertain'일 때 사유('low_sample'|'low_accuracy'|
+    # 'step_deadzone'|'other'). 구버전 FE는 안 보냄, optional.
+    uncertain_reason: str | None = None
 
 
 class SpeedSamplePayload(BaseModel):

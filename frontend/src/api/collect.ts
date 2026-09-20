@@ -34,6 +34,8 @@ export type SlopeObservation = {
   near_crossing?:   boolean;
   facility?:        boolean;
   valid?:           boolean;
+  // stop_class==="uncertain"일 때만 채워짐 — 사후 역추적용(2026-09).
+  uncertain_reason?: "low_sample" | "low_accuracy" | "step_deadzone" | "other" | null;
   // S6 — 이 행(worst-wins 집계, utils/distanceRowTracker.ts)의 slope 신뢰도.
   slope_source?:    "dem" | "bridge_zero" | "missing";
 };
