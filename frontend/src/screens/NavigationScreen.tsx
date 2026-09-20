@@ -1199,6 +1199,9 @@ export default function NavigationScreen({ navigation, route }: Props) {
       //   denied   → 세션 없이 진행(기존과 동일)
       getCollectConsent().then((consent) => {
         if (!mounted) return;
+        // 디버그용, 검증 후 제거 예정 — beginCollection 게이트가 되는 consent 값
+        // 확인 (9/17~ 왕복 세션 신호 A/B 0건 조사).
+        console.warn(`[collect][DEBUG] getCollectConsent 반환값=${consent}`);
         if (consent === "granted") beginCollection(initTime);
         else if (consent === "unknown" && (mode ?? "walk") === "walk") setConsentPrompt(true);
       }).catch(() => {}).finally(() => {
@@ -1774,6 +1777,9 @@ export default function NavigationScreen({ navigation, route }: Props) {
     // elapsed_ms 에 "화면 꺼둔 시간"이 통째로 섞인다. 공백이 SPEED_SAMPLE_MAX_GAP_S
     // 를 넘으면 그 bin 을 버리고(다음 경계부터 다시), 직전 픽스도 리셋한다 (이슈 S3).
     const appStateSub = AppState.addEventListener("change", (state) => {
+      // 디버그용, 검증 후 제거 예정 — 2분 타이머 미동작이 백그라운드 스로틀
+      // 때문인지 확인 (9/17~ 왕복 세션 신호 A/B 0건 조사).
+      console.warn(`[collect][DEBUG] AppState change → ${state}`);
       if (state === "background" || state === "inactive") {
         bgAtRef.current = Date.now();
       } else if (state === "active" && bgAtRef.current > 0) {

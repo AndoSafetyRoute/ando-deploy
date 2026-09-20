@@ -208,6 +208,9 @@ export class CollectSession {
   constructor(sessionId?: string) {
     this.sessionId = sessionId ?? newSessionId();
     this.timer = setInterval(() => { void this.flush(); }, FLUSH_INTERVAL_MS);
+    // 디버그용, 검증 후 제거 예정 — 타이머가 실제로 등록되는지 확인
+    // (9/17~ 왕복 세션 신호 A/B 0건, collect_batch_log max_seq=0 조사).
+    console.warn(`[collect][DEBUG] CollectSession 생성 + 타이머 등록됨 session=${this.sessionId} intervalMs=${FLUSH_INTERVAL_MS}`);
   }
 
   private bufferedRows(): number {
