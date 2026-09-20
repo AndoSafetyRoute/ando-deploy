@@ -132,6 +132,15 @@ interface Props {
       // 개인화 계측 세션 ID. 3경로 비교 화면(⑬)에서 경로 선택을 먼저 기록한 뒤
       // 같은 세션으로 안내 계측을 이어붙이기 위해 넘긴다. 없으면 새로 생성.
       collectSessionId?: string;
+      // 대중교통 leg 전환 시, 이전 leg의 CollectSession이 이미 쓴 seq 다음 값을
+      // 이어받는다. 없으면 CollectSession이 0부터 시작 — collectSessionId를
+      // 재사용하면서 이 값을 안 넘기면, 이전 leg가 이미 쓴 (uid,session_id,seq)와
+      // 겹쳐 백엔드 ON CONFLICT DO NOTHING에 조용히 씹힌다(leg 전환 세션 단절 버그).
+      collectSessionStartSeq?: number;
+      // GpsTraceBuffer(측정 파이프라인 v2 원본 궤적)의 seq는 CollectSession과
+      // 별개 카운터라 따로 이어받아야 한다 — 안 넘기면 gps_traces도 같은
+      // (session_id, seq) 충돌로 leg 2+ 포인트가 조용히 유실된다.
+      gpsTraceStartSeq?: number;
       // 상단 여정 스테퍼용 — 전체 구간 요약(JSON 배열)과 그중 지금 안내 중인 인덱스.
       journeySteps?: string;
       legIndex?: string;
@@ -1048,7 +1057,10 @@ export default function NavigationScreen({ navigation, route }: Props) {
    */
   const beginCollection = useCallback((initTime: number) => {
     if (collectSessionRef.current) return;              // 중복 방지
-    collectSessionRef.current = new CollectSession(route?.params?.collectSessionId);
+    collectSessionRef.current = new CollectSession(
+      route?.params?.collectSessionId,
+      route?.params?.collectSessionStartSeq,
+    );
     // S1 — 걸음 수 구독도 같은 동의 시점에 시작. 실패해도(센서 없음/권한 거부)
     // 안내 흐름을 막지 않는다 — start()가 내부에서 삼킴.
     stepTrackerRef.current = new StepTracker();
@@ -1077,7 +1089,10 @@ export default function NavigationScreen({ navigation, route }: Props) {
         schemaVer:  MEASUREMENT_SCHEMA_VERSION,
       }, token).catch(() => {});
     }).catch(() => {});
-    gpsTraceBufferRef.current = new GpsTraceBuffer(collectSessionRef.current.sessionId);
+    gpsTraceBufferRef.current = new GpsTraceBuffer(
+      collectSessionRef.current.sessionId,
+      route?.params?.gpsTraceStartSeq,
+    );
     distanceRowTrackerRef.current = new DistanceRowTracker(initTime);
     try {
       collectSessionRef.current.setRouteProfile({
@@ -1707,12 +1722,48 @@ export default function NavigationScreen({ navigation, route }: Props) {
             // 알려진 이슈(별도 트래킹, 지금 안 고침): 여기서 새 NavigationScreen을
             // 마운트하는 것 = 이전 leg는 completeNavigation을 절대 호출받지 못하고
             // routes.status='in_progress'로 영구히 남는다(postWalkParams에
-            // serverRouteId/collectSessionId 이어받는 값이 없어 이전 leg를 닫을
-            // 방법 자체가 없음). 파일럿 전 DB에서 발견한 in_progress 방치 63건 중
-            // 일부는 "앱 종료/네트워크 유실"이 아니라 대중교통 정상 동작 중에도
-            // 구조적으로 이렇게 생겼을 가능성이 있음. 멀티레그 "완료"를 leg 단위로
-            // 볼지 여정 전체로 볼지 결정 필요 — 이번 측정 파이프라인 v2 작업 범위 밖.
-            navigation?.navigate("Navigation", transitNextLeg.nextLegParams);
+            // serverRouteId 이어받는 값이 없어 이전 leg를 닫을 방법 자체가 없음).
+            // 파일럿 전 DB에서 발견한 in_progress 방치 63건 중 일부는 "앱 종료/
+            // 네트워크 유실"이 아니라 대중교통 정상 동작 중에도 구조적으로 이렇게
+            // 생겼을 가능성이 있음. 멀티레그 "완료"를 leg 단위로 볼지 여정 전체로
+            // 볼지 결정 필요 — 이번 측정 파이프라인 v2 작업 범위 밖(routes.status만
+            // 남는 문제, CollectSession 쪽은 아래에서 별도로 잇는다).
+            //
+            // collectSessionId는 여기서 잇는다 — 예전엔 postWalkParams에 아예 안
+            // 실려가서 leg마다 완전히 새 session_id가 발급됐다(신호 A/B/D가 leg
+            // 경계에서 끊김). 그냥 sessionId만 이어주면 또 다른 문제가 생긴다 —
+            // CollectSession 생성자가 seq를 항상 0부터 시작해서, 재사용된
+            // session_id에 이전 leg가 이미 쓴 (uid,session_id,seq=0,1,2...)와
+            // 겹쳐 백엔드 ON CONFLICT DO NOTHING(database.py save_collect_batch)에
+            // 조용히 씹힌다. 그래서 이전 leg를 final flush로 완전히 닫고(seq 확정)
+            // 그 다음 seq를 collectSessionStartSeq로 같이 넘긴다.
+            {
+              const cs = collectSessionRef.current;
+              const finalObs = distanceRowTrackerRef.current?.finalize(now, serverRouteIdRef.current) ?? [];
+              if (cs) { for (const obs of finalObs) cs.addSlopeObservation(buildSlopeObservationPayload(obs)); }
+              collectSessionRef.current = null;
+              distanceRowTrackerRef.current = null;
+
+              // gps_traces(측정 파이프라인 v2 원본 궤적)도 같은 이유로 이어줘야
+              // 한다 — nextSeq는 push()에서만 증가하므로(flush는 안 건드림) 지금
+              // 값을 그대로 읽으면 되고, CollectSession처럼 flush 완료를 기다릴
+              // 필요는 없다.
+              const gtb = gpsTraceBufferRef.current;
+              const gpsTraceStartSeq = gtb?.getNextSeqForHandoff();
+              if (gtb) { void gtb.flush({ final: true }); }
+              gpsTraceBufferRef.current = null;
+
+              const goNextLeg = () => {
+                navigation?.navigate("Navigation", {
+                  ...transitNextLeg.nextLegParams,
+                  collectSessionId: cs?.sessionId,
+                  collectSessionStartSeq: cs?.getSeqForHandoff(),
+                  gpsTraceStartSeq,
+                });
+              };
+              if (cs) cs.flush({ final: true }).catch(() => {}).finally(goNextLeg);
+              else goNextLeg();
+            }
           }
 
           waypoints.forEach((wp, idx) => {

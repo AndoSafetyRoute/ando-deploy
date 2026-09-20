@@ -205,13 +205,24 @@ export class CollectSession {
   // 보고 저장 실패 시 버퍼를 비울지(재시도 포기) 말지(다음 flush에서 재시도) 판단.
   private saveFailCount = 0;
 
-  constructor(sessionId?: string) {
+  /**
+   * @param startSeq 다른 CollectSession(같은 sessionId)이 이미 쓴 seq 다음 값을
+   *   이어받을 때만 넘긴다(대중교통 leg 전환 handoff, NavigationScreen.tsx 참고).
+   *   생략하면 0부터 — sessionId를 재사용하면서 이 값을 생략하면 이전 인스턴스가
+   *   이미 쓴 (uid,session_id,seq)와 겹쳐 백엔드가 조용히 무시한다(ON CONFLICT
+   *   DO NOTHING → 신호 A/B/D 유실, 배치 저장 자체는 "성공"으로 보임).
+   */
+  constructor(sessionId?: string, startSeq?: number) {
     this.sessionId = sessionId ?? newSessionId();
+    this.seq = startSeq ?? 0;
     this.timer = setInterval(() => { void this.flush(); }, FLUSH_INTERVAL_MS);
     // 디버그용, 검증 후 제거 예정 — 타이머가 실제로 등록되는지 확인
     // (9/17~ 왕복 세션 신호 A/B 0건, collect_batch_log max_seq=0 조사).
-    console.warn(`[collect][DEBUG] CollectSession 생성 + 타이머 등록됨 session=${this.sessionId} intervalMs=${FLUSH_INTERVAL_MS}`);
+    console.warn(`[collect][DEBUG] CollectSession 생성 + 타이머 등록됨 session=${this.sessionId} intervalMs=${FLUSH_INTERVAL_MS} startSeq=${this.seq}`);
   }
+
+  /** leg 전환 등 세션 연속 handoff용 — 다음 CollectSession이 이어받을 seq(현재값). */
+  getSeqForHandoff(): number { return this.seq; }
 
   private bufferedRows(): number {
     return this.slope.length + this.speed.length + this.seg.length + (this.choice ? 1 : 0);

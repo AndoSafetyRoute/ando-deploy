@@ -30,10 +30,15 @@ export class GpsTraceBuffer {
   private timer: ReturnType<typeof setInterval> | null = null;
   private closed = false;
 
-  constructor(sessionId: string) {
+  /** @param startSeq leg 전환 handoff용 — 생략하면 0부터(신규 세션 기본). */
+  constructor(sessionId: string, startSeq?: number) {
     this.sessionId = sessionId;
+    this.nextSeq = startSeq ?? 0;
     this.timer = setInterval(() => { void this.flush(); }, GPS_FLUSH_INTERVAL_MS);
   }
+
+  /** leg 전환 등 세션 연속 handoff용 — 다음 GpsTraceBuffer가 이어받을 seq(현재값). */
+  getNextSeqForHandoff(): number { return this.nextSeq; }
 
   /** GPS 콜백에서 픽스 하나씩 누적 — 판정 로직(거리 계산 등)과 무관, push만 한다. */
   push(p: GpsTracePoint): void {
