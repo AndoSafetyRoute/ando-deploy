@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 # Python 로그가 즉시 출력되도록 설정
 ENV PYTHONDONTWRITEBYTECODE=1

@@ -13,6 +13,9 @@ BASE_SPEED_MS = {
     "cane":                0.9,
     "leg_injury":          0.7,
     "elderly":             0.7,
+    # S6 general(실험 참가자) — cost.py USER_TYPES와 동일한 플레이스홀더 취급,
+    # 근거 데이터 없음. elderly보다 다소 빠른 일반 보행 속도로 임시 설정.
+    "general":             0.9,
 }
 
 

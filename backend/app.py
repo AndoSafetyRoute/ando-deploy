@@ -124,6 +124,40 @@ def _nav_segs_and_waypoints(path_nodes: list, user_type: str) -> tuple[list, lis
     return nav_segs_json, waypoints
 
 
+def _measurement_units_payload(path_nodes: list) -> list:
+    """
+    path_nodes → measurement_units 응답 dict 리스트.
+
+    _nav_segs_and_waypoints 와 같은 문제가 measurement_units 에도 있었다 —
+    compare 후보 중 메인("type")만 이걸 계산해 붙였고 distance/personal 은
+    아예 빠져 있어서, 사용자가 그 후보를 선택해 안내를 시작하면
+    POST /navigation/{route_id}/segment 로 보낼 unit 자체가 없어 신호 A(경사
+    구간 관측)·D(navigation_measurements) 가 처음부터 하나도 안 쌓였다
+    (실기기/에뮬 GPS 재생 테스트로 확인, trip_slope_observations 0건 고착).
+    """
+    node_to_path_idx: dict = {}
+    for i, n in enumerate(path_nodes):
+        if n not in node_to_path_idx:
+            node_to_path_idx[n] = i
+
+    units = build_measurement_units(G, path_nodes)
+    return [
+        {
+            "unit_index":      u.unit_index,
+            "distance_m":      u.distance_m,
+            "slope_pct":       u.slope_pct,
+            "is_stairs":       u.is_stairs,
+            "coord_start_idx": node_to_path_idx.get(u.start_node, 0),
+            "coord_end_idx":   node_to_path_idx.get(u.end_node, 0),
+            "start_coords":    [round(G.nodes[u.start_node]["lon"], 7),
+                                round(G.nodes[u.start_node]["lat"], 7)],
+            "end_coords":      [round(G.nodes[u.end_node]["lon"], 7),
+                                round(G.nodes[u.end_node]["lat"], 7)],
+        }
+        for u in units
+    ]
+
+
 def _candidate_segs(raw_segments: list, user_type: str) -> list:
     """
     CCH 결과의 원본 segment(slope_pct / length_m / direction …)를 FE 가 바로 쓰는
@@ -1593,6 +1627,7 @@ def api_route(
         nav_segs, waypoints, nav_time = [], [], {}
         measurement_units = []
         _node_to_path_idx: dict = {}
+        _t_nav_segs = time.perf_counter()  # try 초반 실패 시에도 폴백값 보장
         try:
             nav_segs = build_navigation_segments(
                 G, result["path_nodes"], body.user_type, waypoints_set=_waypoints_set
@@ -1768,6 +1803,11 @@ def api_route(
                         dist_nav_segs, dist_waypoints = _nav_segs_and_waypoints(
                             dist_result["path_nodes"], body.user_type
                         )
+                        try:
+                            dist_measurement_units = _measurement_units_payload(dist_result["path_nodes"])
+                        except Exception as _dmu_err:
+                            print(f"[NAV] distance 후보 measurement_units 생성 실패 (무시): {_dmu_err}")
+                            dist_measurement_units = []
                         candidate_routes.append({
                             "kind":          "distance",
                             "coordinates":   dist_coords,
@@ -1779,6 +1819,7 @@ def api_route(
                             "routeSegments": _candidate_segs(dist_result["segments"], body.user_type),
                             "navigation_segments": dist_nav_segs,
                             "waypoints":     dist_waypoints,
+                            "measurement_units": dist_measurement_units,
                         })
                 except Exception as e:
                     print(f"[route2] 거리경로 조회 실패 (무시): {e}")
@@ -1815,6 +1856,11 @@ def api_route(
                             personal_nav_segs, personal_waypoints = _nav_segs_and_waypoints(
                                 personal_result["path_nodes"], body.user_type
                             )
+                            try:
+                                personal_measurement_units = _measurement_units_payload(personal_result["path_nodes"])
+                            except Exception as _pmu_err:
+                                print(f"[NAV] personal 후보 measurement_units 생성 실패 (무시): {_pmu_err}")
+                                personal_measurement_units = []
                             candidate_routes.append({
                                 "kind":          "personal",
                                 "coordinates":   personal_coords,
@@ -1826,6 +1872,7 @@ def api_route(
                                 "routeSegments": _candidate_segs(personal_result["segments"], body.user_type),
                                 "navigation_segments": personal_nav_segs,
                                 "waypoints":     personal_waypoints,
+                                "measurement_units": personal_measurement_units,
                             })
                     except Exception as e:
                         print(f"[route3] 맞춤경로 조회 실패 (무시): {e}")

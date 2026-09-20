@@ -284,8 +284,8 @@ export default function RouteSelectScreen() {
             <Text style={styles.optionTitle}>보행 경로 안내</Text>
           </View>
           <Text style={styles.optionDescription}>
-            출발지와 도착지를 모두 설정하면 백엔드 경로 탐색 API를 호출하여
-            보행약자 맞춤 경로를 계산합니다.
+            출발지와 도착지를 모두 설정하면 거리 우선, 유형별 추천, 사용자
+            맞춤형 경로 중 원하는 경로를 골라 안내받을 수 있어요.
           </Text>
         </View>
 
