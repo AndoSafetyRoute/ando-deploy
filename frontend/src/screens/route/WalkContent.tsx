@@ -19,6 +19,7 @@ import {
   buildComparison,
   buildRouteChoicePayload,
   primaryKind,
+  CANDIDATE_LABELS,
   type ShownCandidate,
 } from '../../utils/routeChoiceModel';
 import { CollectSession, newSessionId } from '../../utils/collectQueue';
@@ -249,10 +250,13 @@ export default function WalkContent({
         const src = hr.length ? hr : [routeData];
         const s = src.map((r: any, i: number) => {
           const isDist = r?.id === 'shortest' || r?.tag === '최단 거리';
+          const kind: 'distance' | 'type' = isDist ? 'distance' : 'type';
           return {
             shownPos: i,
-            label: isDist ? '거리우선' : '유형별 경로',
-            mergedKinds: [isDist ? 'distance' : 'type'] as any,
+            // 일반 경로(buildComparison)와 라벨을 통일 — 백엔드가 hybrid로 응답하든
+            // 일반으로 응답하든 화면 문구가 갈리지 않게 CANDIDATE_LABELS를 그대로 쓴다.
+            label: CANDIDATE_LABELS[kind],
+            mergedKinds: [kind] as any,
             route: {
               coordinates: r?.coordinates ?? routeData?.coordinates ?? [],
               routeSegments: r?.routeSegments ?? routeData?.routeSegments ?? [],
@@ -452,7 +456,9 @@ export default function WalkContent({
             <View style={ss.emptyCard}>
               <ActivityIndicator color={C.primary} />
               <Text style={[ss.emptyText, { marginTop: 12 }]}>
-                거리우선·유형별 경로를 불러오는 중이에요.
+                {/* 특정 후보 조합(거리우선/유형별 등)을 문구에 못박지 않는다 — hybrid든
+                    일반 응답이든, 실제 노출되는 후보 종류와 무관하게 항상 맞는 문구. */}
+                경로를 불러오는 중이에요.
               </Text>
             </View>
           ) : error || shown.length === 0 ? (
