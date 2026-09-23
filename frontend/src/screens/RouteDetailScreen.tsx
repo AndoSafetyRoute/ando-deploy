@@ -1,4 +1,4 @@
-﻿import React, { useCallback, useState } from "react";
+﻿import React, { useCallback, useMemo, useState } from "react";
 import {
   View,
   Text,
@@ -14,7 +14,8 @@ import { goHome } from "../utils/navigation";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 
-import { C } from "../constants/colors";
+import { C, ZONE_COLORS } from "../constants/colors";
+import RouteMapView, { type MapCoordinate, type MapRoute, type MapRouteSegment } from "./route/RouteMapView";
 import {
   getRoutes,
   deleteRoute,
@@ -66,6 +67,49 @@ const EFFORT_CONFIG: Record<SlopeZoneKey, { label: string; color: string; bg: st
     icon: "⚠",
   },
 };
+
+// "걸은 경로" 지도 — ljy(ando-FE 0ef382e) 경로 상세 지도를 이 화면 구조에 맞춰 이식.
+// 좌표는 서버 실측(navigation_measurements start/end_coords, [lon,lat]) 우선, 없으면
+// 로컬 기록(record.segments start/end). 색은 위 요약 카드와 같은 classifySlopeZone
+// 기준이고, 연속된 같은 zone 구간은 하나로 묶어 선이 잘게 끊기지 않게 한다.
+type ZonedSeg = { start: MapCoordinate; end: MapCoordinate; slopePercent: number };
+
+function toCoord(c: [number, number] | null | undefined): MapCoordinate | null {
+  if (!c || !Number.isFinite(c[0]) || !Number.isFinite(c[1])) return null;
+  return { latitude: c[1], longitude: c[0] };
+}
+
+function buildWalkedMapRoute(
+  raw: RouteMeasurementSegment[],
+  local: SegmentTime[],
+  walkerType?: string,
+): MapRoute | null {
+  let segs: ZonedSeg[] = raw.flatMap((s) => {
+    const start = toCoord(s.start_coords);
+    const end = toCoord(s.end_coords);
+    return start && end ? [{ start, end, slopePercent: s.slope_pct }] : [];
+  });
+  if (segs.length === 0) {
+    segs = local.flatMap((s) =>
+      s.start && s.end ? [{ start: s.start, end: s.end, slopePercent: s.slopePercent }] : []
+    );
+  }
+
+  const groups: (MapRouteSegment & { zone: SlopeZoneKey })[] = [];
+  segs.forEach((s) => {
+    const zone = classifySlopeZone(s.slopePercent, walkerType);
+    const last = groups[groups.length - 1];
+    if (last && last.zone === zone) {
+      last.coordinates.push(s.end);
+    } else {
+      groups.push({ coordinates: [s.start, s.end], color: ZONE_COLORS[zone] ?? ZONE_COLORS.flat, zone });
+    }
+  });
+
+  const coordinates = groups.flatMap((g) => g.coordinates);
+  if (coordinates.length < 2) return null;
+  return { id: "record", color: C.primary, coordinates, segments: groups };
+}
 
 // 주관적 D 신호(segment_hardship_feedback.verdict, 사용자가 실제로 답한 것만) —
 // EFFORT_CONFIG와 라벨·색·아이콘 계열을 완전히 분리한다. 표정 이모지를 여기만
@@ -239,6 +283,12 @@ export default function RouteDetailScreen() {
   // 보여준다/막지 않는다), true: 물어볼 구간 있음, false: eligible:false(대부분
   // 평지 등) — 버튼 대신 안내 문구로 바꾼다. "왜 안 뜨는지 드러낸다" 원칙.
   const [slowEligible, setSlowEligible] = useState<boolean | null>(null);
+
+  // 매 렌더마다 새 객체를 넘기면 RouteMapView WebView가 다시 그려져 깜빡이므로 메모.
+  const walkedMapRoute = useMemo(
+    () => (record ? buildWalkedMapRoute(rawMeasurements, record.segments ?? [], record.walkerType) : null),
+    [record, rawMeasurements]
+  );
 
   useFocusEffect(
     useCallback(() => {
@@ -488,6 +538,29 @@ export default function RouteDetailScreen() {
               </View>
             </View>
           </View>
+        </View>
+
+        <View style={styles.mapCard}>
+          <Text style={styles.cardTitle}>걸은 경로</Text>
+          <Text style={styles.cardDesc}>구간별 경사도를 색으로 표시했어요.</Text>
+          {walkedMapRoute ? (
+            <View style={styles.mapBox}>
+              <RouteMapView
+                routes={[walkedMapRoute]}
+                selectedRouteId="record"
+                startLabel={record.from || "출발지"}
+                endLabel={record.to || "도착지"}
+              />
+            </View>
+          ) : (
+            <View style={styles.noMapBox}>
+              <Text style={styles.noMapText}>
+                {segments.length === 0
+                  ? "저장된 구간 정보가 없습니다."
+                  : "이 경로는 좌표가 저장되지 않아 지도를 표시할 수 없어요."}
+              </Text>
+            </View>
+          )}
         </View>
 
         <View style={styles.effortSummaryCard}>
@@ -926,6 +999,38 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: C.warn,
     fontWeight: "900",
+  },
+
+  mapCard: {
+    backgroundColor: WHITE,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: BORDER_GRAY,
+    padding: 18,
+    marginBottom: 18,
+    ...shadowStyle,
+  },
+
+  mapBox: {
+    marginTop: 14,
+    height: 320,
+    borderRadius: 18,
+    overflow: "hidden",
+  },
+
+  noMapBox: {
+    marginTop: 14,
+    backgroundColor: LIGHT_GRAY,
+    borderRadius: 16,
+    padding: 18,
+    alignItems: "center",
+  },
+
+  noMapText: {
+    fontSize: 13,
+    color: TEXT_GRAY,
+    fontWeight: "800",
+    textAlign: "center",
   },
 
   effortSummaryCard: {

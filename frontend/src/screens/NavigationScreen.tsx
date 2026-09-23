@@ -1992,6 +1992,9 @@ export default function NavigationScreen({ navigation, route }: Props) {
               slopePercent: seg.slope ?? 0,
               elapsedMs: measured,
               measured: true,
+              zone: seg.zone,
+              start: seg.start,
+              end: seg.end,
             });
           });
 

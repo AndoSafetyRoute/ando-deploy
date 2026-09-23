@@ -126,6 +126,11 @@ export interface SegmentTime {
   slopePercent:  number;  // 경사도 (%)
   elapsedMs:     number;  // 해당 구간 소요 시간 (ms)
   measured: boolean;
+  // RouteDetailScreen "걸은 경로" 지도용(서버 실측이 없을 때의 로컬 폴백). 이 필드
+  // 추가 이전에 저장된 기록엔 없다 — 없으면 지도 대신 안내 문구.
+  zone?:  string;
+  start?: { latitude: number; longitude: number };
+  end?:   { latitude: number; longitude: number };
 }
 
 export interface RouteRecord {
