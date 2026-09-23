@@ -102,20 +102,37 @@ WEIGHT_SCALE = 1_000   # slope_cost(float) → list[int] 변환 배율
 
 # ── alpha 이진탐색 튜닝 상수 (#D) ────────────────────────────────────────────
 # 회당 비용(_interp_weights_list + CCHMetric.reset())이 쿼리 자체보다 훨씬
-# 커서(실측 ~630ms/회), 정확도-속도 트레이드오프가 필요해지면 이 값부터
-# 낮춘다. 해상도는 1/2**ALPHA_SEARCH_MAX_STEPS.
+# 커서(2026-09-23 실측 ~0.7s/회, 거리 무관 — 아래 ALPHA_SEARCH_LOCAL_ENABLED
+# 참고), 정확도-속도 트레이드오프가 필요해지면 이 값부터 낮춘다. 해상도는
+# 1/2**ALPHA_SEARCH_MAX_STEPS.
 ALPHA_SEARCH_MAX_STEPS      = 5
 # #C(조기 종료) 기본 OFF — 실측 재검증에서 "같은 경로가 2회 연속(채택 후보끼리만
 # 비교) 나오면 멈춘다"는 조건도 안전하지 않음을 확인했다: 남산도서관→명동
 # (cane, 최단 2,465m)에서 step 3에 채택 후보 경로가 2회 연속 완전히 동일
 # (same_path=True)해 조기 종료했는데도, 남은 2스텝을 마저 돌리면 avgSlope
 # 9.31→9.11, totalDistance 2,516.5m→2,564.8m로 더 나은(경사 더 낮은) 경로를
-# 찾아냈다 — CCH 정수 가중치 양자화 때문에 "경로가 2회 연속 같다"가 진짜
-# 수렴을 보장하지 않는다. #B(초기 추정값)는 같은 검증에서 전 케이스 경로
+# 찾아냈다 — alpha 에 따라 최적 경로가 계단식(불연속)으로 바뀌어 "경로가 2회
+# 연속 같다"가 진짜 수렴을 보장하지 않는다(정수 가중치 양자화는 원인 아님 —
+# WEIGHT_SCALE=1000 이라 1mm 단위). #B(초기 추정값)는 같은 검증에서 전 케이스 경로
 # 완전 동일(회귀 없음)을 확인했으므로 그대로 켜 둔다. 이 값을 키워 다시
 # 켜려면(정확도-속도 트레이드오프 감수) 위 실측을 먼저 재확인할 것.
 ALPHA_SEARCH_EARLY_STOP_ENABLED = False
 ALPHA_SEARCH_EARLY_STOP_REL     = 0.01
+
+# alpha 이진탐색을 CCH 재커스터마이제이션 대신 "타원 부분그래프 + scipy
+# dijkstra"로 푼다. 실측(2026-09-23, 엣지 4.46M): 스텝당 ~0.7s 중 서울 전역
+# 커스터마이제이션(reset/생성)이 ~80%, .tolist() ~14%, 쿼리는 1% 미만 — 거리와
+# 무관하게 매 스텝 서울 전체를 다시 준비하고 있었다. 채택 조건(우회 ≤ ratio)상
+# 채택 가능한 경로의 모든 노드 v 는 euclid(src,v)+euclid(v,dst) ≤ ratio×최단거리
+# 를 만족하므로(직선거리 ≤ 그래프거리) 그 타원 안만 보면 된다.
+# - 가중치는 현행과 비트 단위 동일(np.maximum(1, dist+α·Δ).astype(int64))
+# - 채택 검사는 그대로 — 부분그래프는 후보 집합만 줄인다. 전체 그래프 최적이
+#   타원 밖이라 거절되던 alpha 에서도 타원 안 최선 경로가 채택될 수 있어
+#   결과가 달라질 수 있다(같거나 더 나은 쪽).
+# False 면 기존 CCH 루프(롤백 스위치 — 리버트 없이 끄고 비교).
+ALPHA_SEARCH_LOCAL_ENABLED = True
+# 등거리 근사 투영(lon_to_m = 111320·cos(mean_lat)) 왜곡 방어용 타원 여유.
+ALPHA_SEARCH_LOCAL_MARGIN  = 1.02
 
 # 이진탐색 진입 빈도 실측용 프로세스 전역 카운터(#A) — 요청마다 리셋되지
 # 않고 서버 수명 동안 누적해 트리거율을 로그로 확인한다.
@@ -195,7 +212,8 @@ class CCHEngine:
                  metric_dist, metrics_a1,
                  metric_dist_safe=None,
                  basis_weights=None,
-                 edge_tail=None, edge_head=None):
+                 edge_tail=None, edge_head=None,
+                 coords_m=None, tail_np=None, head_np=None):
         self.G           = G
         self.cch         = cch
         self.node_list   = node_list
@@ -215,6 +233,11 @@ class CCHEngine:
         self.basis_weights    = basis_weights      # scipy.sparse (m, 15) | None
         self.edge_tail        = edge_tail          # list[int] | None
         self.edge_head        = edge_head          # list[int] | None
+        # alpha 이진탐색 부분그래프용(ALPHA_SEARCH_LOCAL_ENABLED) — 노드 미터 좌표
+        # (KDTree와 같은 투영)와 엣지 tail/head 원본 numpy. 없으면 CCH 루프로 폴백.
+        self._coords_m = coords_m                  # (n, 2) float64 | None
+        self._tail_np  = tail_np                   # (m,) uint32 | None
+        self._head_np  = head_np                   # (m,) uint32 | None
 
     # ── 내부 헬퍼 ────────────────────────────────────────────────────────────
 
@@ -253,6 +276,72 @@ class CCHEngine:
         """
         w = self._dist_wf + alpha * self._slope_minus_dist[user_type]
         return np.maximum(1, w).astype(np.int64).tolist()
+
+    def _local_alpha_subgraph(self, src_id: int, dst_id: int, user_type: str,
+                              radius_m: float) -> dict:
+        """alpha 이진탐색 진입 시 1회 — 타원 부분그래프의 CSR 구조를 만든다.
+
+        노드 v 가 euclid(src,v)+euclid(v,dst) ≤ radius_m 인 것만, 엣지는 양 끝이
+        모두 안에 있는 것만 남긴다. 엣지를 (local tail, local head) 로 정렬해
+        indptr/indices 를 여기서 1회만 만들고, 스텝마다는 같은 순서의 data(가중치)
+        만 갈아끼운다(_local_alpha_query) — 스텝마다 COO→CSR 변환하면 이득을 까먹는다.
+        """
+        xy = self._coords_m
+        tail, head = self._tail_np, self._head_np
+        d_sum = (np.hypot(xy[:, 0] - xy[src_id, 0], xy[:, 1] - xy[src_id, 1])
+                 + np.hypot(xy[:, 0] - xy[dst_id, 0], xy[:, 1] - xy[dst_id, 1]))
+        node_mask = d_sum <= radius_m
+        nodes = np.nonzero(node_mask)[0]
+        k = len(nodes)
+        local = np.full(len(xy), -1, dtype=np.int64)
+        local[nodes] = np.arange(k)
+
+        eidx = np.nonzero(node_mask[tail] & node_mask[head])[0]
+        lt = local[tail[eidx]]
+        lh = local[head[eidx]]
+        order = np.lexsort((lh, lt))
+        eidx, lt, lh = eidx[order], lt[order], lh[order]
+        # coo→csr 는 중복 (u,v) 를 합산해버린다 — G가 DiGraph라 유일해야 정상이지만
+        # MultiDiGraph 등으로 바뀌면 조용히 가중치가 2배가 되므로 여기서 막는다.
+        assert not np.any((lt[1:] == lt[:-1]) & (lh[1:] == lh[:-1])), \
+            "부분그래프에 중복 (u,v) 엣지 — CSR 가중치가 합산됨"
+
+        indptr = np.zeros(k + 1, dtype=np.int64)
+        np.cumsum(np.bincount(lt, minlength=k), out=indptr[1:])
+        return {
+            "nodes":   nodes,                       # local → CCH 노드 ID
+            "src":     int(local[src_id]),
+            "dst":     int(local[dst_id]),
+            "indptr":  indptr,
+            "indices": lh.astype(np.int32),
+            # 가중치 원료를 부분그래프 엣지 순서로 미리 잘라 둔다(스텝당 m_sub 개만 연산).
+            "dist_wf": self._dist_wf[eidx],
+            "delta":   self._slope_minus_dist[user_type][eidx],
+            "n_edges": len(eidx),
+        }
+
+    def _local_alpha_query(self, sub: dict, alpha: float):
+        """부분그래프에서 alpha 가중치 최단경로 → path_nodes list | None(연결 안 됨).
+
+        가중치는 _interp_weights_list 와 비트 단위로 같은 식을 부분그래프 엣지에만
+        적용한 것이다(float 전환·스케일 변경 없음).
+        """
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.csgraph import dijkstra
+
+        w = np.maximum(1, sub["dist_wf"] + alpha * sub["delta"]).astype(np.int64)
+        k = len(sub["nodes"])
+        g = csr_matrix((w, sub["indices"], sub["indptr"]), shape=(k, k))
+        dist, pred = dijkstra(g, directed=True, indices=sub["src"],
+                              return_predecessors=True)
+        dst = sub["dst"]
+        if not np.isfinite(dist[dst]):
+            return None
+        path_local = [dst]
+        while path_local[-1] != sub["src"]:
+            path_local.append(int(pred[path_local[-1]]))
+        ids = sub["nodes"][path_local[::-1]]
+        return [self.node_list[i] for i in ids]
 
     # ── 공개 API ─────────────────────────────────────────────────────────────
 
@@ -324,16 +413,36 @@ class CCHEngine:
                 prev_accepted_nodes = None
                 steps_used = 0
 
+                sub = None
+                if ALPHA_SEARCH_LOCAL_ENABLED and self._coords_m is not None:
+                    t_sub = time.perf_counter()
+                    sub = self._local_alpha_subgraph(
+                        src_id, dst_id, user_type,
+                        max_detour_ratio * shortest_dist * ALPHA_SEARCH_LOCAL_MARGIN,
+                    )
+                    print(f"[CCH] 부분그래프 노드={len(sub['nodes']):,} "
+                          f"엣지={sub['n_edges']:,}  "
+                          f"({(time.perf_counter() - t_sub) * 1000:.0f}ms)")
+
+                t_bs = time.perf_counter()
                 for step in range(ALPHA_SEARCH_MAX_STEPS):
                     mid = alpha0 if step == 0 else (lo + hi) / 2
                     steps_used = step + 1
-                    w_list = self._interp_weights_list(user_type, mid)
-                    if metric_bs is None:
-                        metric_bs = CCHMetric(self.cch, w_list)
+                    if sub is not None:
+                        cand = self._local_alpha_query(sub, mid)
+                        if cand is None:
+                            # path_d(길이 = 최단거리)는 항상 타원 안이라 src–dst 는
+                            # 구조적으로 연결돼 있어야 한다 — 여기 오면 마스크 버그.
+                            print(f"[CCH] ⚠ 부분그래프 src–dst 연결 안 됨 "
+                                  f"(alpha={mid:.3f}) — 마스크 버그 의심")
                     else:
-                        metric_bs.reset(w_list)   # 기존 버퍼 재사용 (빠름)
+                        w_list = self._interp_weights_list(user_type, mid)
+                        if metric_bs is None:
+                            metric_bs = CCHMetric(self.cch, w_list)
+                        else:
+                            metric_bs.reset(w_list)   # 기존 버퍼 재사용 (빠름)
+                        cand = self._query(metric_bs, src_id, dst_id)
 
-                    cand = self._query(metric_bs, src_id, dst_id)
                     if cand is None:
                         hi = mid
                         continue
@@ -366,7 +475,9 @@ class CCHEngine:
                     prev_accepted_nodes, prev_accepted_dist = cand, cand_dist
 
                 print(f"[CCH] 이진탐색 완료 alpha={used_alpha:.3f}  "
-                      f"steps={steps_used}/{ALPHA_SEARCH_MAX_STEPS}")
+                      f"steps={steps_used}/{ALPHA_SEARCH_MAX_STEPS}  "
+                      f"{'local' if sub is not None else 'cch'} "
+                      f"{(time.perf_counter() - t_bs) * 1000:.0f}ms")
 
         # ── 4. 구간 정보 복원 ────────────────────────────────────────────────
         G        = self.G
@@ -673,4 +784,7 @@ def build_cch_engine(G, order_cache_path: str | None = None) -> CCHEngine:
         basis_weights=basis_weights,
         edge_tail=tail_list,
         edge_head=head_list,
+        coords_m=coords_m,
+        tail_np=tail_np,
+        head_np=head_np,
     )
