@@ -2003,17 +2003,19 @@ def api_bus_arrival(
 
 @app.get("/subway/arrival")
 def api_subway_arrival(
-    station:  str        = Query(..., description="승차역명 (카카오 stops[].name, 예: 강남역)"),
-    line_no:  str | None = Query(None, description="노선번호 (카카오 lineNo, 예: 4) — 있으면 그 노선 열차만 우선 필터"),
+    station:  str        = Query(..., description="승차역명 (카카오 stops[].name, 예: 서울역)"),
+    line_no:  str | None = Query(None, description="노선번호 (카카오 vehicle.name에서 '호선' 뗀 값, 예: 4)"),
 ):
     """
-    서울시 지하철 실시간 도착정보 (공공데이터포털 서비스, 키는 서버에만 보관).
+    서울시 지하철 실시간 도착정보 (서울 열린데이터광장, 키는 서버에만 보관).
 
     항상 200 + dict 를 돌려준다. 키 미설정·역명 미매칭·운행중 열차 없음 등은
-    `available:false` + `reason` 으로 표현 — FE 는 그 경우 실시간 배지를 숨기고
-    정적(카카오) 시간을 유지한다(graceful degradation, bus_arrival과 동일 원칙).
+    `available:false` + `reason` 으로 표현 — FE 는 그 경우 실시간 배지를 숨긴다.
+    방향(상행/하행)은 확정할 수 없어 추측하지 않고, 각 열차의 종착지 방면
+    텍스트(direction)를 그대로 같이 돌려준다 — FE가 그 텍스트를 보여줘서
+    사용자가 맞는 방향인지 스스로 확인할 수 있게 한다.
     """
-    return subway_arrival.arrival_for_boarding(station=station, line_no=line_no)
+    return subway_arrival.arrival_for_boarding(station_name=station, line_no=line_no)
 
 
 # ── 유틸 ──────────────────────────────────────────────────────────────────────

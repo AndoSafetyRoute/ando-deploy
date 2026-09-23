@@ -21,10 +21,11 @@ from typing import Any
 import requests
 
 try:
-    from config import BUS_ARRIVAL_KEY, BUS_ROUTE_INFO_ENABLED
+    from config import BUS_ARRIVAL_KEY, BUS_ROUTE_INFO_KEY, BUS_ROUTE_INFO_ENABLED
 except Exception:                       # config 에 아직 없을 때도 임포트는 되게
     import os
     BUS_ARRIVAL_KEY = os.environ.get("BUS_ARRIVAL_KEY", "")
+    BUS_ROUTE_INFO_KEY = os.environ.get("BUS_ROUTE_INFO_KEY", "") or BUS_ARRIVAL_KEY
     BUS_ROUTE_INFO_ENABLED = os.environ.get("BUS_ROUTE_INFO_ENABLED", "") == "1"
 
 _ARRIVE_BASE = "http://ws.bus.go.kr/api/rest/arrive"
@@ -34,6 +35,9 @@ _CACHE_TTL_S = 15.0                     # 실시간이지만 15초 안엔 재호
 
 # 혼잡도 코드(서울) → 라벨
 _CONGESTION = {0: None, 3: "여유", 4: "보통", 5: "혼잡", 6: "매우혼잡"}
+
+# 차량유형 코드(서울, busType1/2) — 0:일반버스, 1:저상버스, 2:굴절버스
+_LOWFLOOR_TYPE = "1"
 
 # 노선정보조회 서비스가 없을 때 쓰는 최소 seed. 정확한 값만 넣는다(틀린 ID는
 # 실시간을 조용히 오염시키므로 넣지 않느니만 못하다). 확인된 것만 추가할 것.
@@ -45,10 +49,13 @@ _cache: dict[str, tuple[float, Any]] = {}
 
 
 # ── 저수준 HTTP ──────────────────────────────────────────────────────────────
-def _get(base: str, path: str, params: dict) -> dict | None:
-    if not BUS_ARRIVAL_KEY:
+def _get(base: str, path: str, params: dict, key: str | None = None) -> dict | None:
+    # 도착정보/노선정보가 서로 다른 data.go.kr 계정으로 승인된 경우가 있어(2026-09
+    # 실제로 그랬음), 호출부가 쓸 키를 지정하지 않으면 도착정보 키를 기본값으로 쓴다.
+    key = key if key is not None else BUS_ARRIVAL_KEY
+    if not key:
         return None
-    q = {"serviceKey": BUS_ARRIVAL_KEY, "resultType": "json", **params}
+    q = {"serviceKey": key, "resultType": "json", **params}
     try:
         r = requests.get(f"{base}/{path}", params=q, timeout=_TIMEOUT)
     except requests.RequestException as e:
@@ -99,19 +106,6 @@ def _data_age_s(mk_tm: str | None) -> int | None:
     return None
 
 
-def _is_lowfloor(it: dict, n: int) -> bool | None:
-    """
-    실제로 지금 오는 그 차량이 저상버스인지 — 노선 단위 보유율(lowfloor_bus.py,
-    /bus/lowfloor)과 달리 "이 차" 기준의 실시간 값이다. 서울시 버스도착정보
-    조회 서비스 응답의 busType{n} 필드(0=일반, 1=저상)를 쓴다. 필드 자체가
-    없거나 파싱 불가면 모른다는 뜻으로 None을 돌려준다(잘못 단정하지 않는다).
-    """
-    raw = it.get(f"busType{n}")
-    if raw is None or str(raw).strip() == "":
-        return None
-    return _to_int(raw) == 1
-
-
 def _bus_slot(it: dict, n: int) -> dict | None:
     """n=1 또는 2 (다음차/다다음차). 유효 도착정보 없으면 None."""
     msg = (it.get(f"arrmsg{n}") or "").strip()
@@ -120,6 +114,7 @@ def _bus_slot(it: dict, n: int) -> dict | None:
         # 출발대기/운행종료/빈 슬롯 → 표시할 실시간 없음
         if msg in ("", "출발대기", "운행종료"):
             return None
+    bus_type = (it.get(f"busType{n}") or "").strip()
     return {
         "seconds":     sec if sec > 0 else None,
         "text":        msg or None,
@@ -127,7 +122,9 @@ def _bus_slot(it: dict, n: int) -> dict | None:
         "congestion":  _CONGESTION.get(_to_int(it.get(f"full{n}")), None),
         "arriving":    str(it.get(f"isArrive{n}", "0")) == "1",
         "last_bus":    str(it.get(f"isLast{n}", "0")) == "1",
-        "is_lowfloor": _is_lowfloor(it, n),
+        # 이번에 실제로 오는 그 차량이 저상인지 실시간으로 확정된 값(정적 노선
+        # 보유율과 달리 "이 차"가 저상인지 아닌지를 안다). 필드가 비어있으면 None.
+        "is_lowfloor": (bus_type == _LOWFLOOR_TYPE) if bus_type else None,
     }
 
 
@@ -168,7 +165,7 @@ def resolve_route_id(route_name: str) -> str | None:
         return None
 
     def _fetch():
-        data = _get(_ROUTEINFO_BASE, "getBusRouteList", {"strSrch": name})
+        data = _get(_ROUTEINFO_BASE, "getBusRouteList", {"strSrch": name}, key=BUS_ROUTE_INFO_KEY)
         for it in _items(data):
             if (it.get("busRouteNm") or it.get("busRouteAbrv") or "").strip() == name:
                 return (it.get("busRouteId") or "").strip() or None

@@ -55,16 +55,21 @@ LOWFLOOR_BUS_XLSX = os.environ.get(
 # ── 대중교통 API ──────────────────────────────────────────────────────────────
 # 대중교통 경로탐색(ODsay)/PathFinder는 사용하지 않기로 결정 — 프론트에서 카카오
 # 대중교통 API로 직접 조회한다.
-# 서울 지하철 실시간 도착 (data.seoul.go.kr OA-12764, swopenapi.seoul.go.kr 전용 키)
-# → openapi.seoul.go.kr 키(SEOUL_ELEVATOR_KEY 등)와 다른 별도 발급 필요.
-# subway_arrival.py 참고. 키 없으면 실시간 배지는 자동으로 숨겨진다(정적 시간 유지).
+# 서울 지하철 실시간 도착 (data.seoul.go.kr 발급 포털에서 별도 발급, 카탈로그 페이지엔
+# "서비스 종료 안내"로 나오는 경우가 있으나 실제 엔드포인트는 살아있음 — 2026-09 확인).
+# openapi.seoul.go.kr 키(SEOUL_ELEVATOR_KEY 등)와는 다른 별도 키. subway_arrival.py 참고.
+# 키 없으면 실시간 배지는 자동으로 숨겨진다(그래도 카카오 정적 시간은 그대로 표시).
 SEOUL_REALTIME_KEY = os.environ.get("SEOUL_REALTIME_KEY", "")
 
 # 서울시 버스도착정보 실시간 (공공데이터포털 '서울특별시_버스도착정보조회 서비스',
 # ws.bus.go.kr/api/rest/arrive/*). 노선명→busRouteId 변환은 '서울특별시_노선정보조회
-# 서비스'가 추가로 활용신청돼 있어야 동적 가능 → 그 경우 BUS_ROUTE_INFO_ENABLED=1.
+# 서비스'(ws.bus.go.kr/api/rest/busRouteInfo/*)가 추가로 활용신청돼 있어야 동적 가능
+# → 그 경우 BUS_ROUTE_INFO_ENABLED=1. 두 서비스가 계정이 달라 인증키가 서로 다를 수
+# 있어(실제로 그랬음, 2026-09), BUS_ROUTE_INFO_KEY 를 따로 둔다 — 비어있으면
+# BUS_ARRIVAL_KEY 를 그대로 재사용(같은 계정인 경우 대비).
 # bus_arrival.py 참고. 키 없으면 실시간 배지는 자동으로 숨겨진다(정적 시간 유지).
 BUS_ARRIVAL_KEY        = os.environ.get("BUS_ARRIVAL_KEY", "")
+BUS_ROUTE_INFO_KEY     = os.environ.get("BUS_ROUTE_INFO_KEY", "") or BUS_ARRIVAL_KEY
 BUS_ROUTE_INFO_ENABLED = os.environ.get("BUS_ROUTE_INFO_ENABLED", "") == "1"
 
 # ── 라우팅 파라미터 ───────────────────────────────────────────────────────────
