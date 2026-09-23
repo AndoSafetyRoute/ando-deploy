@@ -18,8 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import networkx as nx
 
 from config import FORBIDDEN_PENALTY
-from routing.cost import USER_TYPES, is_facility_blocked, is_facility_blocked_for_any_type
-from routing.pathfinder import set_edge_weights
+from routing.cost import USER_TYPES, is_facility_blocked, is_facility_blocked_for_any_type, set_edge_weights
 from routing.measurement_units import build_measurement_units
 from routing.segments import build_navigation_segments
 import subway.facility as facility

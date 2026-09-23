@@ -2,15 +2,14 @@
 경사도 점수 & 엣지 비용 함수 + 유형별 파라미터 테이블
 
 ── S7: 세 경로 종류의 비용함수 정의 ──────────────────────────────────────────
-  shortest(거리)   : length                              — pathfinder.find_route(mode="shortest")/
-                                                             set_edge_weights(alpha=0.0)
+  shortest(거리)   : length                              — set_edge_weights(alpha=0.0)
   type(유형별)      : length × f_type(slope) = slope_cost(slope, user_type, length)
                                                           — set_edge_weights(alpha=1.0)
   personal(맞춤형)  : c_u(e) — 아직 미구현(S8 예정, user_model_params 기반).
                        f_type과 user_type 피처를 쓰지 않는다는 게 S8의 요구사항.
 
   세 함수 모두 시설 정책(FACILITY_POLICY, is_facility_blocked)을 적용한다 —
-  shortest(alpha=0)도 예외 없음. pathfinder.set_edge_weights()가 alpha 보간과
+  shortest(alpha=0)도 예외 없음. set_edge_weights()가 alpha 보간과
   무관하게 항상 덮어쓰는 방식으로 구현(코드 참고) — "차단"은 그래프에서 엣지를
   제거하는 대신 큰 유한 비용(FORBIDDEN_PENALTY × length)을 주는 기존 관례를
   그대로 따른다(경사 forbidden 처리와 동일 패턴, 우회 가드레일도 그대로 적용됨).
@@ -89,7 +88,7 @@ FACILITY_POLICY = {
 def is_facility_blocked(user_type: str, is_stairs: bool) -> bool:
     """이 구간(사실 필드들)이 user_type에게 통행 불가인지 — 순수 정책 판정만.
     실제 엣지 비용 반영 방식(그래프에서 제거할지, 큰 유한 비용을 줄지)은
-    호출측(S7, pathfinder.py/cch_engine.py)이 기존 관례(FORBIDDEN_PENALTY)에
+    호출측(S7, set_edge_weights/cch_engine.py)이 기존 관례(FORBIDDEN_PENALTY)에
     맞춰 정한다 — 이 함수는 "막아야 하는가"만 답한다."""
     if is_stairs and FACILITY_POLICY.get(user_type, {}).get("stairs") == "block":
         return True
@@ -186,3 +185,27 @@ def precompute_edge_costs(G) -> None:
         slope  = data.get("slope_pct", 0.0)
         for ut in USER_TYPES:
             data[f"_w1_{ut}"] = slope_cost(slope, ut, length)
+
+
+def set_edge_weights(G, user_type: str, alpha: float = 1.0):
+    """
+    유형별 slope_cost를 'weight'로 설정.
+    precompute_edge_costs() 호출 후에는 선형 보간만 수행 (slope_cost 재계산 없음).
+    alpha=1.0 → 경사 비용 전체 반영 / alpha=0.0 → 순수 거리
+
+    S7 — 시설 정책(계단 차단)은 alpha와 무관하게 항상 적용한다("세 비용 함수
+    (shortest/type/personal) 모두 시설 정책 적용" 요구). alpha=0(순수 거리)
+    이어도 계단 통과 불가 유형에게는 큰 유한 비용을 준다 — 이 페널티는
+    slope_cost 보간(w1)과 별개 축이라 보간 이후 덮어쓴다.
+
+    (구 routing/pathfinder.py에서 이전 — #4 CCH 전용화. facility_policy_test.py
+    회귀테스트가 여전히 이 함수를 직접 쓴다.)
+    """
+    key = f"_w1_{user_type}"
+    for u, v, data in G.edges(data=True):
+        length = data["length_m"]
+        w1 = data.get(key) or slope_cost(data.get("slope_pct", 0.0), user_type, length)
+        weight = length + alpha * (w1 - length)
+        if is_facility_blocked(user_type, data.get("highway") == "steps"):
+            weight = max(weight, FORBIDDEN_PENALTY * length)
+        data["weight"] = weight

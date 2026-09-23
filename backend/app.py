@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from config import GEOJSON_PATH
-from routing import build_graph, find_route, USER_TYPES, classify_zone, precompute_edge_costs
+from routing import build_graph, USER_TYPES, classify_zone, precompute_edge_costs
 from routing.search import build_spatial_index, nearest_node
 from routing.graph import haversine
 from routing.cch_engine import build_cch_engine, CCHEngine
@@ -212,16 +212,17 @@ def _seoul_leg_segs(raw_segments: list, user_type: str) -> list:
 
 
 def _seoul_leg_route(o: tuple, d: tuple, user_type: str, seoul_mode: str):
-    """서울 안 두 점 사이 leg. seoul_mode: 'type'|'shortest'. → (coords, result) | None."""
+    """서울 안 두 점 사이 leg. seoul_mode: 'type'|'shortest'. → (coords, result) | None.
+
+    CCH 미가용이면 실패 처리(None) → 호출측(_hybrid_walk_response)이 기존
+    흐름으로 폴백한다. pathfinder.find_route() NetworkX 폴백 제거(#4) — CCH
+    전용 경로가 됐다."""
+    if _cch is None:
+        print(f"[hybrid] 서울 leg 실패 ({seoul_mode}): CCH 엔진 미가용")
+        return None
     try:
-        if _cch is not None:
-            r = (_cch.find_distance_route(o, d) if seoul_mode == "shortest"
-                 else _cch.find_route(o, d, user_type))
-        else:
-            # CCH 미가용 폴백 — seoul_mode 를 그대로 반영해야 "최단" leg 가
-            # 유형별 leg 와 똑같이 나오지 않는다.
-            r = find_route(G, o, d, user_type, "auto",
-                           mode="shortest" if seoul_mode == "shortest" else "accessibility")
+        r = (_cch.find_distance_route(o, d) if seoul_mode == "shortest"
+             else _cch.find_route(o, d, user_type))
     except Exception as e:
         print(f"[hybrid] 서울 leg 실패 ({seoul_mode}): {e}")
         return None
@@ -352,24 +353,25 @@ async def lifespan(app: FastAPI):
     _waypoints_set = extract_waypoints(G)
     print(f"그래프 로딩 완료 (교차로 {len(_waypoints_set):,}개 사전 계산)")
 
-    # CCH 전처리 (서울 전역 그래프에서 유효, 용산구는 NetworkX로도 충분)
-    if G.number_of_nodes() > 200_000:
-        try:
-            print(f"[CCH] 노드 {G.number_of_nodes():,}개 - CCH 전처리 시작 (1~5분 소요)")
-            # inertial order 디스크 캐시 - 위상 동일 시 재부팅에서 ~146s 절약
-            _cch_order_cache = os.path.splitext(GEOJSON_PATH)[0] + ".cchorder.pkl"
-            _cch = build_cch_engine(G, order_cache_path=_cch_order_cache)
-            print("[CCH] 준비 완료 - 이후 /route 요청은 CCH로 처리됩니다")
-            # 개인 맞춤 metric 캐시 (⑧) - 시작 시엔 비어있음, 배치 스크립트(⑨)가
-            # /personal/refresh 등으로 채워야 우선 채워짐. 요청 경로에서는
-            # 절대 여기서 학습하지 않고, 이미 채워진 걸 읽기만 한다.
-            _personal_cache = PersonalMetricCache(_cch.cch, _cch.basis_weights)
-        except Exception as e:
-            print(f"[CCH] 초기화 실패 -> NetworkX fallback: {e}")
-            _cch = None
-            _personal_cache = None
-    else:
-        print(f"[CCH] 노드 {G.number_of_nodes():,}개 - NetworkX 모드 유지")
+    # CCH 전처리 — #4로 pathfinder.find_route()(NetworkX) 폴백이 삭제되면서
+    # CCH가 유일한 라우팅 엔진이 됐다. 이전엔 소규모(용산구 등 <20만 노드)
+    # 개발용 그래프는 NetworkX로도 충분하다고 보고 CCH 전처리를 건너뛰었는데,
+    # 그 폴백이 없어진 지금 건너뛰면 _cch가 영원히 None이라 그 모드에서
+    # /route 가 전부 실패한다 — 그래프 크기와 무관하게 항상 CCH를 빌드한다.
+    try:
+        print(f"[CCH] 노드 {G.number_of_nodes():,}개 - CCH 전처리 시작 (서울 전역 1~5분, 소규모 그래프는 훨씬 빠름)")
+        # inertial order 디스크 캐시 - 위상 동일 시 재부팅에서 ~146s 절약
+        _cch_order_cache = os.path.splitext(GEOJSON_PATH)[0] + ".cchorder.pkl"
+        _cch = build_cch_engine(G, order_cache_path=_cch_order_cache)
+        print("[CCH] 준비 완료 - 이후 /route 요청은 CCH로 처리됩니다")
+        # 개인 맞춤 metric 캐시 (⑧) - 시작 시엔 비어있음, 배치 스크립트(⑨)가
+        # /personal/refresh 등으로 채워야 우선 채워짐. 요청 경로에서는
+        # 절대 여기서 학습하지 않고, 이미 채워진 걸 읽기만 한다.
+        _personal_cache = PersonalMetricCache(_cch.cch, _cch.basis_weights)
+    except Exception as e:
+        print(f"[CCH] 초기화 실패: {e}")
+        _cch = None
+        _personal_cache = None
 
     try:
         init_db()
@@ -1419,13 +1421,12 @@ def _shortest_route_card(origin: tuple, dest: tuple, user_type: str,
     결과가 동일함을 전제로 한다 — 호출부가 safe 경로가 필요 없는 컨텍스트에서만
     넘겨야 한다.
     """
-    if _cch is not None:
-        if precomputed_shortest_path is not None:
-            sr = _cch.distance_route_from_path(origin, dest, precomputed_shortest_path)
-        else:
-            sr = _cch.find_distance_route(origin, dest)
+    if _cch is None:
+        return None
+    if precomputed_shortest_path is not None:
+        sr = _cch.distance_route_from_path(origin, dest, precomputed_shortest_path)
     else:
-        sr = find_route(G, origin, dest, user_type, mode="shortest")
+        sr = _cch.find_distance_route(origin, dest)
     s_len = round(sr["total_length_m"], 1)
     if s_len <= 0 or abs(s_len - type_len_m) / max(type_len_m, 1.0) <= 0.03:
         return None
@@ -1460,7 +1461,7 @@ def _pick_best_exit_by_route_cost(
     함수가 고른 도착 좌표로 /route 가 평소대로(alpha 이진탐색 포함) 다시 계산한다.
     후보가 없거나 전부 라우팅 실패하면 None(호출측이 기존 좌표로 폴백).
     """
-    if _subway_db is None:
+    if _subway_db is None or _cch is None:
         return None
     candidates = _subway_db.get_exit_candidates(station_name, user_type, direction="entering")
     if not candidates:
@@ -1470,10 +1471,7 @@ def _pick_best_exit_by_route_cost(
     for c in candidates:
         dest = (c["lon"], c["lat"])
         try:
-            if _cch is not None:
-                r = _cch.find_distance_route(origin, dest, safe=True)
-            else:
-                r = find_route(G, origin, dest, user_type, mode="shortest")
+            r = _cch.find_distance_route(origin, dest, safe=True)
         except Exception as e:
             print(f"[NAV] 출구 후보 {c.get('exit_no')} 비용 계산 실패(스킵): {e}")
             continue
@@ -1560,17 +1558,17 @@ def api_route(
         # 운영 로그가 시끄러워지면 나중에 샘플링/제거 검토.
         _t_route_start = time.perf_counter()
 
-        # CCH 우선 (서울 전역 그래프), fallback → NetworkX
-        if _cch is not None and body.mode == "accessibility":
-            try:
-                result = _cch.find_route(origin, dest, body.user_type)
-            except Exception as e:
-                print(f"[CCH] 쿼리 실패 → NetworkX fallback: {e}")
-                result = find_route(G, origin, dest, body.user_type,
-                                    body.algorithm, mode=body.mode)
-        else:
-            result = find_route(G, origin, dest, body.user_type,
-                                body.algorithm, mode=body.mode)
+        # CCH 전용 — pathfinder.find_route() NetworkX 폴백 제거(#4). 폴백이
+        # 살아있을 때 실측된 지연(우회 이진탐색 시 최대 24~27초, 전체 그래프
+        # O(E) 재계산 × 최대 10회)이 60초 타임아웃에 근접해 사실상 실패나
+        # 다름없었다 — 느리게 성공하는 대신 즉시 에러로 명확히 실패한다.
+        if _cch is None:
+            raise ValueError("라우팅 엔진이 아직 준비되지 않았습니다. 잠시 후 다시 시도해주세요.")
+        try:
+            result = _cch.find_route(origin, dest, body.user_type)
+        except Exception as e:
+            print(f"[CCH] 쿼리 실패: {e}")
+            raise ValueError("경로를 찾을 수 없습니다.")
         _t_find_route = time.perf_counter()
 
         coords = [
@@ -1636,12 +1634,17 @@ def api_route(
             nav_time = estimate_nav_time(nav_segs, body.user_type)
             _t_nav_segs = time.perf_counter()
 
-            if not body.light:
-                # path_nodes → coordinates 배열 인덱스 매핑 (첫 등장 우선)
-                for _i, _n in enumerate(result["path_nodes"]):
-                    if _n not in _node_to_path_idx:
-                        _node_to_path_idx[_n] = _i
+            # path_nodes → coordinates 배열 인덱스 매핑 (첫 등장 우선). 아래
+            # navigation_segments의 coord_start_idx/coord_end_idx(지도 색칠 구간
+            # 슬라이싱용)가 여기 의존하므로 light 모드에서도 항상 채운다 — 예전엔
+            # not body.light 안에 있어서 light 모드(대중교통 탭 승차 전/하차 후
+            # 도보 조회)의 모든 구간이 0/0으로 나와 coords.slice(0,1)=점 1개→FE
+            # 필터("좌표 2개 이상")에 전부 걸러짐→지도에서 직선 폴백으로 보이던 버그.
+            for _i, _n in enumerate(result["path_nodes"]):
+                if _n not in _node_to_path_idx:
+                    _node_to_path_idx[_n] = _i
 
+            if not body.light:
                 # 측정 파이프라인 v2 — GPS 실측(navigation_measurements) 제출 단위.
                 # nav_segs(교차로 기준, 지도색/안내용)와 목적이 다른 완전히 별개의
                 # 분할이라 독립적으로 계산한다(하나가 실패해도 다른 하나는 살아있게

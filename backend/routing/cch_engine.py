@@ -24,9 +24,63 @@ import numpy as np
 from scipy.spatial import KDTree
 
 from config import MAX_DETOUR_RATIO, FORBIDDEN_PENALTY, BASE_DIR
-from routing.cost import USER_TYPES, slope_cost, is_facility_blocked, is_facility_blocked_for_any_type
-from routing.pathfinder import recalculate_path_slopes
+from routing.cost import USER_TYPES, slope_cost, slope_score, is_facility_blocked, is_facility_blocked_for_any_type
 from routing.basis import precompute_basis_weights, save_basis_weights, load_basis_weights
+
+
+def recalculate_path_slopes(G, path_nodes: list) -> list:
+    """
+    경로 노드 순서 기반으로 각 구간의 경사도·방향을 결정.
+
+    엣지에 slope_pct가 이미 저장돼 있으면 그 값을 그대로 사용한다.
+    (legacy: signed_slope()로 저장된 값 / densified: DEM 실측값)
+    평지 판단은 % 기준(0.5%) — FLAT_THRESHOLD(미터 기준)를 5m 구간에 쓰면
+    10% 미만이 전부 flat으로 분류되는 문제가 생겨서 별도 상수를 쓴다.
+
+    (구 routing/pathfinder.py에서 이전 — #4 CCH 전용화. CCH 경로 복원에서만
+    쓰이므로 이 파일로 옮겼다. 로직 변경 없음.)
+    """
+    SLOPE_FLAT_PCT = 0.5   # % 미만이면 평지 (0.5m/100m)
+    segments       = []
+
+    for i in range(len(path_nodes) - 1):
+        u, v = path_nodes[i], path_nodes[i + 1]
+        if not G.has_edge(u, v):
+            continue
+
+        edge         = G[u][v]
+        slope_signed = float(edge.get("slope_pct", 0.0))
+        slope_abs    = abs(slope_signed)
+
+        if slope_abs < SLOPE_FLAT_PCT:
+            slope_signed, direction = 0.0, "flat"
+        elif slope_signed > 0:
+            direction = "up"
+        else:
+            direction = "down"
+
+        g_eval = slope_abs
+        d_eval = direction if direction != "flat" else "up"
+
+        seg = {
+            "u":             u,
+            "v":             v,
+            "length_m":      edge.get("length_m", 0.0),
+            "slope_pct":     slope_signed,
+            "direction":     direction,
+            "name":          edge.get("name", ""),
+            "score_by_type": {ut: slope_score(g_eval, d_eval, ut) for ut in USER_TYPES},
+            # S3 — 신호 A 행(FE distanceRowTracker)의 facility 판정용. S6.5와
+            # 동일 사실 필드(OSM 원본 highway=='steps').
+            "is_stairs":     edge.get("highway") == "steps",
+            # S6 — slope 0/NULL/교량 구분(graph.py 참고). 레거시 그래프 경로 등
+            # 속성이 없는 엣지는 "missing"으로 보수적 처리(값을 신뢰 못 한다는
+            # 뜻이지 실제로 결측이라 단정하는 건 아님 — 확인 불가 케이스).
+            "slope_source":  edge.get("slope_source") or "missing",
+        }
+        segments.append(seg)
+
+    return segments
 
 
 def is_forbidden_for_any_type(slope_pct: float) -> bool:
@@ -206,8 +260,8 @@ class CCHEngine:
                    user_type: str,
                    max_detour_ratio: float = MAX_DETOUR_RATIO) -> dict:
         """
-        CCH 기반 경로 탐색.
-        반환 형식은 routing.pathfinder.find_route()와 동일.
+        CCH 기반 경로 탐색. (구 routing.pathfinder.find_route()와 동일한 반환 형식
+        — #4로 그 함수는 제거됨, CCH가 유일한 경로 탐색 구현체.)
         """
         from routingkit_cch import CCHMetric
         t0 = time.time()
