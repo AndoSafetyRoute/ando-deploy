@@ -13,7 +13,6 @@ import {
 } from '../../api/transitApi';
 import {
   requestWalkLeg, requestSubwayBestExit, SubwayBestExit,
-  requestLowfloorBusInfo, LowfloorBusInfo,
   requestStationChargers, StationCharger,
 } from '../../api/routeApi';
 import RouteMapView, { MapCoordinate } from './RouteMapView';
@@ -161,7 +160,6 @@ function buildSteps(steps: KakaoTransitStep[], apiUserType: string) {
       lineNo: p.type === 'SUBWAY' && vehicle ? vehicle.name.replace(/호선$/, '') : undefined,
       lineColor: p.type === 'SUBWAY' ? color : undefined,
       busNo,
-      busType: busNo && KNOWN_ACCESSIBILITY[busNo]?.kind === 'bus' ? 'lowfloor' : undefined,
       stops: stopNames,
       accessibility,
       facilities,
@@ -384,31 +382,6 @@ function applyChargerInfo(step: any, chargers: StationCharger[]) {
   ];
 }
 
-// 노선별 저상버스 보유율 조회 캐시 — 여러 후보 경로가 같은 노선을 공유할 때
-// 중복 조회 방지 (LegCache/SubwayExitCache와 동일한 이유).
-type LowfloorCache = Map<string, Promise<LowfloorBusInfo | null>>;
-
-function computeLowfloorInfo(routeNo: string, cache: LowfloorCache): Promise<LowfloorBusInfo | null> {
-  const cached = cache.get(routeNo);
-  if (cached) return cached;
-  const promise = requestLowfloorBusInfo(routeNo);
-  cache.set(routeNo, promise);
-  return promise;
-}
-
-// 정적 데이터(실시간 아님)이므로 "이 노선은 저상버스가 없다"고 단정하지 않고
-// 보유율만 안내 — 0%에 가까워도 배차상 저상버스가 올 수 있다.
-// busType='lowfloor' 배지는 보유율>0일 때만 (0%는 뱃지 없이 문구만 노출).
-function applyLowfloorInfo(step: any, info: LowfloorBusInfo) {
-  if (!step) return;
-  const pct = Math.round(info.ratio);
-  step.accessibility = [
-    ...(step.accessibility ?? []),
-    { type: 'lowfloor', text: `${info.route}번 노선 저상버스 보유율 약 ${pct}%`, icon: '♿' },
-  ];
-  if (pct > 0) step.busType = 'lowfloor';
-}
-
 function makeWalkStep(id: string, leg: WalkLeg, title: string, isDestination: boolean) {
   const distanceText = leg.distanceM != null ? formatDistanceText(leg.distanceM) : '';
   return {
@@ -450,7 +423,6 @@ async function convertKakaoRoute(
   limit: Limiter,
   legCache: LegCache,
   subwayCache: SubwayExitCache,
-  lowfloorCache: LowfloorCache,
   chargerCache: ChargerCache,
 ) {
   const steps = route.steps ?? [];
@@ -543,18 +515,6 @@ async function convertKakaoRoute(
     );
   });
 
-  // 버스 구간이면 노선번호로 저상버스 보유율 조회(정적 데이터) — 한 스텝에
-  // 여러 노선(예: "간선 402외 2대")이 묶인 경우 전부 조회해서 합쳐 보여준다.
-  steps.forEach((step, i) => {
-    if (step.properties.type !== 'BUS') return;
-    for (const v of step.properties.vehicles ?? []) {
-      walkTasks.push(
-        computeLowfloorInfo(v.name, lowfloorCache)
-          .then(info => { if (info) applyLowfloorInfo(uiSteps[i], info); })
-      );
-    }
-  });
-
   await Promise.all(walkTasks);
 
   // 미리보기 지도용 구간별 색상 — 도보는 경사도 zone 색, 탑승 구간은 그 스텝의
@@ -603,10 +563,10 @@ async function convertKakaoRoute(
     } else if (step.properties.type === 'BUS') {
       const vehicle = step.properties.vehicles?.[0];
       const busNo = vehicle?.name;
-      const isLowfloor = !!busNo && KNOWN_ACCESSIBILITY[busNo]?.kind === 'bus';
-      // 저상버스는 기존처럼 접근성 색(C.lowFloor) 우선 — 그 외엔 노선유형색(간선/
-      // 지선/순환/광역/마을)으로 구분해서 지하철 호선색과 대칭되게 맞춘다.
-      mapSegments.push({ coordinates: coords, color: isLowfloor ? C.lowFloor : busTypeColor(busNo) });
+      // 노선유형색(간선/지선/순환/광역/마을)으로 지하철 호선색과 대칭되게 칠한다.
+      // 저상 여부는 "이번에 오는 차" 기준이라 노선 단위 선 색으론 표현하지 않고
+      // 실시간 배지(BusArrivalBadge, is_lowfloor)로만 보여준다.
+      mapSegments.push({ coordinates: coords, color: busTypeColor(busNo) });
     } else {
       const vehicle = step.properties.vehicles?.[0];
       const lineNo = vehicle?.name?.replace(/호선$/, '');
@@ -780,8 +740,7 @@ const StepItem = ({ step, isLast }: { step: any; isLast: boolean }) => {
                   </View>
                 )}
                 {step.busNo && (
-                  <View style={[ss.busBadge, { backgroundColor: step.busType === 'lowfloor' ? C.lowFloor : C.bus }]}>
-                    {step.busType === 'lowfloor' && <Text style={ss.lowFloorIcon}>♿</Text>}
+                  <View style={[ss.busBadge, { backgroundColor: C.bus }]}>
                     <Text style={ss.busBadgeText}>{step.busNo}</Text>
                   </View>
                 )}
@@ -836,7 +795,6 @@ const StepItem = ({ step, isLast }: { step: any; isLast: boolean }) => {
 
 const RouteCard = ({ route, selected, onSelect }: any) => {
   const scaleAnim = useRef(new Animated.Value(1)).current;
-  const hasLowfloorBus = route.steps?.some((s: any) => s.busType === 'lowfloor');
   const handlePress = () => {
     Animated.sequence([
       Animated.timing(scaleAnim, { toValue: 0.97, duration: 70, useNativeDriver: true }),
@@ -861,9 +819,6 @@ const RouteCard = ({ route, selected, onSelect }: any) => {
               <View style={ss.accessibleBadge}><Text style={ss.accessibleBadgeText}>♿ 교통약자 가능</Text></View>
             ) : (
               <View style={ss.notAccessibleBadge}><Text style={ss.notAccessibleBadgeText}>⚠ 일부 제한</Text></View>
-            )}
-            {hasLowfloorBus && (
-              <View style={ss.lowFloorListBadge}><Text style={ss.lowFloorListBadgeText}>♿ 저상버스</Text></View>
             )}
             {selected && (
               <View style={ss.selectedBadge}><Text style={ss.selectedText}>✓ 선택</Text></View>
@@ -994,7 +949,6 @@ export function useTransitRoutes({
         const limit = createLimiter(4);
         const legCache: LegCache = new Map();
         const subwayCache: SubwayExitCache = new Map();
-        const lowfloorCache: LowfloorCache = new Map();
         const chargerCache: ChargerCache = new Map();
         const converted = await Promise.all(
           kakaoRoutes.map((r, i) =>
@@ -1005,7 +959,6 @@ export function useTransitRoutes({
               limit,
               legCache,
               subwayCache,
-              lowfloorCache,
               chargerCache,
             )
           )
@@ -1363,27 +1316,6 @@ export default function TransitContent({
               <Text style={ss.summarySep}>·</Text>
               <Text style={ss.summaryAccess}>{currentRoute.accessNote}</Text>
             </View>
-            {(() => {
-              const knownBusStep = currentRoute.steps.find((s: any) => s.busNo && s.busType === 'lowfloor');
-              if (knownBusStep) {
-                const lowfloorText = knownBusStep.accessibility?.find((a: any) => a.type === 'lowfloor')?.text
-                  ?? `${knownBusStep.busNo} 저상버스 운행 확인됨`;
-                return (
-                  <View style={ss.lowFloorAlert}>
-                    <Text style={ss.lowFloorAlertIcon}>♿</Text>
-                    <Text style={ss.lowFloorAlertText}>{lowfloorText}</Text>
-                  </View>
-                );
-              }
-              const hasBus = currentRoute.segments.some((s: any) => s.type === 'bus' || s.type === 'lowfloor');
-              if (!hasBus) return null;
-              return (
-                <View style={ss.lowFloorAlert}>
-                  <Text style={ss.lowFloorAlertIcon}>♿</Text>
-                  <Text style={ss.lowFloorAlertText}>버스 탑승 시 저상버스 여부는 현장에서 확인해 주세요</Text>
-                </View>
-              );
-            })()}
             {currentRoute.steps.map((step, i) => (
               <StepItem key={step.id} step={step} isLast={i === currentRoute.steps.length - 1} />
             ))}
@@ -1497,8 +1429,6 @@ const ss = StyleSheet.create({
   accessibleBadgeText: { fontSize: 11, color: C.lowFloor, fontWeight: '600' },
   notAccessibleBadge: { backgroundColor: '#FFF3E0', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10 },
   notAccessibleBadgeText: { fontSize: 11, color: C.warn, fontWeight: '600' },
-  lowFloorListBadge: { backgroundColor: C.lowFloorBg, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10 },
-  lowFloorListBadgeText: { fontSize: 11, color: C.lowFloor, fontWeight: '600' },
   selectedBadge: { backgroundColor: C.success + '22', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10 },
   selectedText: { fontSize: 11, color: C.success, fontWeight: '700' },
   routeCardMid: { flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'space-between' },
@@ -1528,13 +1458,6 @@ const ss = StyleSheet.create({
   summarySep: { fontSize: 14, color: C.textMute },
   summaryCost: { fontSize: 13, fontWeight: '600', color: C.text },
   summaryAccess: { fontSize: 12, color: C.textSub, flex: 1 },
-  lowFloorAlert: {
-    flexDirection: 'row', alignItems: 'center', backgroundColor: C.lowFloorBg,
-    borderRadius: 12, paddingHorizontal: 12, paddingVertical: 9, gap: 8, marginBottom: 12,
-    borderWidth: 1, borderColor: C.lowFloor + '60',
-  },
-  lowFloorAlertIcon: { fontSize: 16 },
-  lowFloorAlertText: { flex: 1, fontSize: 12, color: C.lowFloor, fontWeight: '600' },
   realTimeBadge: { backgroundColor: C.lowFloor, borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3 },
   realTimeText: { fontSize: 10, color: C.white, fontWeight: '700' },
 
@@ -1554,7 +1477,6 @@ const ss = StyleSheet.create({
   lineBadge: { paddingHorizontal: 8, paddingVertical: 2, borderRadius: 8 },
   lineBadgeText: { fontSize: 11, color: C.white, fontWeight: '700' },
   busBadge: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 8, paddingVertical: 2, borderRadius: 8, gap: 4 },
-  lowFloorIcon: { fontSize: 10, color: C.white },
   busBadgeText: { fontSize: 11, color: C.white, fontWeight: '700' },
   nextBusPill: {
     flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: C.lowFloorBg,

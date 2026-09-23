@@ -6,13 +6,13 @@ import { BASE_URL } from "../api";
 
 export type SubwayArrivalItem = {
   seconds:      number | null; // 도착까지 초. null 이면 arriving 등으로만 판단
-  text:         string | null; // "2분 30초 후" 같은 원문
+  text:         string | null; // "2분 후 (당산)" 같은 원문
   current_pos:  string | null; // 열차 현재 위치역
-  line_no:      string | null; // "2" 같은 노선번호(안 매칭되면 null)
-  // 종착지 방면("OO행 - OO방면"). 방향(상행/하행)은 서버가 노선 위상 없이는
-  // 확정 못 해서 추측하지 않고 이 텍스트를 그대로 준다 — 맞는 방향인지 사용자가 직접 확인.
+  line_no:      string | null; // "4" 같은 노선번호(안 매칭되면 null)
+  // 종착지 방면("OO행"). 방향(상행/하행)은 서버가 노선 위상 없이는 확정 못 해서
+  // 추측하지 않고 이 텍스트를 그대로 준다 — 맞는 방향인지 사용자가 직접 확인.
   direction:    string | null;
-  updn_line:    string | null; // "상행"/"하행"/"내선"/"외선" 원문(있을 때만)
+  updn_line:    string | null; // "상행"/"하행" 원문(있을 때만)
   train_type:   string | null; // "일반"/"급행" 등
   arriving:     boolean;
   data_age_s:   number | null;
@@ -28,8 +28,8 @@ export type SubwayArrival = {
 };
 
 /**
- * @param station 승차역명 (카카오 step.stops[0].name, 예 "강남역")
- * @param lineNo  노선번호 (카카오 step.lineNo, 예 "2") — 있으면 그 노선 열차만 우선 필터
+ * @param station 승차역명 (카카오 step.stops[0].name, 예 "서울역")
+ * @param lineNo  노선번호 (카카오 step.lineNo, 예 "4") — 있으면 그 노선만 우선 필터
  */
 export async function getSubwayArrival(args: {
   station: string;

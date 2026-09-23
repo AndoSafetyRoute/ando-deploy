@@ -5,15 +5,15 @@
 import { BASE_URL } from "../api";
 
 export type BusArrivalItem = {
-  seconds:    number | null;   // 도착까지 초. null 이면 text 만 (곧 도착 등)
-  text:       string | null;   // "3분 12초 후 [2번째 전]" 같은 원문
-  vehicle_no: string | null;
-  congestion: string | null;   // "여유" | "보통" | "혼잡" | null
-  arriving:   boolean;         // 곧 도착
-  last_bus:   boolean;
+  seconds:      number | null; // 도착까지 초. null 이면 text 만 (곧 도착 등)
+  text:         string | null; // "3분 12초 후 [2번째 전]" 같은 원문
+  vehicle_no:   string | null;
+  congestion:   string | null; // "여유" | "보통" | "혼잡" | null
+  arriving:     boolean;       // 곧 도착
+  last_bus:     boolean;
   // 이번에 실제로 오는 그 차량이 저상버스인지(busType 실시간 값). 정적 노선
   // 보유율(/bus/lowfloor)과 달리 "이 차" 기준 — null이면 서버가 값을 못 받은 것.
-  is_lowfloor: boolean | null;
+  is_lowfloor:  boolean | null;
 };
 
 export type BusArrival = {
