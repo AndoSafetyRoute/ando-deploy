@@ -3,7 +3,7 @@ import {
   View, Text, StyleSheet, TouchableOpacity,
   ScrollView, Animated, Dimensions, Platform, Alert,
 } from 'react-native';
-import { C, ZONE_COLORS, SUBWAY_LINE_COLORS } from '../../constants/colors';
+import { C, ZONE_COLORS, SUBWAY_LINE_COLORS, busTypeColor } from '../../constants/colors';
 import { formatMinutes } from '../../utils/storage';
 import {
   requestTransitDirections,
@@ -604,7 +604,9 @@ async function convertKakaoRoute(
       const vehicle = step.properties.vehicles?.[0];
       const busNo = vehicle?.name;
       const isLowfloor = !!busNo && KNOWN_ACCESSIBILITY[busNo]?.kind === 'bus';
-      mapSegments.push({ coordinates: coords, color: isLowfloor ? C.lowFloor : C.transitLineBus });
+      // 저상버스는 기존처럼 접근성 색(C.lowFloor) 우선 — 그 외엔 노선유형색(간선/
+      // 지선/순환/광역/마을)으로 구분해서 지하철 호선색과 대칭되게 맞춘다.
+      mapSegments.push({ coordinates: coords, color: isLowfloor ? C.lowFloor : busTypeColor(busNo) });
     } else {
       const vehicle = step.properties.vehicles?.[0];
       const lineNo = vehicle?.name?.replace(/호선$/, '');

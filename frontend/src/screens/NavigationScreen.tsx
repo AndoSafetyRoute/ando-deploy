@@ -614,11 +614,11 @@ function makeKakaoMapHtml({
                 // 미리보기 지도(RouteMapView)와 동일한 테두리+중앙 2중 렌더링 —
                 // 실제 GPS 안내 화면에서도 경로 선을 굵게, 테두리로 눈에 띄게 그린다.
                 new kakao.maps.Polyline({
-                  path: polyPath, strokeWeight: 9,
+                  path: polyPath, strokeWeight: 18,
                   strokeColor: "#7C6FF7", strokeOpacity: 0.95, strokeStyle: "solid"
                 }).setMap(map);
                 new kakao.maps.Polyline({
-                  path: polyPath, strokeWeight: 5,
+                  path: polyPath, strokeWeight: 13,
                   strokeColor: seg.color, strokeOpacity: 0.95, strokeStyle: "solid"
                 }).setMap(map);
 
@@ -646,11 +646,11 @@ function makeKakaoMapHtml({
                 var start = new kakao.maps.LatLng(seg.start.lat, seg.start.lng);
                 var end   = new kakao.maps.LatLng(seg.end.lat,   seg.end.lng);
                 new kakao.maps.Polyline({
-                  path: [start, end], strokeWeight: 9,
+                  path: [start, end], strokeWeight: 18,
                   strokeColor: "#7C6FF7", strokeOpacity: 0.95, strokeStyle: "solid"
                 }).setMap(map);
                 new kakao.maps.Polyline({
-                  path: [start, end], strokeWeight: 5,
+                  path: [start, end], strokeWeight: 13,
                   strokeColor: seg.color, strokeOpacity: 0.95, strokeStyle: "solid"
                 }).setMap(map);
               });
@@ -659,11 +659,11 @@ function makeKakaoMapHtml({
                 return new kakao.maps.LatLng(p.lat, p.lng);
               });
               new kakao.maps.Polyline({
-                path: path, strokeWeight: 9,
+                path: path, strokeWeight: 18,
                 strokeColor: "#5B52D6", strokeOpacity: 0.95, strokeStyle: "solid"
               }).setMap(map);
               new kakao.maps.Polyline({
-                path: path, strokeWeight: 5,
+                path: path, strokeWeight: 13,
                 strokeColor: "#7C6FF7", strokeOpacity: 0.95, strokeStyle: "solid"
               }).setMap(map);
             }

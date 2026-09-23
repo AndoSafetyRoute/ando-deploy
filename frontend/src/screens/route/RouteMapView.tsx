@@ -168,9 +168,13 @@ function makeRouteMapHtml({ routes, selectedRouteId, startLabel, endLabel, width
                 // 2중 렌더링 — 선택 여부와 무관하게 항상 조각조각 그린다(비교 후보도
                 // 도보 구간은 경사도색이 보여야 한다). 비선택 후보는 얇고 옅게 그려
                 // 시각적 위계만 유지한다.
-                var borderWeight = r.selected ? 9 : 6;
-                var centerWeight = r.selected ? 5 : 3;
-                var opacity      = r.selected ? 1 : 0.55;
+                // 선 폭·테두리 폭 — ×2 했다가 너무 굵어서 그 결과의 ×0.8로 하향
+                // (실질 ×1.6, 기존 11/8·7/5 대비). 비선택 후보는 투명도를
+                // 0.55→0.3으로 낮춰서 선택된 경로(예: 최단)가 다른 후보(유형별
+                // 추천 등)에 시각적으로 안 묻히게 한다.
+                var borderWeight = r.selected ? 18 : 11;
+                var centerWeight = r.selected ? 13 : 8;
+                var opacity      = r.selected ? 1 : 0.3;
                 r.segments.forEach(function (seg) {
                   if (!seg.path || seg.path.length < 2) return;
                   var segPath = seg.path.map(function (p) {
@@ -209,9 +213,9 @@ function makeRouteMapHtml({ routes, selectedRouteId, startLabel, endLabel, width
                 new kakao.maps.Polyline({
                   map: map,
                   path: linePath,
-                  strokeWeight: r.selected ? 6 : 4,
+                  strokeWeight: r.selected ? 14 : 10, // ×2 → ×0.8 하향(실질 ×1.6, 기존 9/6)
                   strokeColor: r.color || '#7C6FF7',
-                  strokeOpacity: r.selected ? 1 : 0.35,
+                  strokeOpacity: r.selected ? 1 : 0.3,
                   strokeStyle: 'solid'
                 });
               }

@@ -84,3 +84,25 @@ export const SUBWAY_LINE_COLORS: Record<string, string> = {
   '1': '#0052A4', '2': '#00A84D', '3': '#EF7C1C', '4': '#00A4E3', '5': '#996CAC',
   '6': '#CD7C2F', '7': '#747F00', '8': '#E6186C', '9': '#BDB092',
 };
+
+// 서울시 버스 노선유형별 공식 색상(간선=파랑/지선=초록/순환=노랑/광역=빨강/마을=민트).
+// 카카오 API가 노선유형을 별도 필드로 안 줘서(vehicle.type 미검증), 서울시가
+// 공개한 노선번호 체계(자릿수/접두)로 유형을 추정한다 — 100% 정확은 아닐 수 있음.
+export const BUS_TYPE_COLORS = {
+  trunk:    '#3D5AAE', // 간선 — 3자리 숫자(예: 143)
+  branch:   '#53B332', // 지선 — 4자리 숫자(예: 6411)
+  circular: '#FEC000', // 순환 — 1~2자리 숫자(예: 02)
+  express:  '#E10000', // 광역 — 9로 시작 또는 M접두(예: 9401, M4108)
+  village:  '#6DCDA8', // 마을 — 한글 지역명 접두(예: 성북03)
+} as const;
+
+export function busTypeColor(routeNo: string | undefined | null): string {
+  const no = (routeNo || '').trim();
+  if (!no) return BUS_TYPE_COLORS.trunk;
+  if (/^[가-힣]/.test(no)) return BUS_TYPE_COLORS.village;
+  if (/^(M|9)/i.test(no)) return BUS_TYPE_COLORS.express;
+  const digits = no.replace(/\D/g, '');
+  if (digits.length >= 4) return BUS_TYPE_COLORS.branch;
+  if (digits.length <= 2) return BUS_TYPE_COLORS.circular;
+  return BUS_TYPE_COLORS.trunk;
+}
