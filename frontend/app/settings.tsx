@@ -245,6 +245,18 @@ export default function SettingScreen() {
           <TouchableOpacity
             style={styles.menuButton}
             activeOpacity={0.85}
+            onPress={() => router.push("/debug-queue")}
+          >
+            <View style={styles.menuLeft}>
+              <Ionicons name="bug-outline" size={23} color={NAVY} />
+              <Text style={styles.menuText}>로컬 수집 큐 확인 (디버그)</Text>
+            </View>
+            <MaterialCommunityIcons name="chevron-right" size={25} color="#B8B8B8" />
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.menuButton}
+            activeOpacity={0.85}
             onPress={() => router.push("/mypage")}
           >
             <View style={styles.menuLeft}>

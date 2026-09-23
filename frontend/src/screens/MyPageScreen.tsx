@@ -7,6 +7,7 @@ import {
   ScrollView,
   Platform,
   ActivityIndicator,
+  Alert,
 } from "react-native";
 import { router, useFocusEffect } from "expo-router";
 import { goHome } from "../utils/navigation";
@@ -33,6 +34,7 @@ import {
   UserStats,
   PersonalizationStatus,
 } from "../api";
+import { exportRoutesCsv } from "../utils/exportRoutesCsv";
 
 const NAVY = "#1B0F4A";
 const WHITE = "#FFFFFF";
@@ -208,6 +210,25 @@ export default function MyPageScreen() {
   const [stats, setStats] = useState<UserStats | null>(null);
   const [personalization, setPersonalization] = useState<PersonalizationStatus | null>(null);
   const [loading, setLoading] = useState(true);
+  const [exporting, setExporting] = useState(false);
+
+  const handleExportCsv = useCallback(async () => {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const result = await exportRoutesCsv(routes);
+      if (result.ok === true) return;
+
+      let message = "내보내기에 실패했어요.";
+      if (result.reason === "empty") message = "내보낼 경로 기록이 없어요.";
+      else if (result.reason === "unavailable") message = "이 기기에서는 공유 기능을 사용할 수 없어요.";
+      else if (result.message) message = `내보내기에 실패했어요.\n${result.message}`;
+
+      Alert.alert("CSV 내보내기", message);
+    } finally {
+      setExporting(false);
+    }
+  }, [routes, exporting]);
 
   useFocusEffect(
     useCallback(() => {
@@ -440,8 +461,26 @@ export default function MyPageScreen() {
           </View>
 
           <View style={styles.section}>
-            <View style={styles.sectionHeader}>
+            <View style={[styles.sectionHeader, styles.sectionHeaderRow]}>
               <Text style={styles.sectionTitle}>지난 경로</Text>
+
+              {routes.length > 0 && (
+                <TouchableOpacity
+                  style={styles.csvButton}
+                  onPress={handleExportCsv}
+                  disabled={exporting}
+                  activeOpacity={0.8}
+                >
+                  {exporting ? (
+                    <ActivityIndicator size="small" color={NAVY} />
+                  ) : (
+                    <>
+                      <Ionicons name="download-outline" size={15} color={NAVY} />
+                      <Text style={styles.csvButtonText}>CSV 내보내기</Text>
+                    </>
+                  )}
+                </TouchableOpacity>
+              )}
             </View>
 
             {routes.length === 0 ? (
@@ -575,6 +614,31 @@ const styles = StyleSheet.create({
 
   sectionHeader: {
     marginBottom: 10,
+  },
+
+  sectionHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+
+  csvButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: LIGHT_GRAY,
+    borderRadius: 12,
+    paddingHorizontal: 11,
+    paddingVertical: 7,
+    minWidth: 40,
+    minHeight: 30,
+    justifyContent: "center",
+  },
+
+  csvButtonText: {
+    marginLeft: 5,
+    fontSize: 12,
+    fontWeight: "800",
+    color: NAVY,
   },
 
   sectionTitle: {

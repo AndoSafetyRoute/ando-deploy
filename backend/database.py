@@ -1075,7 +1075,7 @@ def get_user_routes(db: Session, uid: str) -> list:
         route_id = row[0]
         segs = db.execute(text("""
             SELECT seg_index, distance_m, slope_pct, elapsed_ms,
-                   direction, zone, name
+                   direction, zone, name, measured
             FROM navigation_segments WHERE route_id = :rid ORDER BY seg_index
         """), {"rid": route_id}).fetchall()
 
@@ -1097,6 +1097,7 @@ def get_user_routes(db: Session, uid: str) -> list:
                     "direction":    s[4],
                     "zone":         s[5],
                     "name":         s[6],
+                    "measured":     s[7],
                 }
                 for s in segs
             ],
