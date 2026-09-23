@@ -8,10 +8,13 @@ const KAKAO_JAVASCRIPT_KEY = process.env.EXPO_PUBLIC_KAKAO_JAVASCRIPT_KEY;
 export type MapCoordinate = { latitude: number; longitude: number };
 
 // zone(경사도) 또는 노선(대중교통) 기준으로 구간별 색을 다르게 그리기 위한 조각.
+// 테두리(굵게, 선택지 구분색)와 중앙(얇게, 도보=경사도/대중교통=호선·저상 구분색)을
+// 2중으로 그린다 — color가 중앙색, borderColor 생략 시 route.color(선택지색)로 폴백.
 // slopeMean/zone이 있으면(경사 구간) showSlopeMarkers일 때 화살표 라벨도 같이 그린다.
 export type MapRouteSegment = {
   coordinates: MapCoordinate[];
   color: string;
+  borderColor?: string;
   slopeMean?: number;
   zone?: string;
 };
@@ -20,8 +23,9 @@ export type MapRoute = {
   id: string;
   color: string;
   coordinates: MapCoordinate[];
-  // 선택된(selected) 경로일 때만 사용 — 있으면 이 조각들로 색칠하고, 없으면
-  // 기존처럼 coordinates 전체를 color 하나로 그린다(비교용 후보 경로는 항상 이쪽).
+  // 있으면 이 조각들로 테두리+중앙 2중 색칠, 없으면 기존처럼 coordinates 전체를
+  // color 하나로(단선) 그린다. 선택 여부와 무관하게 항상 이쪽을 우선한다 —
+  // 비교용 후보 경로도 도보 구간은 경사도색이 보여야 하기 때문.
   segments?: MapRouteSegment[];
 };
 
@@ -54,9 +58,10 @@ function makeRouteMapHtml({ routes, selectedRouteId, startLabel, endLabel, width
       color: r.color,
       selected: r.id === selectedRouteId,
       path: r.coordinates.map((c) => ({ lat: c.latitude, lng: c.longitude })),
-      segments: (r.id === selectedRouteId ? r.segments : undefined)?.map((seg) => ({
+      segments: r.segments?.map((seg) => ({
         path: seg.coordinates.map((c) => ({ lat: c.latitude, lng: c.longitude })),
         color: seg.color,
+        borderColor: seg.borderColor || r.color,
         slopeMean: seg.slopeMean,
         zone: seg.zone,
       })),
@@ -158,8 +163,14 @@ function makeRouteMapHtml({ routes, selectedRouteId, startLabel, endLabel, width
                 return new kakao.maps.LatLng(p.lat, p.lng);
               });
 
-              if (r.selected && r.segments && r.segments.length > 0) {
-                // 구간별 색칠(경사도 zone 또는 대중교통 노선) — 통짜 단색 대신 조각조각 그린다.
+              if (r.segments && r.segments.length > 0) {
+                // 테두리(굵게, 선택지 구분색) + 중앙(얇게, 경사도 zone/노선/저상 구분색)
+                // 2중 렌더링 — 선택 여부와 무관하게 항상 조각조각 그린다(비교 후보도
+                // 도보 구간은 경사도색이 보여야 한다). 비선택 후보는 얇고 옅게 그려
+                // 시각적 위계만 유지한다.
+                var borderWeight = r.selected ? 9 : 6;
+                var centerWeight = r.selected ? 5 : 3;
+                var opacity      = r.selected ? 1 : 0.55;
                 r.segments.forEach(function (seg) {
                   if (!seg.path || seg.path.length < 2) return;
                   var segPath = seg.path.map(function (p) {
@@ -168,13 +179,21 @@ function makeRouteMapHtml({ routes, selectedRouteId, startLabel, endLabel, width
                   new kakao.maps.Polyline({
                     map: map,
                     path: segPath,
-                    strokeWeight: 6,
+                    strokeWeight: borderWeight,
+                    strokeColor: seg.borderColor || r.color || '#7C6FF7',
+                    strokeOpacity: opacity,
+                    strokeStyle: 'solid'
+                  });
+                  new kakao.maps.Polyline({
+                    map: map,
+                    path: segPath,
+                    strokeWeight: centerWeight,
                     strokeColor: seg.color || r.color || '#7C6FF7',
-                    strokeOpacity: 1,
+                    strokeOpacity: opacity,
                     strokeStyle: 'solid'
                   });
 
-                  if (${drawSlopeMarkers} && seg.zone && seg.zone !== 'flat' && seg.slopeMean && seg.slopeMean !== 0) {
+                  if (${drawSlopeMarkers} && r.selected && seg.zone && seg.zone !== 'flat' && seg.slopeMean && seg.slopeMean !== 0) {
                     var midIdx = Math.floor(segPath.length / 2);
                     var midPt = segPath[midIdx];
                     var arrow = seg.slopeMean > 0 ? '↑' : '↓';

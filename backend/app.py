@@ -48,6 +48,7 @@ from subway import get_facility_db, SubwayFacilityDB
 from subway.facility import get_station_chargers
 from lowfloor_bus import get_lowfloor_info
 import bus_arrival
+import subway_arrival
 
 G = None
 _spatial_index = None
@@ -1995,6 +1996,21 @@ def api_bus_arrival(
         bus_route_id=bus_route_id,
         walk_remaining_s=walk_remaining_s,
     )
+
+
+@app.get("/subway/arrival")
+def api_subway_arrival(
+    station:  str        = Query(..., description="승차역명 (카카오 stops[].name, 예: 강남역)"),
+    line_no:  str | None = Query(None, description="노선번호 (카카오 lineNo, 예: 4) — 있으면 그 노선 열차만 우선 필터"),
+):
+    """
+    서울시 지하철 실시간 도착정보 (공공데이터포털 서비스, 키는 서버에만 보관).
+
+    항상 200 + dict 를 돌려준다. 키 미설정·역명 미매칭·운행중 열차 없음 등은
+    `available:false` + `reason` 으로 표현 — FE 는 그 경우 실시간 배지를 숨기고
+    정적(카카오) 시간을 유지한다(graceful degradation, bus_arrival과 동일 원칙).
+    """
+    return subway_arrival.arrival_for_boarding(station=station, line_no=line_no)
 
 
 # ── 유틸 ──────────────────────────────────────────────────────────────────────

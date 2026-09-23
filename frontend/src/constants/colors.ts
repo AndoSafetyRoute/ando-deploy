@@ -77,3 +77,10 @@ export const ZONE_COLORS: Record<string, string> = {
   warning:   '#FF9800',  // 주의 — 주황
   forbidden: '#F44336',  // 금지 — 빨강
 };
+
+// 서울 지하철 공식 노선색(1~9호선). RouteMapView가 지도 위 지하철 탑승 구간
+// 중앙선 색으로 쓴다 — 매핑 안 되는 노선(지선/광역철도)은 C.transitLineSubway로 폴백.
+export const SUBWAY_LINE_COLORS: Record<string, string> = {
+  '1': '#0052A4', '2': '#00A84D', '3': '#EF7C1C', '4': '#00A4E3', '5': '#996CAC',
+  '6': '#CD7C2F', '7': '#747F00', '8': '#E6186C', '9': '#BDB092',
+};

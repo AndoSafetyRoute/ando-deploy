@@ -56,7 +56,8 @@ LOWFLOOR_BUS_XLSX = os.environ.get(
 # 대중교통 경로탐색(ODsay)/PathFinder는 사용하지 않기로 결정 — 프론트에서 카카오
 # 대중교통 API로 직접 조회한다.
 # 서울 지하철 실시간 도착 (data.seoul.go.kr OA-12764, swopenapi.seoul.go.kr 전용 키)
-# → openapi.seoul.go.kr 키(SEOUL_ELEVATOR_KEY 등)와 다른 별도 발급 필요. 현재 미사용.
+# → openapi.seoul.go.kr 키(SEOUL_ELEVATOR_KEY 등)와 다른 별도 발급 필요.
+# subway_arrival.py 참고. 키 없으면 실시간 배지는 자동으로 숨겨진다(정적 시간 유지).
 SEOUL_REALTIME_KEY = os.environ.get("SEOUL_REALTIME_KEY", "")
 
 # 서울시 버스도착정보 실시간 (공공데이터포털 '서울특별시_버스도착정보조회 서비스',

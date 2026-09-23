@@ -3,7 +3,7 @@ import {
   View, Text, StyleSheet, TouchableOpacity,
   ScrollView, Animated, Dimensions, Platform, Alert,
 } from 'react-native';
-import { C, ZONE_COLORS } from '../../constants/colors';
+import { C, ZONE_COLORS, SUBWAY_LINE_COLORS } from '../../constants/colors';
 import { formatMinutes } from '../../utils/storage';
 import {
   requestTransitDirections,
@@ -19,6 +19,7 @@ import {
 import RouteMapView, { MapCoordinate } from './RouteMapView';
 import { useDraggableSheet } from './useDraggableSheet';
 import BusArrivalBadge from '../../components/BusArrivalBadge';
+import SubwayArrivalBadge from '../../components/SubwayArrivalBadge';
 
 const { height: H } = Dimensions.get('window');
 
@@ -599,11 +600,15 @@ async function convertKakaoRoute(
     const coords = pointsToCoordinates(pts);
     if (step.properties.type === 'WALKING') {
       mapSegments.push({ coordinates: coords, color: C.walk });
+    } else if (step.properties.type === 'BUS') {
+      const vehicle = step.properties.vehicles?.[0];
+      const busNo = vehicle?.name;
+      const isLowfloor = !!busNo && KNOWN_ACCESSIBILITY[busNo]?.kind === 'bus';
+      mapSegments.push({ coordinates: coords, color: isLowfloor ? C.lowFloor : C.transitLineBus });
     } else {
-      // 지도 선은 노선 브랜드색 대신 무채색으로 통일 — 도보 구간의 경사도
-      // zone 색(특히 flat 초록)과 버스 브랜드색이 겹쳐 보이는 문제 때문.
-      const transitLineColor = step.properties.type === 'BUS' ? C.transitLineBus : C.transitLineSubway;
-      mapSegments.push({ coordinates: coords, color: transitLineColor });
+      const vehicle = step.properties.vehicles?.[0];
+      const lineNo = vehicle?.name?.replace(/호선$/, '');
+      mapSegments.push({ coordinates: coords, color: (lineNo && SUBWAY_LINE_COLORS[lineNo]) || C.transitLineSubway });
     }
   });
 
@@ -788,6 +793,9 @@ const StepItem = ({ step, isLast }: { step: any; isLast: boolean }) => {
               )}
               {step.type === 'bus' && step.busNo && (
                 <BusArrivalBadge routeName={step.busNo} stopName={step.stops?.[0]} />
+              )}
+              {step.type === 'subway' && step.lineNo && step.stops?.[0] && (
+                <SubwayArrivalBadge station={step.stops[0]} lineNo={step.lineNo} />
               )}
               {step.stops && (
                 <View style={ss.stopsRow}>

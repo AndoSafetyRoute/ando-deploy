@@ -10,7 +10,7 @@ import {
   Dimensions,
   Platform,
 } from 'react-native';
-import { C } from '../../constants/colors';
+import { C, ZONE_COLORS } from '../../constants/colors';
 import { formatMinutes } from '../../utils/storage';
 import RouteMapView from './RouteMapView';
 import { useDraggableSheet } from './useDraggableSheet';
@@ -70,6 +70,32 @@ function buildExternalSegments(routeSegments: any[] | undefined): MapSeg[] {
   }
   flush();
   return out;
+}
+
+// 경로 전체(경사도 구간 + 서울 밖 회색 구간)를 빠짐없이 조각내서 지도에 넘긴다.
+// navigation_segments가 커버 못 하는 구간이 남아있으면(서울 밖 등) 그 부분만
+// 통짜 단색으로 비어있던 예전 방식과 달리, 항상 route 전체 길이를 다 그린다.
+function buildWalkMapSegments(route: any): MapSeg[] {
+  const navSegs = route?.navigation_segments;
+  const coords: { latitude: number; longitude: number }[] = Array.isArray(route?.coordinates)
+    ? route.coordinates.map(([lng, lat]: [number, number]) => ({ latitude: lat, longitude: lng }))
+    : [];
+  const segs: MapSeg[] = [];
+  if (Array.isArray(navSegs) && navSegs.length > 0 && coords.length > 0) {
+    for (const s of navSegs) {
+      const slice = coords.slice(s.coord_start_idx ?? 0, (s.coord_end_idx ?? 0) + 1);
+      if (slice.length >= 2) {
+        segs.push({
+          coordinates: slice,
+          color: ZONE_COLORS[s.zone as string] ?? ZONE_COLORS.flat,
+          zone: s.zone,
+          slopeMean: s.slope_mean,
+        });
+      }
+    }
+  }
+  segs.push(...buildExternalSegments(route?.routeSegments));
+  return segs;
 }
 
 function fmtExtLen(m: number | null | undefined) {
@@ -313,13 +339,10 @@ export default function WalkContent({
   const selectedCand = shown[selectedPos] ?? shown[0];
   const selectedId = selectedCand ? String(selectedCand.shownPos) : '';
 
-  // 하이브리드일 때만: 선택된 경로의 서울 밖 구간을 회색 직선으로 지도에 얹는다.
-  const externalSegs = useMemo(
-    () => (isHybrid ? buildExternalSegments((selectedCand as any)?.route?.routeSegments) : []),
-    [isHybrid, selectedCand]
-  );
-
   // routes가 실제로 바뀔 때만 새 배열을 만든다(지도 깜빡임/줌 초기화 방지).
+  // 모든 후보(선택 여부 무관)에 경사도 구간색을 넣는다 — 비교 단계에서도 도보
+  // 구간이 통짜 단색이 아니라 실제 경사도를 보여줘야 하기 때문. 테두리는 후보별
+  // 선택지 색(LANE_COLORS)으로 통일해 어떤 경로가 어떤 후보인지 구분한다.
   const mapRoutes = useMemo(
     () =>
       shown.map((s) => ({
@@ -329,9 +352,9 @@ export default function WalkContent({
           latitude: lat,
           longitude: lng,
         })),
-        segments: String(s.shownPos) === selectedId ? externalSegs : undefined,
+        segments: buildWalkMapSegments(s.route),
       })),
-    [shown, selectedId, externalSegs]
+    [shown]
   );
 
   const { sheetExpanded, sheetHeight, toggleSheet, panHandlers } = useDraggableSheet(
