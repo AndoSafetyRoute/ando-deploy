@@ -921,6 +921,11 @@ export type TransitRoutesState = {
   errorMessage: string | null;
   selectedRoute: string;
   setSelectedRoute: (id: string) => void;
+  // 지도 위 출발/도착 라벨 전용 — startName/endName(검색창 입력, 즉시 바뀜)과 분리해서
+  // 실제 경로 데이터(routes)가 갱신될 때만 같이 바뀌게 한다. 그래야 재검색 중
+  // "지도는 그대로인데 이름표만 먼저 바뀌는" 어색한 과도상태가 안 생긴다.
+  mapStartLabel: string;
+  mapEndLabel: string;
 };
 
 export function useTransitRoutes({
@@ -944,6 +949,8 @@ export function useTransitRoutes({
   const [loading, setLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [selectedRoute, setSelectedRoute] = useState('');
+  const [mapStartLabel, setMapStartLabel] = useState('');
+  const [mapEndLabel, setMapEndLabel] = useState('');
 
   useEffect(() => {
     let cancelled = false;
@@ -1005,6 +1012,8 @@ export function useTransitRoutes({
         if (cancelled) return;
         setRoutes(converted);
         setSelectedRoute(converted[0]?.id ?? '');
+        setMapStartLabel(startName || '');
+        setMapEndLabel(endName || '');
       } catch (e) {
         if (!cancelled) {
           setRoutes([]);
@@ -1019,7 +1028,7 @@ export function useTransitRoutes({
     return () => { cancelled = true; };
   }, [startLatitude, startLongitude, endLatitude, endLongitude, startName, endName, walkerType]);
 
-  return { routes, loading, errorMessage, selectedRoute, setSelectedRoute };
+  return { routes, loading, errorMessage, selectedRoute, setSelectedRoute, mapStartLabel, mapEndLabel };
 }
 
 // ── 메인 ───────────────────────────────────────────────────────
@@ -1050,7 +1059,7 @@ export default function TransitContent({
   onToggleSlopeMarkers,
   transitState,
 }: Props) {
-  const { routes, loading, errorMessage, selectedRoute, setSelectedRoute } = transitState;
+  const { routes, loading, errorMessage, selectedRoute, setSelectedRoute, mapStartLabel, mapEndLabel } = transitState;
   const [activeFilter, setActiveFilter]   = useState('all');
   const [view, setView]                   = useState<'routes' | 'steps'>('routes');
   const [containerHeight, setContainerHeight] = useState(H);
@@ -1068,15 +1077,26 @@ export default function TransitContent({
     0.62
   );
 
-  const filteredRoutes = routes.filter(r => {
+  const filterRoutes = (list: any[], filter: string) => list.filter(r => {
     const types = r.segments.map((s: any) => s.type);
     const hasBus    = types.some((t: string) => t === 'bus' || t === 'lowfloor');
     const hasSubway = types.includes('subway');
-    if (activeFilter === 'bus')    return hasBus && !hasSubway;
-    if (activeFilter === 'subway') return hasSubway && !hasBus;
-    if (activeFilter === 'mixed')  return hasBus && hasSubway;
+    if (filter === 'bus')    return hasBus && !hasSubway;
+    if (filter === 'subway') return hasSubway && !hasBus;
+    if (filter === 'mixed')  return hasBus && hasSubway;
     return true;
   });
+
+  const filteredRoutes = filterRoutes(routes, activeFilter);
+
+  // 카테고리(전체/버스/지하철/버스+지하철) 탭을 누르면, 필터링만 하고 선택은
+  // 그대로 두던 예전 방식 대신 — 그 필터로 걸러진 목록의 1위 경로로 지도/선택을
+  // 즉시 맞춘다(선택돼있던 경로가 필터에서 빠져도 지도가 안 따라오는 문제 방지).
+  const applyFilter = (key: string) => {
+    setActiveFilter(key);
+    const next = filterRoutes(routes, key);
+    setSelectedRoute(next[0]?.id ?? '');
+  };
 
   const currentRoute = routes.find(r => r.id === selectedRoute);
 
@@ -1092,8 +1112,12 @@ export default function TransitContent({
             segments: currentRoute.mapSegments,
           }]
         : [],
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [currentRoute?.id]
+    // currentRoute.id는 "r0","r1"... 인덱스 기반이라 재검색해도 1위 후보 id가
+    // 그대로 "r0"인 경우가 많다 — id만 의존성으로 두면 좌표가 바뀐 새 경로인데도
+    // 지도가 재계산을 안 해서 이전 경로가 그대로 남아있는 버그가 있었다. routes가
+    // 새로 fetch될 때마다 배열/객체가 통째로 새로 만들어지므로, currentRoute
+    // 객체 자체를 의존성으로 둬서 내용이 바뀌면 항상 다시 그리게 한다.
+    [currentRoute]
   );
 
   // 실제 경사도 엔진(coordinates/routeSegments)을 NavigationScreen에 그대로 넘겨서
@@ -1256,24 +1280,21 @@ export default function TransitContent({
             <TouchableOpacity
               key={f.key}
               style={[ss.filterTab, activeFilter === f.key && ss.filterTabActive]}
-              onPress={() => setActiveFilter(f.key)}
+              onPress={() => applyFilter(f.key)}
             >
               <Text style={[ss.filterTabText, activeFilter === f.key && ss.filterTabTextActive]}>
                 {f.label}
               </Text>
             </TouchableOpacity>
           ))}
-          <TouchableOpacity style={ss.accessFilterTab}>
-            <Text style={ss.accessFilterText}>♿ 교통약자 우선</Text>
-          </TouchableOpacity>
         </ScrollView>
       </View>
 
       <RouteMapView
         routes={mapRoutes}
         selectedRouteId={currentRoute?.id ?? ''}
-        startLabel={startName}
-        endLabel={endName}
+        startLabel={mapStartLabel || startName}
+        endLabel={mapEndLabel || endName}
         showSlopeMarkers={showSlopeMarkers}
         onToggleSlopeMarkers={onToggleSlopeMarkers}
       />
@@ -1402,11 +1423,6 @@ const ss = StyleSheet.create({
   filterTabActive: { backgroundColor: C.primary, borderColor: C.primary },
   filterTabText: { fontSize: 12, color: C.textSub, fontWeight: '500' },
   filterTabTextActive: { color: C.white, fontWeight: '700' },
-  accessFilterTab: {
-    paddingHorizontal: 14, paddingVertical: 6, borderRadius: 20,
-    backgroundColor: C.primaryBg, borderWidth: 1.5, borderColor: C.primary,
-  },
-  accessFilterText: { fontSize: 12, color: C.primary, fontWeight: '700' },
 
   mapContainer: { flex: 1 },
   mapBg: { flex: 1, backgroundColor: '#E8EBF0', position: 'relative', overflow: 'hidden' },

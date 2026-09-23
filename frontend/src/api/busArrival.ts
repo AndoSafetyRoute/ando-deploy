@@ -11,6 +11,9 @@ export type BusArrivalItem = {
   congestion: string | null;   // "여유" | "보통" | "혼잡" | null
   arriving:   boolean;         // 곧 도착
   last_bus:   boolean;
+  // 이번에 실제로 오는 그 차량이 저상버스인지(busType 실시간 값). 정적 노선
+  // 보유율(/bus/lowfloor)과 달리 "이 차" 기준 — null이면 서버가 값을 못 받은 것.
+  is_lowfloor: boolean | null;
 };
 
 export type BusArrival = {

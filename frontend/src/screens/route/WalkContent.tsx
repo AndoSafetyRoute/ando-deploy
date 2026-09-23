@@ -232,6 +232,10 @@ export default function WalkContent({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [reloadKey, setReloadKey] = useState(0);
+  // 지도 위 출발/도착 라벨 — from/to(검색창 입력, 즉시 바뀜)와 분리해서 실제
+  // 경로 데이터(shown)가 갱신될 때만 같이 바뀌게 한다. TransitContent와 동일 이유.
+  const [mapStartLabel, setMapStartLabel] = useState('');
+  const [mapEndLabel, setMapEndLabel] = useState('');
 
   // 경로 선택 계측 세션(동의 시에만 생성 — 미동의면 전부 no-op).
   const collectRef = useRef<CollectSession | null>(null);
@@ -298,6 +302,8 @@ export default function WalkContent({
         if (alive) {
           setShown(s);
           setSelectedPos(0);
+          setMapStartLabel(startName || from);
+          setMapEndLabel(endName || to);
           setLoading(false);
         }
         return;
@@ -315,6 +321,8 @@ export default function WalkContent({
         const { shown: s } = buildComparison(res.candidateRoutes);
         setShown(s);
         setSelectedPos(0);
+        setMapStartLabel(startName || from);
+        setMapEndLabel(endName || to);
       } catch (e: any) {
         if (alive) setError(e?.message ?? '경로를 불러오지 못했습니다.');
       } finally {
@@ -437,8 +445,8 @@ export default function WalkContent({
       <RouteMapView
         routes={mapRoutes}
         selectedRouteId={selectedId}
-        startLabel={from}
-        endLabel={to}
+        startLabel={mapStartLabel || from}
+        endLabel={mapEndLabel || to}
         showSlopeMarkers={showSlopeMarkers}
         onToggleSlopeMarkers={onToggleSlopeMarkers}
       />

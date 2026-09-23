@@ -99,6 +99,19 @@ def _data_age_s(mk_tm: str | None) -> int | None:
     return None
 
 
+def _is_lowfloor(it: dict, n: int) -> bool | None:
+    """
+    실제로 지금 오는 그 차량이 저상버스인지 — 노선 단위 보유율(lowfloor_bus.py,
+    /bus/lowfloor)과 달리 "이 차" 기준의 실시간 값이다. 서울시 버스도착정보
+    조회 서비스 응답의 busType{n} 필드(0=일반, 1=저상)를 쓴다. 필드 자체가
+    없거나 파싱 불가면 모른다는 뜻으로 None을 돌려준다(잘못 단정하지 않는다).
+    """
+    raw = it.get(f"busType{n}")
+    if raw is None or str(raw).strip() == "":
+        return None
+    return _to_int(raw) == 1
+
+
 def _bus_slot(it: dict, n: int) -> dict | None:
     """n=1 또는 2 (다음차/다다음차). 유효 도착정보 없으면 None."""
     msg = (it.get(f"arrmsg{n}") or "").strip()
@@ -114,6 +127,7 @@ def _bus_slot(it: dict, n: int) -> dict | None:
         "congestion":  _CONGESTION.get(_to_int(it.get(f"full{n}")), None),
         "arriving":    str(it.get(f"isArrive{n}", "0")) == "1",
         "last_bus":    str(it.get(f"isLast{n}", "0")) == "1",
+        "is_lowfloor": _is_lowfloor(it, n),
     }
 
 

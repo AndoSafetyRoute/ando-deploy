@@ -75,13 +75,14 @@ export default function BusArrivalBadge({ routeName, stopName, arsId, walkRemain
   return (
     <View style={ss.wrap}>
       <TouchableOpacity
-        style={[ss.pill, data.will_miss ? ss.pillWarn : ss.pillOk]}
+        style={[ss.pill, data.will_miss ? ss.pillWarn : (b0.is_lowfloor ? ss.pillLowfloor : ss.pillOk)]}
         activeOpacity={0.7}
         onPress={load}
         accessibilityLabel="버스 도착정보 새로고침"
       >
         <View style={[ss.dot, { backgroundColor: data.will_miss ? C.danger : C.success }]} />
         <Text style={[ss.pillText, data.will_miss && { color: C.danger }]}>
+          {b0.is_lowfloor ? "♿ 저상 · " : ""}
           실시간 · 다음 버스 {eta}
           {b0.congestion ? ` · ${b0.congestion}` : ""}
           {b0.last_bus ? " · 막차" : ""}
@@ -95,7 +96,10 @@ export default function BusArrivalBadge({ routeName, stopName, arsId, walkRemain
         <Text style={ss.tightText}>여유 {Math.max(0, Math.round(data.margin_s / 60))}분 — 서두르면 탈 수 있어요</Text>
       )}
       {b1live != null && (
-        <Text style={ss.subText}>다다음 {fmtEta(b1live, data.buses[1].arriving || b1live <= 0)}</Text>
+        <Text style={ss.subText}>
+          {data.buses[1].is_lowfloor ? "♿ 저상 · " : ""}
+          다다음 {fmtEta(b1live, data.buses[1].arriving || b1live <= 0)}
+        </Text>
       )}
       {stale && <Text style={ss.subText}>{Math.round(((data.data_age_s ?? 0) + elapsedS) / 60)}분 전 기준 · 눌러서 새로고침</Text>}
     </View>
@@ -108,8 +112,9 @@ const ss = StyleSheet.create({
     flexDirection: "row", alignItems: "center", alignSelf: "flex-start",
     paddingVertical: 4, paddingHorizontal: 9, borderRadius: 11, borderWidth: 1,
   },
-  pillOk:   { backgroundColor: C.busBg, borderColor: C.bus + "55" },
-  pillWarn: { backgroundColor: "#FFECEC", borderColor: C.danger + "55" },
+  pillOk:       { backgroundColor: C.busBg, borderColor: C.bus + "55" },
+  pillLowfloor: { backgroundColor: C.lowFloor + "22", borderColor: C.lowFloor + "77" },
+  pillWarn:     { backgroundColor: "#FFECEC", borderColor: C.danger + "55" },
   dot: { width: 6, height: 6, borderRadius: 3, marginRight: 6 },
   pillText: { fontSize: 11.5, fontWeight: "700", color: C.bus },
   refreshIcon: { fontSize: 11, fontWeight: "700", color: C.bus, opacity: 0.7 },
