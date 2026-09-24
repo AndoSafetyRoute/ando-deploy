@@ -19,7 +19,7 @@ import RouteMapView, { MapCoordinate } from './RouteMapView';
 import { useDraggableSheet } from './useDraggableSheet';
 import BusArrivalBadge from '../../components/BusArrivalBadge';
 import SubwayArrivalBadge from '../../components/SubwayArrivalBadge';
-import { stationNameOf } from '../../utils/stationName';
+import { stationNameOf, sameStation } from '../../utils/stationName';
 
 const { height: H } = Dimensions.get('window');
 
@@ -261,12 +261,13 @@ async function computeWalkLeg(
   cache: LegCache,
   light: boolean,
   endStationName?: string,
+  startStationName?: string,
 ): Promise<WalkLeg> {
-  const key = `${legCacheKey(fromLat, fromLng, toLat, toLng, apiUserType, light)}|${endStationName ?? ''}`;
+  const key = `${legCacheKey(fromLat, fromLng, toLat, toLng, apiUserType, light)}|${startStationName ?? ''}|${endStationName ?? ''}`;
   const cached = cache.get(key);
   if (cached) return cached;
 
-  const promise = computeWalkLegUncached(fromLat, fromLng, toLat, toLng, apiUserType, limit, light, endStationName);
+  const promise = computeWalkLegUncached(fromLat, fromLng, toLat, toLng, apiUserType, limit, light, endStationName, startStationName);
   cache.set(key, promise);
   return promise;
 }
@@ -278,6 +279,7 @@ async function computeWalkLegUncached(
   limit: Limiter,
   light: boolean,
   endStationName?: string,
+  startStationName?: string,
 ): Promise<WalkLeg> {
   const straightM = haversineMeters(Number(fromLat), Number(fromLng), Number(toLat), Number(toLng));
 
@@ -296,6 +298,7 @@ async function computeWalkLegUncached(
       userType: apiUserType,
       light,
       endStationName,
+      startStationName,
     }));
     const bestRoute = res?.routes?.[0] ?? null;
     // navigation_segments(구간 색상)/waypoints(음성안내)/measurement_units(GPS 실측
@@ -309,6 +312,7 @@ async function computeWalkLegUncached(
           measurement_units:   res?.measurement_units,
           // 도착지가 역이면 서버가 고른 보행약자용 출구(역·출구번호·문구)
           stationExit:         res?.stationExit,
+          startStationExit:    res?.startStationExit,
         }
       : null;
     const distanceM = best ? Number(best.totalDistance) : null;
@@ -342,13 +346,14 @@ type SubwayExitCache = Map<string, Promise<SubwayBestExit | null>>;
 
 function computeSubwayExit(
   station: string, apiUserType: string, lat: number, lon: number,
+  direction: 'entering' | 'exiting',
   cache: SubwayExitCache,
 ): Promise<SubwayBestExit | null> {
-  const key = `${station}:${apiUserType}`;
+  const key = `${station}:${apiUserType}:${direction}`;
   const cached = cache.get(key);
   if (cached) return cached;
 
-  const promise = requestSubwayBestExit(station, apiUserType, lat, lon);
+  const promise = requestSubwayBestExit(station, apiUserType, lat, lon, direction);
   cache.set(key, promise);
   return promise;
 }
@@ -358,8 +363,7 @@ function computeSubwayExit(
 function applyBestExit(step: any, exit: SubwayBestExit) {
   if (!step) return;
   const icon = exit.type === 'elevator' ? '🛗' : exit.type === 'escalator' ? '🔼' : '🦼';
-  step.accessibility = [{ type: exit.type, text: exit.message, icon }];
-  step.detail = exit.message;
+  step.accessibility = [{ type: exit.type, text: exit.message, icon, exit: true }];
 }
 
 // 전동휠체어 충전소 조회 캐시 — 여러 후보 경로가 같은 역을 공유할 때
@@ -385,14 +389,39 @@ function applyChargerInfo(step: any, chargers: StationCharger[]) {
   ];
 }
 
-// 상세 안내 상단 문구. 목적지가 역이면 보행약자용 출구 안내, 일반 장소면 도보 안내 원칙.
-function destExitNote(exit: any): string {
-  if (exit?.station && exit?.exitNo) {
-    const labels: Record<string, string> = { elevator: '엘리베이터', escalator: '에스컬레이터' };
-    const fac = (exit.facilities ?? []).map((f: string) => labels[f] ?? f).join('·');
-    return `${exit.station} ${exit.exitNo}번 출구${fac ? `(${fac})` : ''}로 안내합니다.`;
-  }
-  return '도보 구간은 계단을 피하고 경사가 완만한 길로 안내합니다.';
+type ExitInfo = { station: string; exitNo: string; facilities: string[]; message: string; lat?: number; lon?: number };
+
+const FACILITY_LABELS: Record<string, string> = { elevator: '엘리베이터', escalator: '에스컬레이터', lift: '휠체어리프트' };
+
+// /subway/best-exit 응답 → 공통 출구 정보
+function bestExitToInfo(exit: SubwayBestExit | null): ExitInfo | null {
+  if (!exit) return null;
+  return {
+    station: exit.station ?? '',
+    exitNo: exit.exit_no,
+    facilities: exit.facilities ?? [exit.type],
+    message: exit.message,
+    lat: exit.lat, lon: exit.lon,
+  };
+}
+
+// 출구 행(접힘과 무관하게 항상 표시)
+function exitAccessRow(exit: ExitInfo) {
+  const hasElev = (exit.facilities ?? []).includes('elevator');
+  return { type: hasElev ? 'elevator' : 'escalator', text: exit.message, icon: hasElev ? '🛗' : '🔼', exit: true };
+}
+
+function exitPhrase(exit: ExitInfo): string {
+  const fac = (exit.facilities ?? []).map((f) => FACILITY_LABELS[f] ?? f).join('·');
+  return `${exit.station} ${exit.exitNo}번 출구${fac ? `(${fac})` : ''}`;
+}
+
+// 상세 안내 상단 문구. 출발/도착이 역이면 보행약자용 출구 안내, 둘 다 아니면 도보 안내 원칙.
+function destExitNote(destExit: ExitInfo | null, startExit: ExitInfo | null = null): string {
+  const lines: string[] = [];
+  if (startExit?.station && startExit?.exitNo) lines.push(`출발: ${exitPhrase(startExit)}로 안내합니다.`);
+  if (destExit?.station && destExit?.exitNo) lines.push(`${startExit ? '도착: ' : ''}${exitPhrase(destExit)}로 안내합니다.`);
+  return lines.length ? lines.join('\n') : '도보 구간은 계단을 피하고 경사가 완만한 길로 안내합니다.';
 }
 
 function makeWalkStep(id: string, leg: WalkLeg, title: string, isDestination: boolean) {
@@ -454,61 +483,74 @@ async function convertKakaoRoute(
 
   const walkTasks: Promise<void>[] = [];
 
+  // 출발지/도착지가 역일 때의 출구 안내.
+  //  - 출발역에서 바로 지하철을 타면(출발역 = 첫 탑승역): 그 역에 "들어가는" 출구까지가 승차 전 도보
+  //  - 도착역에서 지하철을 내리면(도착역 = 마지막 하차역): 그 역에서 "나오는" 출구까지가 하차 후 도보
+  //  - 그 외(버스로 가거나 다른 역에서 타고 내림): 도보 구간을 서버가 출발/도착 역 출구로 맞춘다
+  //    (start/end_station_name → startStationExit/stationExit)
   // light: true — 아직 선택 안 된 후보 경로 단계라 GPS 안내용 waypoints는
   // 필요 없다(거리/시간/경사 zone만 있으면 목록·미리보기 지도에 충분). 실제로
   // 이 경로를 선택해 안내를 시작하면 handleStartNavigation에서 선택된 leg만
   // light:false로 다시 조회해 waypoints를 채운다.
-  if (firstPoint && origin.lat && origin.lng) {
-    walkTasks.push(
-      computeWalkLeg(origin.lat, origin.lng, String(firstPoint[1]), String(firstPoint[0]), apiUserType, limit, legCache, true)
-        .then(leg => { preWalkLeg = leg; })
-    );
-  }
-  if (lastPoint && destination.lat && destination.lng) {
-    walkTasks.push(
-      computeWalkLeg(String(lastPoint[1]), String(lastPoint[0]), destination.lat, destination.lng, apiUserType, limit, legCache, true,
-        stationNameOf(destination.name))
-        .then(leg => { postWalkLeg = leg; })
-    );
-  }
-
-  // 실제 승/하차 지점(도보 구간과 맞닿는 곳)이 지하철역이면, 그 지점 기준
-  // 최적 출구(엘리베이터/에스컬레이터)를 백엔드에서 조회해 답사 하드코딩보다 우선 사용한다.
-  // 중간 환승역은 대상에서 제외 — 실제 도보 이동이 발생하는 첫/마지막 역만 사용자 편의에 직결된다.
   const firstStep = steps[0];
   const lastStep  = steps[steps.length - 1];
+  const originStation = stationNameOf(origin.name);
+  const destStation   = stationNameOf(destination.name);
+  const boardStation  = firstStep?.properties.type === 'SUBWAY' ? firstStep.properties.stops?.[0]?.name : undefined;
+  const alightStops   = lastStep?.properties.type === 'SUBWAY' ? lastStep.properties.stops : undefined;
+  const alightStation = alightStops?.[alightStops.length - 1]?.name;
+  const originIsBoard = sameStation(originStation, boardStation);
+  const destIsAlight  = sameStation(destStation, alightStation);
 
-  if (firstStep?.properties.type === 'SUBWAY' && origin.lat && origin.lng) {
-    const stationName = firstStep.properties.stops?.[0]?.name;
-    if (stationName) {
-      walkTasks.push(
-        computeSubwayExit(stationName, apiUserType, Number(origin.lat), Number(origin.lng), subwayCache)
-          .then(exit => { if (exit) applyBestExit(uiSteps[0], exit); })
-      );
-      if (apiUserType === 'electric_wheelchair') {
-        walkTasks.push(
-          computeStationChargers(stationName, chargerCache)
-            .then(chargers => { if (chargers) applyChargerInfo(uiSteps[0], chargers); })
-        );
-      }
+  // 실제 승/하차 지점이 지하철역이면 최적 출구를 백엔드에서 조회해 답사 하드코딩보다 우선.
+  // 중간 환승역은 대상에서 제외 — 실제 도보 이동이 발생하는 첫/마지막 역만 사용자 편의에 직결된다.
+  const boardExitP: Promise<SubwayBestExit | null> = boardStation && origin.lat && origin.lng
+    ? computeSubwayExit(boardStation, apiUserType, Number(origin.lat), Number(origin.lng), 'entering', subwayCache)
+    : Promise.resolve(null);
+  const alightExitP: Promise<SubwayBestExit | null> = alightStation && destination.lat && destination.lng
+    ? computeSubwayExit(alightStation, apiUserType, Number(destination.lat), Number(destination.lng), 'exiting', subwayCache)
+    : Promise.resolve(null);
+  let boardExit: SubwayBestExit | null = null;
+  let alightExit: SubwayBestExit | null = null;
+  const lastRideIdx = uiSteps.length - 1;
+  walkTasks.push(boardExitP.then(exit => { boardExit = exit; if (exit) applyBestExit(uiSteps[0], exit); }));
+  walkTasks.push(alightExitP.then(exit => { alightExit = exit; if (exit) applyBestExit(uiSteps[lastRideIdx], exit); }));
+  if (apiUserType === 'electric_wheelchair') {
+    if (boardStation) {
+      walkTasks.push(computeStationChargers(boardStation, chargerCache)
+        .then(chargers => { if (chargers) applyChargerInfo(uiSteps[0], chargers); }));
+    }
+    if (alightStation) {
+      walkTasks.push(computeStationChargers(alightStation, chargerCache)
+        .then(chargers => { if (chargers) applyChargerInfo(uiSteps[lastRideIdx], chargers); }));
     }
   }
-  if (lastStep?.properties.type === 'SUBWAY' && destination.lat && destination.lng) {
-    const stops = lastStep.properties.stops;
-    const stationName = stops?.[stops.length - 1]?.name;
-    if (stationName) {
-      const idx = uiSteps.length - 1;
-      walkTasks.push(
-        computeSubwayExit(stationName, apiUserType, Number(destination.lat), Number(destination.lng), subwayCache)
-          .then(exit => { if (exit) applyBestExit(uiSteps[idx], exit); })
-      );
-      if (apiUserType === 'electric_wheelchair') {
-        walkTasks.push(
-          computeStationChargers(stationName, chargerCache)
-            .then(chargers => { if (chargers) applyChargerInfo(uiSteps[idx], chargers); })
-        );
+
+  if (firstPoint && origin.lat && origin.lng) {
+    walkTasks.push((async () => {
+      if (originIsBoard) {
+        // 출발지(역) → 그 역으로 들어가는 출구. 출구를 못 찾으면 기존처럼 승차 지점까지.
+        const ex = await boardExitP;
+        const [tLat, tLng] = ex ? [String(ex.lat), String(ex.lon)] : [String(firstPoint[1]), String(firstPoint[0])];
+        preWalkLeg = await computeWalkLeg(origin.lat!, origin.lng!, tLat, tLng, apiUserType, limit, legCache, true);
+      } else {
+        preWalkLeg = await computeWalkLeg(origin.lat!, origin.lng!, String(firstPoint[1]), String(firstPoint[0]),
+          apiUserType, limit, legCache, true, undefined, originStation);
       }
-    }
+    })());
+  }
+  if (lastPoint && destination.lat && destination.lng) {
+    walkTasks.push((async () => {
+      if (destIsAlight) {
+        // 하차 지점 → 그 역에서 나오는 출구. 출구를 못 찾으면 기존처럼 목적지 좌표까지.
+        const ex = await alightExitP;
+        const [tLat, tLng] = ex ? [String(ex.lat), String(ex.lon)] : [destination.lat!, destination.lng!];
+        postWalkLeg = await computeWalkLeg(String(lastPoint[1]), String(lastPoint[0]), tLat, tLng, apiUserType, limit, legCache, true);
+      } else {
+        postWalkLeg = await computeWalkLeg(String(lastPoint[1]), String(lastPoint[0]), destination.lat!, destination.lng!,
+          apiUserType, limit, legCache, true, destStation);
+      }
+    })());
   }
 
   // 카카오가 준 환승/역 도보 스텝(승하차 지점과 무관한, 경로 중간의 WALKING
@@ -603,6 +645,14 @@ async function convertKakaoRoute(
     }
   }
 
+  // 출발/도착이 역이면 그 출구를 출발 칸·도착 칸에 항상 보이게 표시한다.
+  const destExit: ExitInfo | null = destIsAlight
+    ? bestExitToInfo(alightExit)
+    : ((postWalkLeg as WalkLeg | null)?.serverRoute?.stationExit ?? null);
+  const startExit: ExitInfo | null = originIsBoard
+    ? bestExitToInfo(boardExit)
+    : ((preWalkLeg as WalkLeg | null)?.serverRoute?.startStationExit ?? null);
+
   // 마지막 카카오 스텝이 목적지 도착으로 잘못 표시되지 않도록,
   // 도보 구간이 뒤에 붙으면 isDestination 플래그를 옮긴다.
   if (postWalkLeg && uiSteps.length > 0) {
@@ -610,17 +660,14 @@ async function convertKakaoRoute(
   }
 
   if (preWalkLeg) {
-    uiSteps.unshift(makeWalkStep('walk-pre', preWalkLeg, `${origin.name ?? '출발지'}에서 승차 지점까지 이동`, false));
+    const preStep: any = makeWalkStep('walk-pre', preWalkLeg, `${origin.name ?? '출발지'}에서 승차 지점까지 이동`, false);
+    if (startExit?.message) preStep.accessibility = [exitAccessRow(startExit)];
+    uiSteps.unshift(preStep);
     segments.unshift(makeWalkSegment(preWalkLeg));
   }
-  // 목적지가 역이면 하차 후 도보가 보행약자용 출구에서 끝난다 — 그 출구를 도착 칸에 표시
-  const destExit = (postWalkLeg as WalkLeg | null)?.serverRoute?.stationExit ?? null;
   if (postWalkLeg) {
     const destStep: any = makeWalkStep('walk-post', postWalkLeg, `${destination.name ?? '목적지'} 도착`, true);
-    if (destExit?.message) {
-      const hasElev = (destExit.facilities ?? []).includes('elevator');
-      destStep.accessibility = [{ type: hasElev ? 'elevator' : 'escalator', text: destExit.message, icon: hasElev ? '🛗' : '🔼' }];
-    }
+    if (destExit?.message) destStep.accessibility = [exitAccessRow(destExit)];
     uiSteps.push(destStep);
     segments.push(makeWalkSegment(postWalkLeg));
   }
@@ -666,7 +713,7 @@ async function convertKakaoRoute(
     depTime: formatClock(now),
     arrTime: formatClock(arr),
     accessible: hasKnownAccessibleLeg,
-    accessNote: destExitNote(destExit),
+    accessNote: destExitNote(destExit, startExit),
     segments,
     steps: uiSteps,
     // NavigationScreen에 그대로 넘겨서 실제 GPS+경사도 안내를 태울 원본 도보 경로
@@ -680,17 +727,27 @@ async function convertKakaoRoute(
     alightStationName,
     // 목적지가 역일 때 안내 화면 상단에 띄울 출구 문구
     stationExitMessage: destExit?.message as string | undefined,
+    startExitMessage: startExit?.message as string | undefined,
+    // 지도 출발/도착 라벨 — 역이면 "숙대입구역 10번 출구"
+    startExitLabel: startExit ? `${startExit.station} ${startExit.exitNo}번 출구` : undefined,
+    originIsBoard,
+    destIsAlight,
+    endExitLabel: destExit ? `${destExit.station} ${destExit.exitNo}번 출구` : undefined,
     // 미리보기 지도용 — 도보(경사도 zone 색)/탑승(노선 색) 구간별 색상 폴리라인
     mapSegments,
     // NavigationScreen 상단 여정 스테퍼용 — 전체 여정 요약
     journeySteps,
     // 지도 표시용: 각 스텝의 실제 좌표 경로 (도보 구간은 아직 직선; 지도에서 폴리라인으로 사용)
     mapPath: {
-      preWalk: preWalkLeg && origin.lat && origin.lng && firstPoint
+      preWalk: (preWalkLeg as WalkLeg | null)?.serverRoute?.coordinates?.length
+        ? (preWalkLeg as WalkLeg | null)!.serverRoute.coordinates
+        : preWalkLeg && origin.lat && origin.lng && firstPoint
         ? [[Number(origin.lng), Number(origin.lat)], firstPoint]
         : null,
       transit: steps.flatMap(s => s.path?.points ?? []),
-      postWalk: postWalkLeg && destination.lat && destination.lng && lastPoint
+      postWalk: (postWalkLeg as WalkLeg | null)?.serverRoute?.coordinates?.length
+        ? (postWalkLeg as WalkLeg | null)!.serverRoute.coordinates
+        : postWalkLeg && destination.lat && destination.lng && lastPoint
         ? [lastPoint, [Number(destination.lng), Number(destination.lat)]]
         : null,
     },
@@ -793,6 +850,12 @@ const StepItem = ({ step, isLast }: { step: any; isLast: boolean }) => {
             {hasDetail && <Text style={ss.stepExpandIcon}>{expanded ? '▲' : '▼'}</Text>}
           </View>
         </TouchableOpacity>
+        {/* 보행약자용 출구 안내는 접지 않고 항상 보여준다 */}
+        {step.accessibility?.some((a: any) => a.exit) && (
+          <View style={ss.stepExpanded}>
+            {step.accessibility.filter((a: any) => a.exit).map((a: any, i: number) => <AccessRow key={`x${i}`} item={a} />)}
+          </View>
+        )}
         {expanded && (
           <View style={ss.stepExpanded}>
             {step.detail && (
@@ -801,7 +864,7 @@ const StepItem = ({ step, isLast }: { step: any; isLast: boolean }) => {
                 <Text style={ss.detailText}>{step.detail}</Text>
               </View>
             )}
-            {step.accessibility?.map((a: any, i: number) => <AccessRow key={i} item={a} />)}
+            {step.accessibility?.filter((a: any) => !a.exit).map((a: any, i: number) => <AccessRow key={i} item={a} />)}
             {step.facilities?.length > 0 && (
               <View style={ss.facilitiesRow}>
                 {step.facilities.map((f: any, i: number) => <FacilityBadge key={i} item={f} />)}
@@ -1123,7 +1186,8 @@ export default function TransitContent({
         refetchTasks.push(
           computeWalkLegUncached(
             startLatitude, startLongitude, String(boardPt[1]), String(boardPt[0]),
-            apiUserType, fullLimit, false,
+            apiUserType, fullLimit, false, undefined,
+            currentRoute.startExitMessage && !currentRoute.originIsBoard ? stationNameOf(startName) : undefined,
           ).then(leg => { if (leg.serverRoute) preWalkRoute = leg.serverRoute; })
         );
       }
@@ -1133,8 +1197,13 @@ export default function TransitContent({
       if (alightPt) {
         refetchTasks.push(
           computeWalkLegUncached(
-            String(alightPt[1]), String(alightPt[0]), endLatitude, endLongitude,
-            apiUserType, fullLimit, false, stationNameOf(endName),
+            String(alightPt[1]), String(alightPt[0]),
+            ...(currentRoute.destIsAlight && postWalkRoute.coordinates?.length
+              ? [String(postWalkRoute.coordinates[postWalkRoute.coordinates.length - 1][1]),
+                 String(postWalkRoute.coordinates[postWalkRoute.coordinates.length - 1][0])] as [string, string]
+              : [endLatitude, endLongitude] as [string, string]),
+            apiUserType, fullLimit, false,
+            currentRoute.destIsAlight ? undefined : stationNameOf(endName),
           ).then(leg => { if (leg.serverRoute) postWalkRoute = leg.serverRoute; })
         );
       }
@@ -1210,6 +1279,7 @@ export default function TransitContent({
       journeyMapSegments: journeyMapSegmentsJson,
       finalDestinationName: endName,
       finalOriginName: startName,
+      ...(currentRoute.startExitMessage ? { startExitMessage: currentRoute.startExitMessage } : {}),
       ...(postWalkParams ? {
         transitNextLeg: JSON.stringify({
           ridingGuidance: currentRoute.ridingGuidance,
@@ -1270,8 +1340,8 @@ export default function TransitContent({
       <RouteMapView
         routes={mapRoutes}
         selectedRouteId={currentRoute?.id ?? ''}
-        startLabel={mapStartLabel || startName}
-        endLabel={mapEndLabel || endName}
+        startLabel={currentRoute?.startExitLabel || mapStartLabel || startName}
+        endLabel={currentRoute?.endExitLabel || mapEndLabel || endName}
         showSlopeMarkers={showSlopeMarkers}
         onToggleSlopeMarkers={onToggleSlopeMarkers}
       />

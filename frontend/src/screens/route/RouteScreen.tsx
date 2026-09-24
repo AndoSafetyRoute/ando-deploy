@@ -385,6 +385,7 @@ export default function RouteScreen({ navigation, route }: Props) {
         endLongitude: swapped.endLongitude!,
         userType: walkerType,
         endStationName: swapped.endName,
+        startStationName: swapped.startName,
       });
       setParsedRouteData(routeResult);
     } catch (error) {
@@ -424,6 +425,7 @@ export default function RouteScreen({ navigation, route }: Props) {
         endLongitude: next.endLongitude!,
         userType: walkerType,
         endStationName: next.endName,
+        startStationName: next.startName,
       });
       setParsedRouteData(routeResult);
     } catch (error) {
@@ -545,6 +547,7 @@ export default function RouteScreen({ navigation, route }: Props) {
         endLongitude: endpoints.endLongitude!,
         userType: nextType,
         endStationName: endpoints.endName,
+        startStationName: endpoints.startName,
       });
 
       setParsedRouteData(routeResult);

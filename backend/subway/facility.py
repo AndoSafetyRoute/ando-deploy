@@ -777,7 +777,7 @@ class SubwayFacilityDB:
         best = self._nearest(candidates, user_lat, user_lon)
         if not best:
             return None
-        return {**best, **describe_exit(station_name, best, candidates)}
+        return {**best, **describe_exit(station_name, best, candidates, direction)}
 
     def station_summary(self, station_name: str) -> dict:
         """역 시설 현황 요약 (디버그·FE 참고용)"""
@@ -797,12 +797,14 @@ _db: SubwayFacilityDB | None = None
 _FACILITY_LABEL = {"elevator": "엘리베이터", "escalator": "에스컬레이터", "lift": "휠체어리프트"}
 
 
-def describe_exit(station_name: str, best: dict, candidates: list[dict]) -> dict:
+def describe_exit(station_name: str, best: dict, candidates: list[dict],
+                  direction: str = "entering") -> dict:
     """
     고른 출구(best) → FE 표시용 정보. 같은 출구번호에 엘리베이터·에스컬레이터가
     함께 있으면(후보 안에서) 둘 다 알려준다.
       { station:"숙대입구역", exit_no:"10", facilities:["elevator"],
         message:"숙대입구역 10번 출구 엘리베이터를 이용하세요." }
+    direction="exiting"(역에서 나옴)이면 "…엘리베이터로 나오세요."
     """
     exit_no = best["exit_no"]
     types = []
@@ -819,7 +821,9 @@ def describe_exit(station_name: str, best: dict, candidates: list[dict]) -> dict
         "station":    station,
         "exit_no":    exit_no,
         "facilities": types,
-        "message":    f"{station} {exit_no}번 출구 {label}를 이용하세요.",
+        "direction":  direction,
+        "message":    (f"{station} {exit_no}번 출구 {label}로 나오세요." if direction == "exiting"
+                       else f"{station} {exit_no}번 출구 {label}를 이용하세요."),
     }
 
 

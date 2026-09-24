@@ -74,6 +74,8 @@ export type RouteRequest = {
   userType?: string;
   // 목적지가 지하철역이면 역 이름을 같이 보냄. 예: "서울역", "삼각지"
   endStationName?: string;
+  // 출발지가 지하철역이면 역 이름 — 서버가 역에서 나오는 보행약자용 출구로 출발점 이동
+  startStationName?: string;
   // true면 서버가 navigation_segments/waypoints(GPS 안내용) 생성을 생략하고
   // 거리/시간/경사만 반환 — 아직 사용자가 선택하지 않은 후보 경로들의 도보
   // 구간을 대량으로 미리 조회할 때(대중교통 탭) 써서 응답을 빠르게 한다.
@@ -87,6 +89,7 @@ export async function requestRoute({
   endLongitude,
   userType = "manual_wheelchair",
   endStationName,
+  startStationName,
 }: RouteRequest) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 60_000);
@@ -110,8 +113,9 @@ export async function requestRoute({
       },
       body: JSON.stringify({
         origin_lat, origin_lon, dest_lat, dest_lon, user_type,
-        // 이름에 "역"이 있을 때만 역으로 보고 보낸다(서버가 보행약자용 출구로 도착지 이동)
+        // 이름에 "역"/"N호선"이 있을 때만 역으로 보고 보낸다(서버가 보행약자용 출구로 이동)
         end_station_name: stationNameOf(endStationName),
+        start_station_name: stationNameOf(startStationName),
       }),
       signal: controller.signal,
     });
@@ -145,6 +149,7 @@ export async function requestWalkLeg({
   userType = "manual_wheelchair",
   light = false,
   endStationName,
+  startStationName,
 }: RouteRequest) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 60_000);
@@ -164,6 +169,7 @@ export async function requestWalkLeg({
         light,
         // 하차 후 도보의 도착지가 역이면 보행약자용 출구까지 안내(stationExit 응답)
         end_station_name: stationNameOf(endStationName),
+        start_station_name: stationNameOf(startStationName),
       }),
       signal: controller.signal,
     });
@@ -186,6 +192,8 @@ export type SubwayBestExit = {
   serial?:   string;
   direction?: string;
   message:   string;
+  station?:  string;
+  facilities?: string[];
 };
 
 // 대중교통 탭 승/하차역 접근성 조회. 백엔드 데이터가 없거나 요청 실패 시
@@ -195,6 +203,7 @@ export async function requestSubwayBestExit(
   userType: string,
   lat: number,
   lon: number,
+  direction: 'entering' | 'exiting' = 'exiting',
 ): Promise<SubwayBestExit | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 8_000);
@@ -202,7 +211,7 @@ export async function requestSubwayBestExit(
   try {
     const params = new URLSearchParams({
       station, user_type: userType,
-      lat: String(lat), lon: String(lon),
+      lat: String(lat), lon: String(lon), direction,
     });
     const response = await fetch(`${API_BASE_URL}/subway/best-exit?${params.toString()}`, {
       signal: controller.signal,

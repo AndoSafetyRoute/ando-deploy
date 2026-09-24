@@ -155,6 +155,8 @@ interface Props {
       finalDestinationName?: string;
       // 도보 탭: 도착지가 역이면 서버가 고른 보행약자용 출구 문구
       stationExitMessage?: string;
+      // 출발지가 역이면 역에서 나오는(대중교통 첫 탑승역이면 들어가는) 출구 문구
+      startExitMessage?: string;
       // 대중교통 모드 전용: 사용자가 입력한 진짜 출발지. "from"은 도보2 구간
       // 등에서 하차/환승 지점일 수 있어 진짜 출발지와 다를 수 있다.
       finalOriginName?: string;
@@ -762,6 +764,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
   // 목적지로 취급한다.
   const finalDestinationName = route?.params?.finalDestinationName || to;
   const stationExitMessage = route?.params?.stationExitMessage;
+  const startExitMessage = route?.params?.startExitMessage;
   const finalOriginName = route?.params?.finalOriginName || from;
 
   useEffect(() => {
@@ -2116,8 +2119,11 @@ export default function NavigationScreen({ navigation, route }: Props) {
         <View style={ss.titleBox}>
           <Text style={ss.title}>{cfg.icon} {cfg.label}</Text>
           <Text style={ss.subTitle} numberOfLines={1}>{from} → {finalDestinationName}</Text>
+          {!!startExitMessage && (
+            <Text style={ss.legContext} numberOfLines={1}>🛗 출발: {startExitMessage}</Text>
+          )}
           {!!stationExitMessage && (
-            <Text style={ss.legContext} numberOfLines={1}>🛗 {stationExitMessage}</Text>
+            <Text style={ss.legContext} numberOfLines={1}>🛗 {startExitMessage ? '도착: ' : ''}{stationExitMessage}</Text>
           )}
           {finalDestinationName !== to && (
             <Text style={ss.legContext} numberOfLines={1}>

@@ -33,7 +33,8 @@ export type RouteCompareResponse = {
   coordinates?:   [number, number][];
   routeSegments?: any[];
   candidateRoutes: CandidateRoute[];
-  stationExit?:   StationExit;
+  stationExit?:   StationExit;          // 도착역 출구
+  startStationExit?: StationExit;       // 출발역 출구(역에서 나옴)
 };
 
 export async function requestRouteCandidates(params: {
@@ -43,6 +44,7 @@ export async function requestRouteCandidates(params: {
   endLongitude:   string | number;
   userType?:      string;
   endStationName?: string;
+  startStationName?: string;
 }): Promise<RouteCompareResponse> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30_000);
@@ -66,6 +68,7 @@ export async function requestRouteCandidates(params: {
 
         // 목적지가 지하철역이면 접근 가능한 출구로 스냅하기 위해 전달
         end_station_name: stationNameOf(params.endStationName),
+        start_station_name: stationNameOf(params.startStationName),
       }),
       signal: controller.signal,
     });

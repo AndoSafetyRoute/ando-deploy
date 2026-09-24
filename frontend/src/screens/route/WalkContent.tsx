@@ -238,6 +238,8 @@ export default function WalkContent({
   const [mapEndLabel, setMapEndLabel] = useState('');
   // 도착지가 역이면 서버가 고른 보행약자용 출구(엘리베이터/에스컬레이터)
   const [stationExit, setStationExit] = useState<StationExit | null>(null);
+  // 출발지가 역이면 역에서 나오는 보행약자용 출구
+  const [startExit, setStartExit] = useState<StationExit | null>(null);
 
   // 경로 선택 계측 세션(동의 시에만 생성 — 미동의면 전부 no-op).
   const collectRef = useRef<CollectSession | null>(null);
@@ -319,13 +321,19 @@ export default function WalkContent({
           endLongitude: endLongitude!,
           userType: walkerType || 'manual_wheelchair',
           endStationName: endName,
+          startStationName: startName,
         });
         if (!alive) return;
         const { shown: s } = buildComparison(res.candidateRoutes);
         setShown(s);
         setSelectedPos(0);
         setStationExit(res.stationExit ?? null);
-        setMapStartLabel(startName || from);
+        setStartExit(res.startStationExit ?? null);
+        setMapStartLabel(
+          res.startStationExit
+            ? `${res.startStationExit.station} ${res.startStationExit.exitNo}번 출구`
+            : startName || from
+        );
         setMapEndLabel(
           res.stationExit
             ? `${res.stationExit.station} ${res.stationExit.exitNo}번 출구`
@@ -424,6 +432,7 @@ export default function WalkContent({
       collectSessionId: sessionId,
       // 도착지가 역일 때 안내 화면 상단에 출구 문구를 띄운다
       ...(stationExit ? { stationExitMessage: stationExit.message } : {}),
+      ...(startExit ? { startExitMessage: startExit.message } : {}),
 
       routeData: JSON.stringify({
         coordinates: selectedCand.route.coordinates,
@@ -474,6 +483,19 @@ export default function WalkContent({
             <Text style={ss.sheetExpandIcon}>{sheetExpanded ? '▼' : '▲'}</Text>
           </View>
         </View>
+
+        {!!startExit && !loading && (
+          <View style={ss.exitBanner}>
+            <Text style={ss.exitBannerIcon}>
+              {startExit.facilities.includes('elevator') ? '🛗' : '🔼'}
+            </Text>
+            <Text style={ss.exitBannerText}>
+              {startExit.message}
+              {'\n'}
+              <Text style={ss.exitBannerSub}>경로는 이 출구에서 출발해요.</Text>
+            </Text>
+          </View>
+        )}
 
         {!!stationExit && !loading && (
           <View style={ss.exitBanner}>

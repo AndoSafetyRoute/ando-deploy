@@ -1331,6 +1331,8 @@ class RouteRequest(BaseModel):
     # 목적지가 지하철역이면 역명을 함께 보냄 — 있으면 해당 역의 유형별 최적 출구
     # (엘리베이터/에스컬레이터) 좌표로 도착지를 스냅해서 경로를 계산한다.
     end_station_name: str | None = None
+    # 출발지가 지하철역이면 역명 — 역에서 "나오는"(exiting) 유형별 출구로 출발점을 옮긴다.
+    start_station_name: str | None = None
     # true면 교차로 기반 navigation_segments/waypoints(음성안내용) 생성을 생략하고
     # 거리·시간·경사만 반환 — 대중교통 탭에서 사용자가 아직 선택하지 않은 후보
     # 경로 수십 개의 승/하차 도보 구간을 한꺼번에 조회할 때, 실제로는 쓰이지도
@@ -1451,6 +1453,7 @@ def _shortest_route_card(origin: tuple, dest: tuple, user_type: str,
 
 def _pick_best_exit_by_route_cost(
     origin: tuple, station_name: str, user_type: str,
+    direction: str = "entering", dest: tuple | None = None,
 ) -> dict | None:
     """
     S7 — 출구 선택(진입: 길→역)을 직선거리 최근접 대신 origin에서 각 후보
@@ -1468,9 +1471,10 @@ def _pick_best_exit_by_route_cost(
     """
     if _subway_db is None or _cch is None:
         return None
-    candidates = _subway_db.get_exit_candidates(station_name, user_type, direction="entering")
+    candidates = _subway_db.get_exit_candidates(station_name, user_type, direction=direction)
     if not candidates:
         return None
+    # entering(도착역): origin → 출구 비용 / exiting(출발역): 출구 → dest 비용
 
     # 후보가 여럿이면 출발지에서 가장 가까운(실제 도보 비용) 출구. 같은 출구에
     # 엘리베이터·에스컬레이터가 같이 있으면 좌표가 같으므로 출구당 1번만 계산한다.
@@ -1481,7 +1485,10 @@ def _pick_best_exit_by_route_cost(
         key = (c.get("exit_no"), round(c["lat"], 6), round(c["lon"], 6))
         if key not in cost_by_exit:
             try:
-                r = _cch.find_distance_route(origin, (c["lon"], c["lat"]), safe=True)
+                ex = (c["lon"], c["lat"])
+                r = (_cch.find_distance_route(ex, dest, safe=True)
+                     if direction == "exiting" and dest is not None
+                     else _cch.find_distance_route(origin, ex, safe=True))
                 cost_by_exit[key] = r.get("total_cost")
             except Exception as e:
                 print(f"[NAV] 출구 후보 {c.get('exit_no')} 비용 계산 실패(스킵): {e}")
@@ -1492,7 +1499,7 @@ def _pick_best_exit_by_route_cost(
 
     if best is None:
         return None
-    return {**best, **describe_exit(station_name, best, candidates)}
+    return {**best, **describe_exit(station_name, best, candidates, direction)}
 
 
 @app.post("/route")
@@ -1516,6 +1523,25 @@ def api_route(
         # (안전 최단, 계단·금지구간 배제)으로 비교한다. 후보 계산 실패/후보
         # 없음이면 기존 최근접 방식(get_best_exit)으로, 그마저 없으면 원래
         # 좌표 그대로 사용(다단 폴백).
+        # 출발지가 지하철역이면 역에서 나오는 유형별 출구로 출발점을 옮긴다 —
+        # 후보 중 도착지까지 실제 도보 비용이 가장 적은 출구.
+        start_exit_info = None
+        if body.start_station_name and _subway_db is not None:
+            try:
+                start_exit_info = _pick_best_exit_by_route_cost(
+                    origin, body.start_station_name, body.user_type,
+                    direction="exiting", dest=dest,
+                )
+                if not start_exit_info:
+                    start_exit_info = _subway_db.get_best_exit(
+                        body.start_station_name, body.user_type, body.dest_lat, body.dest_lon,
+                        direction="exiting",
+                    )
+                if start_exit_info:
+                    origin = (start_exit_info["lon"], start_exit_info["lat"])
+            except Exception as e:
+                print(f"[NAV] 출발역 출구 스냅 실패 → 원래 좌표 사용: {e}")
+
         exit_info = None
         if body.end_station_name and _subway_db is not None:
             try:
@@ -1525,7 +1551,7 @@ def api_route(
                 if not exit_info:
                     # 경로비용 계산 실패 시 폴백도 "출발지에서 가까운" 출구(직선거리)
                     exit_info = _subway_db.get_best_exit(
-                        body.end_station_name, body.user_type, body.origin_lat, body.origin_lon,
+                        body.end_station_name, body.user_type, origin[1], origin[0],
                         direction="entering",
                     )
                 if exit_info:
@@ -1891,6 +1917,15 @@ def api_route(
             response["candidateRoutes"] = candidate_routes
 
         # 도착지가 역이라 출구로 스냅했으면 FE 표시용 출구 정보(역·출구번호·시설·문구)
+        if start_exit_info:
+            response["startStationExit"] = {
+                "station":    start_exit_info.get("station"),
+                "exitNo":     start_exit_info.get("exit_no"),
+                "facilities": start_exit_info.get("facilities") or [start_exit_info.get("type")],
+                "message":    start_exit_info.get("message"),
+                "lat":        start_exit_info.get("lat"),
+                "lon":        start_exit_info.get("lon"),
+            }
         if exit_info:
             response["stationExit"] = {
                 "station":    exit_info.get("station"),
@@ -1928,6 +1963,7 @@ def api_subway_best_exit(
     user_type: str = Query("elderly", description="이동 유형"),
     lat: float = Query(..., description="현재 위치 위도"),
     lon: float = Query(..., description="현재 위치 경도"),
+    direction: str = Query("exiting", description="entering(역으로 들어감, 첫 탑승역) | exiting(역에서 나옴, 마지막 하차역)"),
 ):
     """
     지하철 역 입구 스냅 — user_type·위치 기준 최적 출구 반환
@@ -1949,7 +1985,9 @@ def api_subway_best_exit(
     if user_type not in USER_TYPES:
         raise HTTPException(400, f"유효하지 않은 user_type: {user_type}")
 
-    result = _subway_db.get_best_exit(station, user_type, lat, lon, direction="exiting")
+    if direction not in ("entering", "exiting"):
+        raise HTTPException(400, "direction은 entering 또는 exiting")
+    result = _subway_db.get_best_exit(station, user_type, lat, lon, direction=direction)
     if result is None:
         raise HTTPException(404, f"'{station}' 역에서 {user_type} 유형이 이용 가능한 출구를 찾을 수 없습니다")
     return result

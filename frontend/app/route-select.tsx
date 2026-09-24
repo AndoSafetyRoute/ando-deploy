@@ -144,6 +144,7 @@ export default function RouteSelectScreen() {
         endLongitude: end.longitude,
         userType: toApiUserType(savedUserType),
         endStationName: end.name,
+        startStationName: start.name,
       });
 
       router.push({

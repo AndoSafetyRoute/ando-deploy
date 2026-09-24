@@ -7,6 +7,22 @@
 const STATION_RE = /역(?=$|[\s(（\d,·])/;
 const LINE_RE = /\d+호선/;
 
+// 역명 비교용 정규화 — 서버 subway/facility._normalize_station 과 같은 규칙
+// ("숙대입구역 4호선" / "숙대입구(서울시교육청)" / "4호선 숙대입구역" → "숙대입구")
+export function normalizeStation(name?: string | null): string {
+  let n = (name ?? '').trim().replace(/\s+/g, ' ');
+  n = n.replace(/\s*[(（][^)）]*[)）]\s*$/, '').trim();
+  n = n.replace(/\s*\d+(?:-\d+)?호선\s*$/, '').trim();
+  n = n.replace(/^\s*\d+(?:-\d+)?호선\s*/, '').trim();
+  if (n.endsWith('역')) n = n.slice(0, -1).trim();
+  return n;
+}
+
+export function sameStation(a?: string | null, b?: string | null): boolean {
+  const x = normalizeStation(a);
+  return !!x && x === normalizeStation(b);
+}
+
 export function stationNameOf(name?: string | null): string | undefined {
   const n = (name ?? '').trim();
   return n && (STATION_RE.test(n) || LINE_RE.test(n)) ? n : undefined;
