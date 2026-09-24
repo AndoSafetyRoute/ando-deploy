@@ -221,7 +221,7 @@ def _seoul_leg_route(o: tuple, d: tuple, user_type: str, seoul_mode: str):
         print(f"[hybrid] 서울 leg 실패 ({seoul_mode}): CCH 엔진 미가용")
         return None
     try:
-        r = (_cch.find_distance_route(o, d) if seoul_mode == "shortest"
+        r = (_cch.find_distance_route(o, d, avoid_stairs=True) if seoul_mode == "shortest"
              else _cch.find_route(o, d, user_type))
     except Exception as e:
         print(f"[hybrid] 서울 leg 실패 ({seoul_mode}): {e}")
@@ -1426,10 +1426,12 @@ def _shortest_route_card(origin: tuple, dest: tuple, user_type: str,
     """
     if _cch is None:
         return None
-    if precomputed_shortest_path is not None:
+    # 전 유형 계단 차단이라 카드도 계단을 피한다(SHORTEST_AVOID_STAIRS). find_route가
+    # 구해 둔 순수 최단에 계단이 없으면 그게 곧 계단 회피 최단이라 그대로 재사용.
+    if precomputed_shortest_path is not None and not _cch.path_has_stairs(precomputed_shortest_path):
         sr = _cch.distance_route_from_path(origin, dest, precomputed_shortest_path)
     else:
-        sr = _cch.find_distance_route(origin, dest)
+        sr = _cch.find_distance_route(origin, dest, avoid_stairs=True)
     s_len = round(sr["total_length_m"], 1)
     if s_len <= 0 or abs(s_len - type_len_m) / max(type_len_m, 1.0) <= 0.03:
         return None

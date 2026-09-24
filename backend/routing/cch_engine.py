@@ -151,6 +151,11 @@ SNAP_ACCESSIBLE_ENABLED = True
 # 165m 는 허용(계단 549m 강제보다 낫다고 판단).
 SNAP_ACCESSIBLE_MAX_EXTRA_M = 200.0
 
+# "최단 거리" 카드(find_distance_route(avoid_stairs=True))에서 계단을 피한다 — 전 유형이
+# 계단 차단인데 순수 거리 최단은 계단을 그대로 탔다. 계단 엣지만 FORBIDDEN_PENALTY 배
+# (나머지는 순수 거리)인 metric 을 쓴다. False 면 순수 거리(기존 동작).
+SHORTEST_AVOID_STAIRS = True
+
 # 이진탐색 진입 빈도 실측용 프로세스 전역 카운터(#A) — 요청마다 리셋되지
 # 않고 서버 수명 동안 누적해 트리거율을 로그로 확인한다.
 _ALPHA_SEARCH_STATS = {"calls": 0, "triggered": 0}
@@ -228,6 +233,7 @@ class CCHEngine:
                  dist_wf, slope_wf,
                  metric_dist, metrics_a1,
                  metric_dist_safe=None,
+                 metric_dist_nostairs=None,
                  basis_weights=None,
                  edge_tail=None, edge_head=None,
                  coords_m=None, tail_np=None, head_np=None,
@@ -248,6 +254,7 @@ class CCHEngine:
         self.metric_dist = metric_dist       # CCHMetric
         self.metrics_a1  = metrics_a1        # {ut: CCHMetric}
         self.metric_dist_safe = metric_dist_safe   # CCHMetric | None
+        self.metric_dist_nostairs = metric_dist_nostairs   # CCHMetric | None (SHORTEST_AVOID_STAIRS)
         self.basis_weights    = basis_weights      # scipy.sparse (m, 15) | None
         self.edge_tail        = edge_tail          # list[int] | None
         self.edge_head        = edge_head          # list[int] | None
@@ -577,7 +584,7 @@ class CCHEngine:
         }
 
     def find_distance_route(self, origin_lonlat: tuple, dest_lonlat: tuple,
-                            safe: bool = False) -> dict:
+                            safe: bool = False, avoid_stairs: bool = False) -> dict:
         """
         경로② "최단 경로" — 말 그대로 그래프상 길이가 가장 짧은 경로(다익스트라,
         alpha=0, 거리 외 제약 없음). 유형별 경로가 우회 배율을 재는 기준선과 동일하므로
@@ -586,6 +593,10 @@ class CCHEngine:
         safe=True 를 주면 예전 동작(6개 유형 중 하나라도 금지인 급경사 엣지를
         FORBIDDEN_PENALTY 로 회피한 '안전 최단')으로 조회한다 — "거리 우선" 카드가
         아니라 별도의 안전 baseline 이 필요할 때만 쓴다.
+
+        avoid_stairs=True(SHORTEST_AVOID_STAIRS): 계단 엣지만 FORBIDDEN_PENALTY 배로 둔
+        거리 최단 — "최단 거리" 카드용(전 유형 계단 차단). 계단 없는 길이 있으면 그 중
+        가장 짧은 길, 없으면 계단을 최소로 쓰는 길.
         """
         t0 = time.time()
 
@@ -594,15 +605,22 @@ class CCHEngine:
         if src_id == dst_id:
             raise ValueError("출발지와 목적지가 동일한 노드입니다.")
 
-        metric = (self.metric_dist_safe
-                  if safe and self.metric_dist_safe is not None
-                  else self.metric_dist)
+        nostairs = (avoid_stairs and not safe and SHORTEST_AVOID_STAIRS
+                    and self.metric_dist_nostairs is not None)
+        if safe and self.metric_dist_safe is not None:
+            metric = self.metric_dist_safe
+        elif nostairs:
+            metric = self.metric_dist_nostairs
+        else:
+            metric = self.metric_dist
         path_nodes = self._query(metric, src_id, dst_id)
         if path_nodes is None:
             raise ValueError("경로를 찾을 수 없습니다.")
 
         result = self._build_distance_result(path_nodes, safe, src_id, dst_id)
-        print(f"[CCH] 최단경로({'safe' if safe else 'pure'}) 완료 "
+        if nostairs:
+            result["algorithm"] = "cch-distance-nostairs"
+        print(f"[CCH] 최단경로({'safe' if safe else 'nostairs' if nostairs else 'pure'}) 완료 "
               f"{time.time() - t0:.2f}s  길이={result['total_length_m']:.0f}m  노드={len(path_nodes)}")
         return result
 
@@ -631,6 +649,11 @@ class CCHEngine:
             "user_label":     "최단 경로",
             "used_alpha":     0.0,
         }
+
+    def path_has_stairs(self, path_nodes: list) -> bool:
+        G = self.G
+        return any(G[u][v].get("highway") == "steps"
+                   for u, v in zip(path_nodes, path_nodes[1:]) if G.has_edge(u, v))
 
     def distance_route_from_path(self, origin_lonlat: tuple, dest_lonlat: tuple,
                                   path_nodes: list) -> dict:
@@ -799,6 +822,11 @@ def build_cch_engine(G, order_cache_path: str | None = None) -> CCHEngine:
     print(f"[CCH] 안전거리(경로②) metric 생성...")
     metric_dist_safe = CCHMetric(cch, dist_safe_w_list)
 
+    print(f"[CCH] 계단 회피 거리 metric 생성...")
+    dist_ns_wf = np.where(stairs_np, dist_wf * FORBIDDEN_PENALTY, dist_wf)
+    metric_dist_nostairs = CCHMetric(cch, np.maximum(1, dist_ns_wf).astype(np.int64).tolist())
+    del dist_ns_wf
+
     metrics_a1 = {}
     for ut in USER_TYPES:
         print(f"[CCH] {ut} metric 생성...")
@@ -857,6 +885,7 @@ def build_cch_engine(G, order_cache_path: str | None = None) -> CCHEngine:
         metric_dist=metric_dist,
         metrics_a1=metrics_a1,
         metric_dist_safe=metric_dist_safe,
+        metric_dist_nostairs=metric_dist_nostairs,
         basis_weights=basis_weights,
         edge_tail=tail_list,
         edge_head=head_list,
