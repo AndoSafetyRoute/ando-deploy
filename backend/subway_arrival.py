@@ -190,7 +190,9 @@ def arrival_for_boarding(station_name: str, line_no: str | None = None) -> dict:
         return out
 
     if line_no:
-        wanted = line_no.strip()
+        # FE는 카카오 vehicle.name에서 "호선"만 떼서 보내므로 "경의중앙선"·"수인분당선"·
+        # "신분당선"처럼 "선"이 남는다 — 표 값("경의중앙" 등)과 맞추려고 뗀다.
+        wanted = re.sub(r"(호선|선)$", "", line_no.strip())
         filtered = [t for t in items if t["line_no"] == wanted]
         # 노선 코드 매칭 실패(표에 없는 노선 등) 시 전체로 폴백 — 방향 텍스트로
         # 사용자가 스스로 구분 가능하니 아예 숨기는 것보단 낫다.
