@@ -34,6 +34,7 @@ import {
   formatMinutes,
 } from "../utils/storage";
 import { classifySlopeZone } from "../utils/slopeZone";
+import { ZOOM_LINE_SCALE_JS } from "../utils/mapLineScale";
 import { createRouteProgressTracker } from "../utils/routeProgress";
 import {
   getAuthToken,
@@ -535,6 +536,7 @@ function makeKakaoMapHtml({
           src="https://dapi.kakao.com/v2/maps/sdk.js?appkey=${KAKAO_JAVASCRIPT_KEY}&autoload=false">
         </script>
         <script>
+          ${ZOOM_LINE_SCALE_JS}
           function toggleLegend() {
             var box = document.getElementById("legendBox");
             if (!box) return;
@@ -576,21 +578,21 @@ function makeKakaoMapHtml({
                 var segLatLngs = seg.path.map(function (p) {
                   return new kakao.maps.LatLng(p.lat, p.lng);
                 });
-                new kakao.maps.Polyline({
+                zoomLine(new kakao.maps.Polyline({
                   map: map, path: segLatLngs,
                   strokeWeight: 5, strokeColor: seg.color || "#9E9E9E",
                   strokeOpacity: 0.6, strokeStyle: "solid"
-                });
+                }), 5, 3);
               });
             } else if (journeyPath.length > 1) {
               var journeyLatLngs = journeyPath.map(function (p) {
                 return new kakao.maps.LatLng(p.lat, p.lng);
               });
-              new kakao.maps.Polyline({
+              zoomLine(new kakao.maps.Polyline({
                 map: map, path: journeyLatLngs,
                 strokeWeight: 4, strokeColor: "#9E9E9E",
                 strokeOpacity: 0.5, strokeStyle: "shortdash"
-              });
+              }), 4, 2);
             }
 
             // 퍼센트 화살표는 항상 만들어두고 setMap(null/map)으로만 껐다 켰다 한다 —
@@ -610,14 +612,14 @@ function makeKakaoMapHtml({
                 });
                 // 미리보기 지도(RouteMapView)와 동일한 테두리+중앙 2중 렌더링 —
                 // 실제 GPS 안내 화면에서도 경로 선을 굵게, 테두리로 눈에 띄게 그린다.
-                new kakao.maps.Polyline({
+                zoomLine(new kakao.maps.Polyline({
                   path: polyPath, strokeWeight: 18,
                   strokeColor: "#7C6FF7", strokeOpacity: 0.95, strokeStyle: "solid"
-                }).setMap(map);
-                new kakao.maps.Polyline({
+                }), 18, 6).setMap(map);
+                zoomLine(new kakao.maps.Polyline({
                   path: polyPath, strokeWeight: 13,
                   strokeColor: seg.color, strokeOpacity: 0.95, strokeStyle: "solid"
-                }).setMap(map);
+                }), 13, 4).setMap(map);
 
                 // 오르막/내리막 화살표 — zone이 평지가 아닌 구간에 표시.
                 // (slope_mean은 부호로 방향만 판단하고, 절댓값 기준으로
@@ -642,27 +644,27 @@ function makeKakaoMapHtml({
               segmentData.forEach(function(seg) {
                 var start = new kakao.maps.LatLng(seg.start.lat, seg.start.lng);
                 var end   = new kakao.maps.LatLng(seg.end.lat,   seg.end.lng);
-                new kakao.maps.Polyline({
+                zoomLine(new kakao.maps.Polyline({
                   path: [start, end], strokeWeight: 18,
                   strokeColor: "#7C6FF7", strokeOpacity: 0.95, strokeStyle: "solid"
-                }).setMap(map);
-                new kakao.maps.Polyline({
+                }), 18, 6).setMap(map);
+                zoomLine(new kakao.maps.Polyline({
                   path: [start, end], strokeWeight: 13,
                   strokeColor: seg.color, strokeOpacity: 0.95, strokeStyle: "solid"
-                }).setMap(map);
+                }), 13, 4).setMap(map);
               });
             } else if (pathData.length > 1) {
               var path = pathData.map(function(p) {
                 return new kakao.maps.LatLng(p.lat, p.lng);
               });
-              new kakao.maps.Polyline({
+              zoomLine(new kakao.maps.Polyline({
                 path: path, strokeWeight: 18,
                 strokeColor: "#5B52D6", strokeOpacity: 0.95, strokeStyle: "solid"
-              }).setMap(map);
-              new kakao.maps.Polyline({
+              }), 18, 6).setMap(map);
+              zoomLine(new kakao.maps.Polyline({
                 path: path, strokeWeight: 13,
                 strokeColor: "#7C6FF7", strokeOpacity: 0.95, strokeStyle: "solid"
-              }).setMap(map);
+              }), 13, 4).setMap(map);
             }
 
             // 여정 전체 좌표(journeyPath)가 있으면 그 양 끝(진짜 출발지/최종
@@ -708,6 +710,9 @@ function makeKakaoMapHtml({
             window.updateCurrentLocation = function (lat, lng) {
               setCurrentOverlay(lat, lng);
             };
+
+            // 선 굵기를 줌 레벨에 맞춤(축소된 전체 보기에서 과하게 두껍던 문제)
+            bindZoomLineWeights(map);
 
             if (pathData.length > 0) {
               // 패딩(top, bottom, left, right) 충분히 줘서 경로가 화면 안에 들어오게

@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator } from 'react-native';
 import { WebView } from 'react-native-webview';
 import { C } from '../../constants/colors';
+import { ZOOM_LINE_SCALE_JS } from '../../utils/mapLineScale';
 
 const KAKAO_JAVASCRIPT_KEY = process.env.EXPO_PUBLIC_KAKAO_JAVASCRIPT_KEY;
 
@@ -109,6 +110,7 @@ function makeRouteMapHtml({ routes, selectedRouteId, startLabel, endLabel, width
         <script type="text/javascript" src="https://dapi.kakao.com/v2/maps/sdk.js?appkey=${KAKAO_JAVASCRIPT_KEY}&autoload=false"></script>
         <script>
           var map;
+          ${ZOOM_LINE_SCALE_JS}
           var bounds;
           var hasBounds = false;
 
@@ -180,22 +182,22 @@ function makeRouteMapHtml({ routes, selectedRouteId, startLabel, endLabel, width
                   var segPath = seg.path.map(function (p) {
                     return new kakao.maps.LatLng(p.lat, p.lng);
                   });
-                  new kakao.maps.Polyline({
+                  zoomLine(new kakao.maps.Polyline({
                     map: map,
                     path: segPath,
                     strokeWeight: borderWeight,
                     strokeColor: seg.borderColor || r.color || '#7C6FF7',
                     strokeOpacity: opacity,
                     strokeStyle: 'solid'
-                  });
-                  new kakao.maps.Polyline({
+                  }), borderWeight, r.selected ? 6 : 4);
+                  zoomLine(new kakao.maps.Polyline({
                     map: map,
                     path: segPath,
                     strokeWeight: centerWeight,
                     strokeColor: seg.color || r.color || '#7C6FF7',
                     strokeOpacity: opacity,
                     strokeStyle: 'solid'
-                  });
+                  }), centerWeight, r.selected ? 4 : 2);
 
                   if (${drawSlopeMarkers} && r.selected && seg.zone && seg.zone !== 'flat' && seg.slopeMean && seg.slopeMean !== 0) {
                     var midIdx = Math.floor(segPath.length / 2);
@@ -210,14 +212,14 @@ function makeRouteMapHtml({ routes, selectedRouteId, startLabel, endLabel, width
                   }
                 });
               } else {
-                new kakao.maps.Polyline({
+                zoomLine(new kakao.maps.Polyline({
                   map: map,
                   path: linePath,
                   strokeWeight: r.selected ? 14 : 10, // ×2 → ×0.8 하향(실질 ×1.6, 기존 9/6)
                   strokeColor: r.color || '#7C6FF7',
                   strokeOpacity: r.selected ? 1 : 0.3,
                   strokeStyle: 'solid'
-                });
+                }), r.selected ? 14 : 10, r.selected ? 4 : 3);
               }
 
               if (r.selected) {
@@ -243,6 +245,9 @@ function makeRouteMapHtml({ routes, selectedRouteId, startLabel, endLabel, width
                 }).setMap(map);
               }
             });
+
+            // 선 굵기를 줌 레벨에 맞춤(축소된 첫 화면에서 과하게 두껍던 문제)
+            bindZoomLineWeights(map);
 
             if (hasBounds) {
               // WebView 컨테이너의 실제 크기가 아직 잡히기 전에 setBounds를 호출하면
