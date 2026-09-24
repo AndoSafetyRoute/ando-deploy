@@ -1,3 +1,5 @@
+import { stationNameOf } from "../utils/stationName";
+
 // 에뮬레이터: 10.0.2.2 / 실기기(같은 WiFi): .env 에 EXPO_PUBLIC_ROUTE_API_URL=http://192.168.x.x:8000 추가
 const API_BASE_URL: string =
   (process.env.EXPO_PUBLIC_ROUTE_API_URL as string | undefined) ?? "http://10.0.2.2:8000";
@@ -108,7 +110,8 @@ export async function requestRoute({
       },
       body: JSON.stringify({
         origin_lat, origin_lon, dest_lat, dest_lon, user_type,
-        end_station_name: endStationName,
+        // 이름에 "역"이 있을 때만 역으로 보고 보낸다(서버가 보행약자용 출구로 도착지 이동)
+        end_station_name: stationNameOf(endStationName),
       }),
       signal: controller.signal,
     });

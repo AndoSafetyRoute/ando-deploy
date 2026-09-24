@@ -9,6 +9,7 @@
 // 동일 노드열은 스킵하므로 실제 길이는 1~3 로 변한다 → FE 는 배열을 그대로 순회한다.
 
 import { BASE_URL, getAuthToken } from "../api";
+import { stationNameOf } from "../utils/stationName";
 import type { CandidateRoute } from "../utils/routeChoiceModel";
 import {
   ROUTE_PATH,
@@ -17,11 +18,22 @@ import {
   CANDIDATE_ROUTES_FIELD,
 } from "../personalization/config";
 
+// 도착지가 역이라 서버가 보행약자용 출구로 도착지를 옮긴 경우의 출구 정보
+export type StationExit = {
+  station:    string;          // "숙대입구역"
+  exitNo:     string;          // "10"
+  facilities: string[];        // ["elevator"] | ["escalator"] | ["elevator","escalator"]
+  message:    string;          // "숙대입구역 10번 출구 엘리베이터를 이용하세요."
+  lat?:       number;
+  lon?:       number;
+};
+
 export type RouteCompareResponse = {
   // 기존 /route single 응답 필드도 그대로 옴(단일 경로). 여기선 비교에 필요한 것만 명시.
   coordinates?:   [number, number][];
   routeSegments?: any[];
   candidateRoutes: CandidateRoute[];
+  stationExit?:   StationExit;
 };
 
 export async function requestRouteCandidates(params: {
@@ -53,7 +65,7 @@ export async function requestRouteCandidates(params: {
         [ROUTE_CANDIDATES_KEY]: ROUTE_CANDIDATES_COMPARE,
 
         // 목적지가 지하철역이면 접근 가능한 출구로 스냅하기 위해 전달
-        end_station_name: params.endStationName,
+        end_station_name: stationNameOf(params.endStationName),
       }),
       signal: controller.signal,
     });

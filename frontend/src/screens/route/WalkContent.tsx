@@ -14,7 +14,7 @@ import { C, ZONE_COLORS } from '../../constants/colors';
 import { formatMinutes } from '../../utils/storage';
 import RouteMapView from './RouteMapView';
 import { useDraggableSheet } from './useDraggableSheet';
-import { requestRouteCandidates } from '../../api/routeCompare';
+import { requestRouteCandidates, type StationExit } from '../../api/routeCompare';
 import {
   buildComparison,
   buildRouteChoicePayload,
@@ -236,6 +236,8 @@ export default function WalkContent({
   // 경로 데이터(shown)가 갱신될 때만 같이 바뀌게 한다. TransitContent와 동일 이유.
   const [mapStartLabel, setMapStartLabel] = useState('');
   const [mapEndLabel, setMapEndLabel] = useState('');
+  // 도착지가 역이면 서버가 고른 보행약자용 출구(엘리베이터/에스컬레이터)
+  const [stationExit, setStationExit] = useState<StationExit | null>(null);
 
   // 경로 선택 계측 세션(동의 시에만 생성 — 미동의면 전부 no-op).
   const collectRef = useRef<CollectSession | null>(null);
@@ -322,8 +324,13 @@ export default function WalkContent({
         const { shown: s } = buildComparison(res.candidateRoutes);
         setShown(s);
         setSelectedPos(0);
+        setStationExit(res.stationExit ?? null);
         setMapStartLabel(startName || from);
-        setMapEndLabel(endName || to);
+        setMapEndLabel(
+          res.stationExit
+            ? `${res.stationExit.station} ${res.stationExit.exitNo}번 출구`
+            : endName || to
+        );
       } catch (e: any) {
         if (alive) setError(e?.message ?? '경로를 불러오지 못했습니다.');
       } finally {
@@ -415,6 +422,8 @@ export default function WalkContent({
       endLongitude,
 
       collectSessionId: sessionId,
+      // 도착지가 역일 때 안내 화면 상단에 출구 문구를 띄운다
+      ...(stationExit ? { stationExitMessage: stationExit.message } : {}),
 
       routeData: JSON.stringify({
         coordinates: selectedCand.route.coordinates,
@@ -465,6 +474,19 @@ export default function WalkContent({
             <Text style={ss.sheetExpandIcon}>{sheetExpanded ? '▼' : '▲'}</Text>
           </View>
         </View>
+
+        {!!stationExit && !loading && (
+          <View style={ss.exitBanner}>
+            <Text style={ss.exitBannerIcon}>
+              {stationExit.facilities.includes('elevator') ? '🛗' : '🔼'}
+            </Text>
+            <Text style={ss.exitBannerText}>
+              {stationExit.message}
+              {'\n'}
+              <Text style={ss.exitBannerSub}>경로는 이 출구까지 안내해요.</Text>
+            </Text>
+          </View>
+        )}
 
         {isHybrid && (
           <View style={ss.svcBanner}>
@@ -1032,6 +1054,22 @@ const ss = StyleSheet.create({
     fontSize: 18,
     color: 'rgba(255,255,255,0.7)',
   },
+
+  exitBanner: {
+
+    flexDirection: 'row', alignItems: 'flex-start', gap: 8,
+
+    marginHorizontal: 16, marginBottom: 8, padding: 12,
+
+    borderRadius: 12, backgroundColor: '#EEF4FF',
+
+  },
+
+  exitBannerIcon: { fontSize: 18 },
+
+  exitBannerText: { flex: 1, fontSize: 13.5, fontWeight: '700', color: C.navy, lineHeight: 19 },
+
+  exitBannerSub: { fontSize: 12, fontWeight: '500', color: C.textMute },
 
   svcBanner: {
     flexDirection: 'row',

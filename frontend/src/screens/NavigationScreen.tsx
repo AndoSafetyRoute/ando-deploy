@@ -153,6 +153,8 @@ interface Props {
       // 대중교통 모드 전용: 사용자가 입력한 진짜 최종 목적지. "to"는 지금 안내
       // 중인 도보 leg의 끝점(승차/환승 지점)이라 최종 목적지와 다를 수 있다.
       finalDestinationName?: string;
+      // 도보 탭: 도착지가 역이면 서버가 고른 보행약자용 출구 문구
+      stationExitMessage?: string;
       // 대중교통 모드 전용: 사용자가 입력한 진짜 출발지. "from"은 도보2 구간
       // 등에서 하차/환승 지점일 수 있어 진짜 출발지와 다를 수 있다.
       finalOriginName?: string;
@@ -752,6 +754,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
   // 이걸 따로 받아서 보여준다 — 없으면(도보 전용 모드) to를 그대로 최종
   // 목적지로 취급한다.
   const finalDestinationName = route?.params?.finalDestinationName || to;
+  const stationExitMessage = route?.params?.stationExitMessage;
   const finalOriginName = route?.params?.finalOriginName || from;
 
   useEffect(() => {
@@ -2106,6 +2109,9 @@ export default function NavigationScreen({ navigation, route }: Props) {
         <View style={ss.titleBox}>
           <Text style={ss.title}>{cfg.icon} {cfg.label}</Text>
           <Text style={ss.subTitle} numberOfLines={1}>{from} → {finalDestinationName}</Text>
+          {!!stationExitMessage && (
+            <Text style={ss.legContext} numberOfLines={1}>🛗 {stationExitMessage}</Text>
+          )}
           {finalDestinationName !== to && (
             <Text style={ss.legContext} numberOfLines={1}>
               지금: {to}까지

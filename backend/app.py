@@ -1472,29 +1472,27 @@ def _pick_best_exit_by_route_cost(
     if not candidates:
         return None
 
+    # 후보가 여럿이면 출발지에서 가장 가까운(실제 도보 비용) 출구. 같은 출구에
+    # 엘리베이터·에스컬레이터가 같이 있으면 좌표가 같으므로 출구당 1번만 계산한다.
+    from subway.facility import describe_exit
     best, best_cost = None, float("inf")
+    cost_by_exit: dict = {}
     for c in candidates:
-        dest = (c["lon"], c["lat"])
-        try:
-            r = _cch.find_distance_route(origin, dest, safe=True)
-        except Exception as e:
-            print(f"[NAV] 출구 후보 {c.get('exit_no')} 비용 계산 실패(스킵): {e}")
-            continue
-        cost = r.get("total_cost")
+        key = (c.get("exit_no"), round(c["lat"], 6), round(c["lon"], 6))
+        if key not in cost_by_exit:
+            try:
+                r = _cch.find_distance_route(origin, (c["lon"], c["lat"]), safe=True)
+                cost_by_exit[key] = r.get("total_cost")
+            except Exception as e:
+                print(f"[NAV] 출구 후보 {c.get('exit_no')} 비용 계산 실패(스킵): {e}")
+                cost_by_exit[key] = None
+        cost = cost_by_exit[key]
         if cost is not None and cost < best_cost:
             best, best_cost = c, cost
 
     if best is None:
         return None
-
-    if best.get("type") == "escalator":
-        msg = (f"{best['exit_no']}번 출구 에스컬레이터를 이용하세요. "
-               f"({best.get('direction', '')} 방향)").strip()
-    elif user_type in ("cane", "leg_injury", "elderly"):  # subway.facility._ESC_PREFERRED
-        msg = f"{best['exit_no']}번 출구 엘리베이터를 이용하세요. (에스컬레이터 없음)"
-    else:
-        msg = f"{best['exit_no']}번 출구 엘리베이터를 이용하세요."
-    return {**best, "message": msg}
+    return {**best, **describe_exit(station_name, best, candidates)}
 
 
 @app.post("/route")
@@ -1518,14 +1516,16 @@ def api_route(
         # (안전 최단, 계단·금지구간 배제)으로 비교한다. 후보 계산 실패/후보
         # 없음이면 기존 최근접 방식(get_best_exit)으로, 그마저 없으면 원래
         # 좌표 그대로 사용(다단 폴백).
+        exit_info = None
         if body.end_station_name and _subway_db is not None:
             try:
                 exit_info = _pick_best_exit_by_route_cost(
                     origin, body.end_station_name, body.user_type,
                 )
                 if not exit_info:
+                    # 경로비용 계산 실패 시 폴백도 "출발지에서 가까운" 출구(직선거리)
                     exit_info = _subway_db.get_best_exit(
-                        body.end_station_name, body.user_type, body.dest_lat, body.dest_lon,
+                        body.end_station_name, body.user_type, body.origin_lat, body.origin_lon,
                         direction="entering",
                     )
                 if exit_info:
@@ -1889,6 +1889,17 @@ def api_route(
                         print(f"[route3] 맞춤경로 조회 실패 (무시): {e}")
 
             response["candidateRoutes"] = candidate_routes
+
+        # 도착지가 역이라 출구로 스냅했으면 FE 표시용 출구 정보(역·출구번호·시설·문구)
+        if exit_info:
+            response["stationExit"] = {
+                "station":    exit_info.get("station"),
+                "exitNo":     exit_info.get("exit_no"),
+                "facilities": exit_info.get("facilities") or [exit_info.get("type")],
+                "message":    exit_info.get("message"),
+                "lat":        exit_info.get("lat"),
+                "lon":        exit_info.get("lon"),
+            }
 
         return response
 

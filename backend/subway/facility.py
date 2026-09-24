@@ -70,11 +70,12 @@ _SVC_CHARGER    = "getWksnWhclCharge" # OA-22745 지하철역 내 전동휠체�
 _OPERATING_OK   = {"M"}            # M=사용가능  (나머지: D삭제 S보수중 T중지 I점검중 B공사중)
 
 # ── user_type 분류 ────────────────────────────────────────────────────────────
-# 엘리베이터만 사용 가능
-_ELEVATOR_ONLY  = {"manual_wheelchair", "electric_wheelchair", "walker"}
-# 에스컬레이터 이용 가능 (우선 안내, 없으면 엘리베이터)
-# S6 — 'general'(실험 참가자, 비보행약자)도 AMBUL과 동일 정책(스펙 명시).
-_ESC_PREFERRED  = {"cane", "leg_injury", "elderly", "general"}
+# 엘리베이터 출구만 — 휠체어·워커·다리부상 (에스컬레이터 탑승 불가/위험)
+_ELEVATOR_ONLY  = {"manual_wheelchair", "electric_wheelchair", "walker", "leg_injury"}
+# 에스컬레이터 또는 엘리베이터 출구 — 지팡이·고령자. 둘 다 후보로 두고 출발지에서
+# 가까운(실제 도보 비용) 출구를 고른다(우선순위 없음).
+# S6 — 'general'(실험 참가자, 비보행약자)도 같은 정책.
+_ESC_OR_ELEV    = {"cane", "elderly", "general"}
 
 # S7 — 에스컬레이터 운행 방향(CSV "상하행구분" 그대로, _load_escalators 참고).
 # entering(길에서 역으로 내려감) → 하행 에스컬레이터만 실제로 도움이 됨.
@@ -82,6 +83,11 @@ _ESC_PREFERRED  = {"cane", "leg_injury", "elderly", "general"}
 # 데이터 결측이지 "이 방향 아님"이 아니므로 양쪽 다 후보로 남긴다.
 _ESC_DOWN = {"하행"}
 _ESC_UP   = {"상행"}
+
+
+def _esc_dir_ok(direction: str | None, need: set) -> bool:
+    """방향 결측·겸용("상/하겸용")은 양방향 모두 이용 가능으로 본다."""
+    return not direction or direction in need or "겸용" in direction
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -340,11 +346,21 @@ def _kakao_exit_coord(station: str, exit_no: str) -> tuple[float, float] | None:
         resp = requests.get(
             "https://dapi.kakao.com/v2/local/search/keyword.json",
             headers={"Authorization": f"KakaoAK {KAKAO_REST_KEY}"},
-            params={"query": query, "size": 1},
+            params={"query": query, "size": 5},
             timeout=5.0,
         )
         resp.raise_for_status()
         docs = resp.json().get("documents", [])
+        # 1위가 다른 출구번호일 때가 있어(실측: 가산디지털단지 6번 → 9번) 이름에
+        # "N번" 이 정확히 들어간 결과를 우선한다. "1번" 이 "11번" 에 걸리지 않게 앞 숫자 확인.
+        exact = [d for d in docs
+                 if re.search(rf"(?<![\d-]){re.escape(exit_no)}번", d.get("place_name", ""))]
+        if exact:
+            docs = exact
+        elif docs and re.search(r"\d+(?:-\d+)?번", docs[0].get("place_name", "")):
+            # 다른 번호의 출구만 나오면 이 출구는 좌표 없음 처리(틀린 출구로 안내하지 않게
+            # 후보에서 빠진다). 번호 없는 결과(역 자체 등)는 기존처럼 그대로 쓴다.
+            docs = []
         if docs:
             coord = (float(docs[0]["y"]), float(docs[0]["x"]))  # (lat, lon)
             _exit_coord_cache[cache_key] = coord
@@ -716,9 +732,9 @@ class SubwayFacilityDB:
         )
 
         # 이 역에 해당 시설 데이터가 아예 없으면(광화문 등) 운행상태 조회 없이 끝낸다.
-        if user_type not in _ELEVATOR_ONLY and user_type not in _ESC_PREFERRED:
+        if user_type not in _ELEVATOR_ONLY and user_type not in _ESC_OR_ELEV:
             return []
-        if not self._elev.get(stn) and not (user_type in _ESC_PREFERRED and self._esc.get(stn)):
+        if not self._elev.get(stn) and not (user_type in _ESC_OR_ELEV and self._esc.get(stn)):
             return []
         broken = get_broken_serials()
         need_dir = _ESC_DOWN if direction == "entering" else _ESC_UP
@@ -727,15 +743,11 @@ class SubwayFacilityDB:
             active = self._active(self._elev.get(stn, []), broken)
             return self._with_coord(stn, active)
 
-        if user_type in _ESC_PREFERRED:
+        if user_type in _ESC_OR_ELEV:
             active_esc = self._active(self._esc.get(stn, []), broken)
-            dir_matched = [e for e in active_esc if not e.get("direction") or e["direction"] in need_dir]
-            candidates = self._with_coord(stn, dir_matched)
-            if candidates:
-                return candidates
-            # 방향 맞는(또는 방향 미상) 에스컬레이터 없음 → 엘리베이터 폴백
+            dir_matched = [e for e in active_esc if _esc_dir_ok(e.get("direction"), need_dir)]
             active_elev = self._active(self._elev.get(stn, []), broken)
-            return self._with_coord(stn, active_elev)
+            return self._with_coord(stn, dir_matched + active_elev)
 
         return []
 
@@ -765,17 +777,7 @@ class SubwayFacilityDB:
         best = self._nearest(candidates, user_lat, user_lon)
         if not best:
             return None
-
-        if best.get("type") == "escalator":
-            msg = (
-                f"{best['exit_no']}번 출구 에스컬레이터를 이용하세요. "
-                f"({best.get('direction', '')} 방향)"
-            ).strip()
-        elif user_type in _ESC_PREFERRED:
-            msg = f"{best['exit_no']}번 출구 엘리베이터를 이용하세요. (에스컬레이터 없음)"
-        else:
-            msg = f"{best['exit_no']}번 출구 엘리베이터를 이용하세요."
-        return {**best, "message": msg}
+        return {**best, **describe_exit(station_name, best, candidates)}
 
     def station_summary(self, station_name: str) -> dict:
         """역 시설 현황 요약 (디버그·FE 참고용)"""
@@ -790,6 +792,35 @@ class SubwayFacilityDB:
 
 # ── 싱글톤 ────────────────────────────────────────────────────────────────────
 _db: SubwayFacilityDB | None = None
+
+
+_FACILITY_LABEL = {"elevator": "엘리베이터", "escalator": "에스컬레이터", "lift": "휠체어리프트"}
+
+
+def describe_exit(station_name: str, best: dict, candidates: list[dict]) -> dict:
+    """
+    고른 출구(best) → FE 표시용 정보. 같은 출구번호에 엘리베이터·에스컬레이터가
+    함께 있으면(후보 안에서) 둘 다 알려준다.
+      { station:"숙대입구역", exit_no:"10", facilities:["elevator"],
+        message:"숙대입구역 10번 출구 엘리베이터를 이용하세요." }
+    """
+    exit_no = best["exit_no"]
+    types = []
+    for c in candidates:
+        if c.get("exit_no") == exit_no and c.get("type") not in types:
+            types.append(c.get("type"))
+    if best.get("type") not in types:
+        types.insert(0, best.get("type"))
+    order = {"elevator": 0, "escalator": 1, "lift": 2}
+    types.sort(key=lambda t: order.get(t, 9))
+    station = f"{_normalize_station(station_name)}역"
+    label = "·".join(_FACILITY_LABEL.get(t, t) for t in types)
+    return {
+        "station":    station,
+        "exit_no":    exit_no,
+        "facilities": types,
+        "message":    f"{station} {exit_no}번 출구 {label}를 이용하세요.",
+    }
 
 
 def get_facility_db() -> SubwayFacilityDB:
