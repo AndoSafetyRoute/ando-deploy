@@ -144,6 +144,7 @@ export async function requestWalkLeg({
   endLongitude,
   userType = "manual_wheelchair",
   light = false,
+  endStationName,
 }: RouteRequest) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 60_000);
@@ -161,6 +162,8 @@ export async function requestWalkLeg({
         dest_lon:    Number(endLongitude),
         user_type:   userType,
         light,
+        // 하차 후 도보의 도착지가 역이면 보행약자용 출구까지 안내(stationExit 응답)
+        end_station_name: stationNameOf(endStationName),
       }),
       signal: controller.signal,
     });

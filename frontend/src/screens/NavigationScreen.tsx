@@ -580,11 +580,18 @@ function makeKakaoMapHtml({
                 var segLatLngs = seg.path.map(function (p) {
                   return new kakao.maps.LatLng(p.lat, p.lng);
                 });
+                // 대중교통 탭 미리보기(RouteMapView)와 같은 테두리+중앙 2중 선 —
+                // 탑승(버스/지하철) 구간도 노선색으로 또렷하게 보이게 한다.
                 zoomLine(new kakao.maps.Polyline({
                   map: map, path: segLatLngs,
-                  strokeWeight: 5, strokeColor: seg.color || "#9E9E9E",
-                  strokeOpacity: 0.6, strokeStyle: "solid"
-                }), 5, 3);
+                  strokeWeight: 18, strokeColor: "#7C6FF7",
+                  strokeOpacity: 1, strokeStyle: "solid"
+                }), 18, 6);
+                zoomLine(new kakao.maps.Polyline({
+                  map: map, path: segLatLngs,
+                  strokeWeight: 13, strokeColor: seg.color || "#9E9E9E",
+                  strokeOpacity: 1, strokeStyle: "solid"
+                }), 13, 4);
               });
             } else if (journeyPath.length > 1) {
               var journeyLatLngs = journeyPath.map(function (p) {

@@ -8,18 +8,15 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import { View, Text, StyleSheet, TouchableOpacity } from "react-native";
 import { C } from "../constants/colors";
+import { fmtArrivalApprox } from "../utils/arrivalTime";
 import { getBusArrival, type BusArrival } from "../api/busArrival";
 
 const REFRESH_MS = 20_000;
 const TICK_MS = 1_000;
 
-/** 초 → "3분 20초", "45초", "곧 도착" — 매초 그대로(반올림 없이) */
+/** 초 → "약 N분"(30초 기준 반올림) / "곧 도착" */
 function fmtEta(sec: number | null, arriving: boolean): string {
-  if (arriving || (sec != null && sec <= 0)) return "곧 도착";
-  if (sec == null) return "";
-  const m = Math.floor(sec / 60);
-  const s = sec % 60;
-  return m > 0 ? `${m}분 ${String(s).padStart(2, "0")}초` : `${s}초`;
+  return fmtArrivalApprox(sec, arriving);
 }
 
 type Props = {

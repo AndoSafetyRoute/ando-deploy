@@ -19,6 +19,7 @@ import RouteMapView, { MapCoordinate } from './RouteMapView';
 import { useDraggableSheet } from './useDraggableSheet';
 import BusArrivalBadge from '../../components/BusArrivalBadge';
 import SubwayArrivalBadge from '../../components/SubwayArrivalBadge';
+import { stationNameOf } from '../../utils/stationName';
 
 const { height: H } = Dimensions.get('window');
 
@@ -37,8 +38,7 @@ const ACCESSIBILITY_WALKER_TYPES = [
 // 카카오 대중교통 API는 출구/엘리베이터 등 접근성 데이터를 제공하지 않는다.
 // 아래는 직접 답사해서 확보한 실제 역/버스 접근성 정보(출구 번호, 엘리베이터 위치 등)이며,
 // 카카오 API가 돌려주는 실제 경로가 이 역/버스를 지나갈 때 그대로 붙여서 안내한다.
-// 답사 데이터가 없는 역/버스는 임의로 지어내지 않고 아래 일반 안내 문구로 대체한다.
-const ACCESS_ADVISORY = '엘리베이터·저상버스 등 교통약자 편의시설 이용 가능 여부는 카카오 대중교통 API에서 제공되지 않아 현장에서 확인해 주세요.';
+// 답사 데이터가 없는 역/버스는 임의로 지어내지 않는다(출구 안내는 서버 역 데이터로 — destExitNote).
 
 type StationAccessInfo = {
   accessibility: { type: string; text: string; icon: string }[];
@@ -147,9 +147,7 @@ function buildSteps(steps: KakaoTransitStep[], apiUserType: string) {
     const known = findKnownAccess(p.type, p.guidance, stopNames, busNo);
     const accessibility = showAdvisory ? (known?.accessibility ?? []) : [];
     const facilities = showAdvisory ? (known?.facilities ?? []) : [];
-    const detail = !showAdvisory
-      ? undefined
-      : known?.detail ?? (uiType !== 'walk' ? ACCESS_ADVISORY : undefined);
+    const detail = showAdvisory ? known?.detail : undefined;
 
     return {
       id: `k${i}`,
@@ -262,12 +260,13 @@ async function computeWalkLeg(
   limit: Limiter,
   cache: LegCache,
   light: boolean,
+  endStationName?: string,
 ): Promise<WalkLeg> {
-  const key = legCacheKey(fromLat, fromLng, toLat, toLng, apiUserType, light);
+  const key = `${legCacheKey(fromLat, fromLng, toLat, toLng, apiUserType, light)}|${endStationName ?? ''}`;
   const cached = cache.get(key);
   if (cached) return cached;
 
-  const promise = computeWalkLegUncached(fromLat, fromLng, toLat, toLng, apiUserType, limit, light);
+  const promise = computeWalkLegUncached(fromLat, fromLng, toLat, toLng, apiUserType, limit, light, endStationName);
   cache.set(key, promise);
   return promise;
 }
@@ -278,6 +277,7 @@ async function computeWalkLegUncached(
   apiUserType: string,
   limit: Limiter,
   light: boolean,
+  endStationName?: string,
 ): Promise<WalkLeg> {
   const straightM = haversineMeters(Number(fromLat), Number(fromLng), Number(toLat), Number(toLng));
 
@@ -295,6 +295,7 @@ async function computeWalkLegUncached(
       endLatitude: toLat, endLongitude: toLng,
       userType: apiUserType,
       light,
+      endStationName,
     }));
     const bestRoute = res?.routes?.[0] ?? null;
     // navigation_segments(구간 색상)/waypoints(음성안내)/measurement_units(GPS 실측
@@ -306,6 +307,8 @@ async function computeWalkLegUncached(
           navigation_segments: res?.navigation_segments,
           waypoints:           res?.waypoints,
           measurement_units:   res?.measurement_units,
+          // 도착지가 역이면 서버가 고른 보행약자용 출구(역·출구번호·문구)
+          stationExit:         res?.stationExit,
         }
       : null;
     const distanceM = best ? Number(best.totalDistance) : null;
@@ -382,6 +385,16 @@ function applyChargerInfo(step: any, chargers: StationCharger[]) {
   ];
 }
 
+// 상세 안내 상단 문구. 목적지가 역이면 보행약자용 출구 안내, 일반 장소면 도보 안내 원칙.
+function destExitNote(exit: any): string {
+  if (exit?.station && exit?.exitNo) {
+    const labels: Record<string, string> = { elevator: '엘리베이터', escalator: '에스컬레이터' };
+    const fac = (exit.facilities ?? []).map((f: string) => labels[f] ?? f).join('·');
+    return `${exit.station} ${exit.exitNo}번 출구${fac ? `(${fac})` : ''}로 안내합니다.`;
+  }
+  return '도보 구간은 계단을 피하고 경사가 완만한 길로 안내합니다.';
+}
+
 function makeWalkStep(id: string, leg: WalkLeg, title: string, isDestination: boolean) {
   const distanceText = leg.distanceM != null ? formatDistanceText(leg.distanceM) : '';
   return {
@@ -453,7 +466,8 @@ async function convertKakaoRoute(
   }
   if (lastPoint && destination.lat && destination.lng) {
     walkTasks.push(
-      computeWalkLeg(String(lastPoint[1]), String(lastPoint[0]), destination.lat, destination.lng, apiUserType, limit, legCache, true)
+      computeWalkLeg(String(lastPoint[1]), String(lastPoint[0]), destination.lat, destination.lng, apiUserType, limit, legCache, true,
+        stationNameOf(destination.name))
         .then(leg => { postWalkLeg = leg; })
     );
   }
@@ -599,8 +613,15 @@ async function convertKakaoRoute(
     uiSteps.unshift(makeWalkStep('walk-pre', preWalkLeg, `${origin.name ?? '출발지'}에서 승차 지점까지 이동`, false));
     segments.unshift(makeWalkSegment(preWalkLeg));
   }
+  // 목적지가 역이면 하차 후 도보가 보행약자용 출구에서 끝난다 — 그 출구를 도착 칸에 표시
+  const destExit = (postWalkLeg as WalkLeg | null)?.serverRoute?.stationExit ?? null;
   if (postWalkLeg) {
-    uiSteps.push(makeWalkStep('walk-post', postWalkLeg, `${destination.name ?? '목적지'} 도착`, true));
+    const destStep: any = makeWalkStep('walk-post', postWalkLeg, `${destination.name ?? '목적지'} 도착`, true);
+    if (destExit?.message) {
+      const hasElev = (destExit.facilities ?? []).includes('elevator');
+      destStep.accessibility = [{ type: hasElev ? 'elevator' : 'escalator', text: destExit.message, icon: hasElev ? '🛗' : '🔼' }];
+    }
+    uiSteps.push(destStep);
     segments.push(makeWalkSegment(postWalkLeg));
   }
 
@@ -645,9 +666,7 @@ async function convertKakaoRoute(
     depTime: formatClock(now),
     arrTime: formatClock(arr),
     accessible: hasKnownAccessibleLeg,
-    accessNote: hasKnownAccessibleLeg
-      ? '답사 확인된 구간(엘리베이터/저상버스) 포함'
-      : ACCESS_ADVISORY,
+    accessNote: destExitNote(destExit),
     segments,
     steps: uiSteps,
     // NavigationScreen에 그대로 넘겨서 실제 GPS+경사도 안내를 태울 원본 도보 경로
@@ -659,6 +678,8 @@ async function convertKakaoRoute(
     postWalkDistanceM: (postWalkLeg as WalkLeg | null)?.distanceM ?? null,
     ridingGuidance,
     alightStationName,
+    // 목적지가 역일 때 안내 화면 상단에 띄울 출구 문구
+    stationExitMessage: destExit?.message as string | undefined,
     // 미리보기 지도용 — 도보(경사도 zone 색)/탑승(노선 색) 구간별 색상 폴리라인
     mapSegments,
     // NavigationScreen 상단 여정 스테퍼용 — 전체 여정 요약
@@ -1113,7 +1134,7 @@ export default function TransitContent({
         refetchTasks.push(
           computeWalkLegUncached(
             String(alightPt[1]), String(alightPt[0]), endLatitude, endLongitude,
-            apiUserType, fullLimit, false,
+            apiUserType, fullLimit, false, stationNameOf(endName),
           ).then(leg => { if (leg.serverRoute) postWalkRoute = leg.serverRoute; })
         );
       }
@@ -1172,6 +1193,7 @@ export default function TransitContent({
       journeyMapSegments: journeyMapSegmentsJson,
       finalDestinationName: endName,
       finalOriginName: startName,
+      ...(currentRoute.stationExitMessage ? { stationExitMessage: currentRoute.stationExitMessage } : {}),
     } : null;
 
     const preWalkParams = hasRealPreWalk ? {
