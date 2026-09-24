@@ -38,7 +38,9 @@ subway/facility.py — 지하철역 편의시설 DB
 import os
 import re
 import math
+import time
 import logging
+import threading
 import requests
 
 from config import (
@@ -251,6 +253,10 @@ def _kakao_exit_coord(station: str, exit_no: str) -> tuple[float, float] | None:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _fetch_seoul_api(key: str, service: str) -> list[dict]:
+    return _fetch_seoul_api_checked(key, service)[0]
+
+
+def _fetch_seoul_api_checked(key: str, service: str) -> tuple[list[dict], bool]:
     """
     서울 열린데이터광장 REST API 호출 → 전체 item 리스트 (페이지네이션 처리)
 
@@ -261,7 +267,7 @@ def _fetch_seoul_api(key: str, service: str) -> list[dict]:
     한 번에 최대 1000건 → totalCount > 1000 이면 여러 번 호출.
     """
     if not key:
-        return []
+        return [], True
 
     PAGE = 1000
     all_items: list[dict] = []
@@ -278,7 +284,7 @@ def _fetch_seoul_api(key: str, service: str) -> list[dict]:
             header = body.get("response", {}).get("header", {})
             if header.get("resultCode") != "00":
                 log.warning("서울 API 오류 [%s]: %s", service, header.get("resultMsg"))
-                break
+                return all_items, False
 
             api_body   = body["response"]["body"]
             total      = int(api_body.get("totalCount", 0))
@@ -297,14 +303,27 @@ def _fetch_seoul_api(key: str, service: str) -> list[dict]:
 
         except Exception as e:
             log.warning("서울 API 호출 실패 [%s, %d~%d]: %s", service, start, end, e)
-            break
+            return all_items, False
 
-    return all_items
+    return all_items, True
 
 
-def get_broken_serials() -> set[str]:
+# 운행상태 캐시 — 이 API는 호출 한 번에 ~5초, 엘리베이터+에스컬레이터 합쳐 ~15초라
+# 요청마다 부르면 역 이름이 도착지인 /route 가 매번 15~30초 걸렸다(실측 2026-09).
+# 고장 현황은 분 단위로 바뀌므로 TTL 동안 재사용하고, 만료 후엔 이전 값을 바로
+# 돌려주면서 백그라운드에서 갱신한다(요청이 API 응답을 기다리지 않음). 캐시가
+# 아예 없을 때(부팅 직후 워밍 전)만 동기로 한 번 조회하며, 동시 요청은 락으로
+# 한 번만 부른다.
+_BROKEN_TTL_OK_S   = 300.0   # 정상 조회 결과 재사용 시간
+_BROKEN_TTL_FAIL_S = 60.0    # 조회 실패(일부/전체) 시 — 빨리 재시도
+_broken_cache: tuple[float, float, set[str]] | None = None   # (조회시각, ttl, serials)
+_broken_lock = threading.Lock()
+_broken_refreshing = False
+
+
+def _fetch_broken_serials() -> tuple[set[str], bool]:
     """
-    현재 고장/운행중단 승강기 일련번호 집합 반환
+    현재 고장/운행중단 승강기 일련번호 집합 + 전부 정상 조회됐는지
     OA-22740 (엘리베이터, getWksnElvtr) + OA-22742 (에스컬레이터, getWksnEsctr) 합산
 
     핵심 필드:
@@ -312,19 +331,70 @@ def get_broken_serials() -> set[str]:
       oprtngSitu — 가동현황 코드 (M=정상, 나머지=고장·중단)
     """
     broken: set[str] = set()
-
+    all_ok = True
     for key, svc in [
         (SEOUL_ELEVATOR_KEY,  _SVC_ELEVATOR),
         (SEOUL_ESCALATOR_KEY, _SVC_ESCALATOR),
     ]:
-        items = _fetch_seoul_api(key, svc)
+        items, ok = _fetch_seoul_api_checked(key, svc)
+        all_ok = all_ok and ok
         for item in items:
             serial = item.get("elvtrSn", "").strip()
             status = item.get("oprtngSitu", "")
             if serial and status not in _OPERATING_OK:
                 broken.add(serial)
+    return broken, all_ok
 
+
+def _refresh_broken_serials() -> set[str]:
+    global _broken_cache
+    t0 = time.monotonic()
+    broken, ok = _fetch_broken_serials()
+    prev = _broken_cache
+    # 실패했는데 이전 값이 있으면 이전 값 유지(빈 집합으로 덮으면 고장 승강기를 추천하게 됨)
+    if not ok and prev is not None and not broken:
+        broken = prev[2]
+    _broken_cache = (time.monotonic(), _BROKEN_TTL_OK_S if ok else _BROKEN_TTL_FAIL_S, broken)
+    log.info("승강기 운행상태 갱신: 고장 %d건, ok=%s, %.1fs", len(broken), ok, time.monotonic() - t0)
     return broken
+
+
+def _refresh_broken_serials_bg() -> None:
+    global _broken_refreshing
+    try:
+        with _broken_lock:
+            _refresh_broken_serials()
+    except Exception as e:
+        log.warning("승강기 운행상태 백그라운드 갱신 실패: %s", e)
+    finally:
+        _broken_refreshing = False
+
+
+def warm_broken_serials() -> None:
+    """서버 기동 시 백그라운드로 한 번 채워 둔다 — 첫 요청이 기다리지 않게."""
+    global _broken_refreshing
+    if _broken_refreshing:
+        return
+    _broken_refreshing = True
+    threading.Thread(target=_refresh_broken_serials_bg, daemon=True, name="broken-serials").start()
+
+
+def get_broken_serials() -> set[str]:
+    """
+    현재 고장/운행중단 승강기 일련번호 집합(캐시). 캐시가 만료됐으면 이전 값을
+    그대로 돌려주고 백그라운드 갱신만 건다. 캐시가 없으면 동기로 한 번 조회.
+    """
+    global _broken_refreshing
+    hit = _broken_cache
+    if hit is not None:
+        fetched_at, ttl, serials = hit
+        if time.monotonic() - fetched_at >= ttl and not _broken_refreshing:
+            warm_broken_serials()
+        return serials
+    with _broken_lock:
+        if _broken_cache is not None:           # 락 기다리는 동안 다른 요청이 채움
+            return _broken_cache[2]
+        return _refresh_broken_serials()
 
 
 def get_station_chargers(station_name: str | None = None) -> list[dict]:
@@ -459,6 +529,11 @@ class SubwayFacilityDB:
                    데이터 결측이지 "이 방향 아님"이 아니므로 양쪽 다 후보로 남긴다.
         """
         stn    = _normalize_station(station_name)
+        # 이 역에 해당 시설 데이터가 아예 없으면(광화문 등) 운행상태 조회 없이 끝낸다.
+        if user_type not in _ELEVATOR_ONLY and user_type not in _ESC_PREFERRED:
+            return []
+        if not self._elev.get(stn) and not (user_type in _ESC_PREFERRED and self._esc.get(stn)):
+            return []
         broken = get_broken_serials()
         need_dir = _ESC_DOWN if direction == "entering" else _ESC_UP
 

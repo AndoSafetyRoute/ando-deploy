@@ -380,6 +380,9 @@ async def lifespan(app: FastAPI):
     try:
         _subway_db = get_facility_db()
         print("[Subway] 편의시설 DB 로딩 완료")
+        # 승강기 운행상태 캐시를 백그라운드로 미리 채움(~15초) — 첫 역 도착 /route 가 안 기다리게
+        from subway.facility import warm_broken_serials
+        warm_broken_serials()
     except Exception as e:
         print(f"[Subway] 편의시설 DB 초기화 실패 (subway 기능 비활성): {e}")
     yield
@@ -1503,6 +1506,7 @@ def api_route(
     if body.candidates not in ("single", "compare"):
         raise HTTPException(400, "candidates는 'single' 또는 'compare'여야 합니다")
 
+    _t_handler_start = time.perf_counter()   # [TIMING] 출구 선택까지 포함하려고 맨 앞에서 잰다
     try:
         origin = (body.origin_lon, body.origin_lat)
         dest   = (body.dest_lon,   body.dest_lat)
@@ -1706,12 +1710,13 @@ def api_route(
         # 타임스탬프가 없을 수 있음 — 그 구간 소요는 0으로 본다(실제로 안 돎).
         _t_measurement_units = locals().get("_t_measurement_units", _t_nav_segs)
         print(
-            f"[TIMING] /route  find_route={_t_find_route - _t_route_start:.3f}s  "
+            f"[TIMING] /route  pre(exit_snap 등)={_t_route_start - _t_handler_start:.3f}s  "
+            f"find_route={_t_find_route - _t_route_start:.3f}s  "
             f"shortest_card={_t_shortest_card - _t_find_route:.3f}s  "
             f"nav_segs={_t_nav_segs - _t_shortest_card:.3f}s  "
             f"measurement_units={_t_measurement_units - _t_nav_segs:.3f}s  "
             f"waypoints={_t_waypoints - _t_measurement_units:.3f}s  "
-            f"total={_t_waypoints - _t_route_start:.3f}s"
+            f"total={_t_waypoints - _t_handler_start:.3f}s"
         )
 
         response = {
