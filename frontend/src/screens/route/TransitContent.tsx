@@ -3,7 +3,7 @@ import {
   View, Text, StyleSheet, TouchableOpacity,
   ScrollView, Animated, Dimensions, Platform, Alert,
 } from 'react-native';
-import { C, ZONE_COLORS, SUBWAY_LINE_COLORS, busTypeColor } from '../../constants/colors';
+import { C, ZONE_COLORS, busTypeColor, subwayLineColor } from '../../constants/colors';
 import { formatMinutes } from '../../utils/storage';
 import {
   requestTransitDirections,
@@ -111,6 +111,17 @@ function routeTypeToTag(type: string) {
   return { tag: '버스+지하철', tagColor: C.primary };
 }
 
+// 카카오 환승 도보 안내는 역명이 앞에 한 번 더 붙어 온다("사당사당역 환승",
+// "신사신사역까지 도보로 이동") — 반복된 앞쪽 역명만 뗀다.
+function dedupeStationPrefix(text: string) {
+  return (text ?? '').replace(/^(.{2,}?)\1(?=역)/, '$1');
+}
+
+// "4" → "4호선", "신분당선"·"경의중앙선"·"공항철도"는 그대로
+function lineLabel(lineNo: string) {
+  return /^\d+$/.test(lineNo) ? `${lineNo}호선` : lineNo;
+}
+
 function formatDistanceText(m: number) {
   if (!Number.isFinite(m)) return '';
   return m >= 1000 ? `${(m / 1000).toFixed(1)}km` : `${Math.round(m)}m`;
@@ -152,11 +163,11 @@ function buildSteps(steps: KakaoTransitStep[], apiUserType: string) {
     return {
       id: `k${i}`,
       type: uiType,
-      title: p.guidance,
+      title: p.type === 'WALKING' ? dedupeStationPrefix(p.guidance) : p.guidance,
       subtitle: `${label} ${formatMinutes(duration)}${distanceText ? ` · 약 ${distanceText}` : ''}`,
       icon, color, colorBg,
       lineNo: p.type === 'SUBWAY' && vehicle ? vehicle.name.replace(/호선$/, '') : undefined,
-      lineColor: p.type === 'SUBWAY' ? color : undefined,
+      lineColor: p.type === 'SUBWAY' ? (subwayLineColor(vehicle?.name) ?? color) : undefined,
       busNo,
       stops: stopNames,
       accessibility,
@@ -349,7 +360,8 @@ function computeSubwayExit(
   direction: 'entering' | 'exiting',
   cache: SubwayExitCache,
 ): Promise<SubwayBestExit | null> {
-  const key = `${station}:${apiUserType}:${direction}`;
+  // 환승역은 기준점(직전/다음 정류장)에 따라 가까운 출구가 달라지므로 좌표도 키에 넣는다.
+  const key = `${station}:${apiUserType}:${direction}:${lat.toFixed(4)},${lon.toFixed(4)}`;
   const cached = cache.get(key);
   if (cached) return cached;
 
@@ -360,10 +372,16 @@ function computeSubwayExit(
 
 // 백엔드 실측(서울 열린데이터광장, 5분 갱신) 출구 정보를 스텝에 반영.
 // 답사 하드코딩 정보보다 항상 우선 — 고장 여부까지 반영된 실시간 데이터이기 때문.
-function applyBestExit(step: any, exit: SubwayBestExit) {
-  if (!step) return;
+function bestExitRow(exit: SubwayBestExit) {
   const icon = exit.type === 'elevator' ? '🛗' : exit.type === 'escalator' ? '🔼' : '🦼';
-  step.accessibility = [{ type: exit.type, text: exit.message, icon, exit: true }];
+  return { type: exit.type, text: exit.message, icon, exit: true };
+}
+
+// 카카오 환승 도보 안내의 "(4번 출구)"는 일반 출구 기준 — 보행약자용 출구 번호로 바꾼다.
+function withExitNo(title: string | undefined, exitNo: string) {
+  const t = title ?? '';
+  const re = /\(\s*[\d-]+번\s*출구\s*\)/;
+  return re.test(t) ? t.replace(re, `(${exitNo}번 출구)`) : `${t} (${exitNo}번 출구)`.trim();
 }
 
 // 전동휠체어 충전소 조회 캐시 — 여러 후보 경로가 같은 역을 공유할 때
@@ -483,9 +501,11 @@ async function convertKakaoRoute(
 
   const walkTasks: Promise<void>[] = [];
 
-  // 출발지/도착지가 역일 때의 출구 안내.
-  //  - 출발역에서 바로 지하철을 타면(출발역 = 첫 탑승역): 그 역에 "들어가는" 출구까지가 승차 전 도보
-  //  - 도착역에서 지하철을 내리면(도착역 = 마지막 하차역): 그 역에서 "나오는" 출구까지가 하차 후 도보
+  // 거리 ↔ 승강장을 오가는 지하철역의 출구 — 첫 승차역, 마지막 하차역, 버스↔지하철 환승역.
+  // 지하철끼리 갈아타는 역은 밖으로 나가지 않으므로 제외한다. 도보는 그 역의 보행약자용
+  // 출구까지로 맞추고, 지도에선 출구 ↔ 역(탑승 구간 끝점)을 점선으로 이어 거리 도보와 구분한다.
+  //  - 출발역 = 첫 탑승역이면: 도보 없이 그 역 출구에서 출발(핀도 출구)
+  //  - 도착역 = 마지막 하차역이면: 도보 없이 그 역 출구에서 도착(핀도 출구)
   //  - 그 외(버스로 가거나 다른 역에서 타고 내림): 도보 구간을 서버가 출발/도착 역 출구로 맞춘다
   //    (start/end_station_name → startStationExit/stationExit)
   // light: true — 아직 선택 안 된 후보 경로 단계라 GPS 안내용 waypoints는
@@ -494,6 +514,7 @@ async function convertKakaoRoute(
   // light:false로 다시 조회해 waypoints를 채운다.
   const firstStep = steps[0];
   const lastStep  = steps[steps.length - 1];
+  const lastIdx   = steps.length - 1;
   const originStation = stationNameOf(origin.name);
   const destStation   = stationNameOf(destination.name);
   const boardStation  = firstStep?.properties.type === 'SUBWAY' ? firstStep.properties.stops?.[0]?.name : undefined;
@@ -502,76 +523,139 @@ async function convertKakaoRoute(
   const originIsBoard = sameStation(originStation, boardStation);
   const destIsAlight  = sameStation(destStation, alightStation);
 
-  // 실제 승/하차 지점이 지하철역이면 최적 출구를 백엔드에서 조회해 답사 하드코딩보다 우선.
-  // 중간 환승역은 대상에서 제외 — 실제 도보 이동이 발생하는 첫/마지막 역만 사용자 편의에 직결된다.
-  const boardExitP: Promise<SubwayBestExit | null> = boardStation && origin.lat && origin.lng
-    ? computeSubwayExit(boardStation, apiUserType, Number(origin.lat), Number(origin.lng), 'entering', subwayCache)
-    : Promise.resolve(null);
-  const alightExitP: Promise<SubwayBestExit | null> = alightStation && destination.lat && destination.lng
-    ? computeSubwayExit(alightStation, apiUserType, Number(destination.lat), Number(destination.lng), 'exiting', subwayCache)
-    : Promise.resolve(null);
-  let boardExit: SubwayBestExit | null = null;
-  let alightExit: SubwayBestExit | null = null;
-  const lastRideIdx = uiSteps.length - 1;
-  walkTasks.push(boardExitP.then(exit => { boardExit = exit; if (exit) applyBestExit(uiSteps[0], exit); }));
-  walkTasks.push(alightExitP.then(exit => { alightExit = exit; if (exit) applyBestExit(uiSteps[lastRideIdx], exit); }));
+  const rideBefore = (i: number) => steps.slice(0, i).reverse().find(s => s.properties.type !== 'WALKING');
+  const rideAfter  = (i: number) => steps.slice(i + 1).find(s => s.properties.type !== 'WALKING');
+  const lastPointOf  = (s?: KakaoTransitStep) => s?.path?.points?.[s.path.points.length - 1];
+  const originRef = origin.lat && origin.lng ? { lat: Number(origin.lat), lon: Number(origin.lng) } : null;
+  const destRef   = destination.lat && destination.lng ? { lat: Number(destination.lat), lon: Number(destination.lng) } : null;
+  const toRef = (p?: [number, number]) => (p ? { lat: p[1], lon: p[0] } : null);
+
+  // SUBWAY 스텝 인덱스 → 그 스텝의 승차역(들어가는) / 하차역(나오는) 출구.
+  // 출구 기준점은 그 역으로 오는 쪽(출발지·직전 정류장) / 가는 쪽(목적지·다음 정류장).
+  const boardExitPs  = new Map<number, Promise<SubwayBestExit | null>>();
+  const alightExitPs = new Map<number, Promise<SubwayBestExit | null>>();
+  steps.forEach((step, i) => {
+    if (step.properties.type !== 'SUBWAY') return;
+    const stops = step.properties.stops ?? [];
+    if (rideBefore(i)?.properties.type !== 'SUBWAY') {
+      const prev = steps[i - 1];
+      const ref = i === 0 ? originRef
+        : toRef(prev?.properties.type === 'WALKING' ? prev.path?.points?.[0] : lastPointOf(prev));
+      if (stops[0]?.name && ref) {
+        boardExitPs.set(i, computeSubwayExit(stops[0].name, apiUserType, ref.lat, ref.lon, 'entering', subwayCache));
+      }
+    }
+    if (rideAfter(i)?.properties.type !== 'SUBWAY') {
+      const next = steps[i + 1];
+      const ref = i === lastIdx ? destRef
+        : toRef(next?.properties.type === 'WALKING' ? lastPointOf(next) : next?.path?.points?.[0]);
+      const name = stops[stops.length - 1]?.name;
+      if (name && ref) {
+        alightExitPs.set(i, computeSubwayExit(name, apiUserType, ref.lat, ref.lon, 'exiting', subwayCache));
+      }
+    }
+  });
+  const noExit: Promise<SubwayBestExit | null> = Promise.resolve(null);
+  const boardExitP  = boardExitPs.get(0) ?? noExit;
+  const alightExitP = alightExitPs.get(lastIdx) ?? noExit;
+
+  const boardExits  = new Map<number, SubwayBestExit | null>();
+  const alightExits = new Map<number, SubwayBestExit | null>();
+  boardExitPs.forEach((p, i) => walkTasks.push(p.then(ex => { boardExits.set(i, ex); })));
+  alightExitPs.forEach((p, i) => walkTasks.push(p.then(ex => { alightExits.set(i, ex); })));
+
+  let boardChargers: StationCharger[] | null = null;
+  let alightChargers: StationCharger[] | null = null;
   if (apiUserType === 'electric_wheelchair') {
     if (boardStation) {
-      walkTasks.push(computeStationChargers(boardStation, chargerCache)
-        .then(chargers => { if (chargers) applyChargerInfo(uiSteps[0], chargers); }));
+      walkTasks.push(computeStationChargers(boardStation, chargerCache).then(c => { boardChargers = c; }));
     }
     if (alightStation) {
-      walkTasks.push(computeStationChargers(alightStation, chargerCache)
-        .then(chargers => { if (chargers) applyChargerInfo(uiSteps[lastRideIdx], chargers); }));
+      walkTasks.push(computeStationChargers(alightStation, chargerCache).then(c => { alightChargers = c; }));
     }
   }
 
   if (firstPoint && origin.lat && origin.lng) {
     walkTasks.push((async () => {
-      if (originIsBoard) {
-        // 출발지(역) → 그 역으로 들어가는 출구. 출구를 못 찾으면 기존처럼 승차 지점까지.
-        const ex = await boardExitP;
-        const [tLat, tLng] = ex ? [String(ex.lat), String(ex.lon)] : [String(firstPoint[1]), String(firstPoint[0])];
-        preWalkLeg = await computeWalkLeg(origin.lat!, origin.lng!, tLat, tLng, apiUserType, limit, legCache, true);
-      } else {
-        preWalkLeg = await computeWalkLeg(origin.lat!, origin.lng!, String(firstPoint[1]), String(firstPoint[0]),
-          apiUserType, limit, legCache, true, undefined, originStation);
-      }
+      const ex = await boardExitP;
+      // 첫 탑승이 지하철이면 그 역 출구까지, 아니면(버스) 승차 지점까지.
+      // 출발지(역) = 첫 탑승역이어도 출발 칸·안내용으로 역 → 출구 도보는 계산한다(지도엔 안 그림).
+      const [tLat, tLng] = ex ? [String(ex.lat), String(ex.lon)] : [String(firstPoint[1]), String(firstPoint[0])];
+      preWalkLeg = await computeWalkLeg(origin.lat!, origin.lng!, tLat, tLng,
+        apiUserType, limit, legCache, true, undefined, originIsBoard ? undefined : originStation);
     })());
   }
   if (lastPoint && destination.lat && destination.lng) {
     walkTasks.push((async () => {
+      const ex = await alightExitP;
       if (destIsAlight) {
-        // 하차 지점 → 그 역에서 나오는 출구. 출구를 못 찾으면 기존처럼 목적지 좌표까지.
-        const ex = await alightExitP;
+        // 도착지(역) = 마지막 하차역: 도착 칸·안내용으로 하차 지점 → 그 역의 나오는 출구 도보
+        // (지도엔 안 그림). 출구를 못 찾으면 목적지 좌표까지.
         const [tLat, tLng] = ex ? [String(ex.lat), String(ex.lon)] : [destination.lat!, destination.lng!];
         postWalkLeg = await computeWalkLeg(String(lastPoint[1]), String(lastPoint[0]), tLat, tLng, apiUserType, limit, legCache, true);
-      } else {
-        postWalkLeg = await computeWalkLeg(String(lastPoint[1]), String(lastPoint[0]), destination.lat!, destination.lng!,
-          apiUserType, limit, legCache, true, destStation);
+        return;
       }
+      // 마지막 하차가 지하철이면 그 역 출구에서, 아니면(버스) 하차 지점에서.
+      const [fLat, fLng] = ex ? [String(ex.lat), String(ex.lon)] : [String(lastPoint[1]), String(lastPoint[0])];
+      postWalkLeg = await computeWalkLeg(fLat, fLng, destination.lat!, destination.lng!,
+        apiUserType, limit, legCache, true, destStation);
     })());
   }
 
   // 카카오가 준 환승/역 도보 스텝(승하차 지점과 무관한, 경로 중간의 WALKING
-  // 스텝) — 좌표는 카카오 것을 그대로 쓰되, 소요시간·경사 유의사항만 CCH로
-  // 재계산해 덮어쓴다. 실제 GPS 내비게이션 화면까지 만들지는 않는다(대부분
-  // 100~300m의 역 구내/인근 이동이라 별도 안내보다 정확한 시간이 더 중요).
+  // 스텝) — 소요시간·경사 유의사항을 CCH로 재계산해 덮어쓴다. 실제 GPS 내비게이션
+  // 화면까지 만들지는 않는다(대부분 100~300m의 역 구내/인근 이동). 버스↔지하철
+  // 환승이면 카카오의 일반 출구 대신 보행약자용 출구까지로 다시 계산해 지도에도
+  // 그 경로를 그린다.
+  const midWalks = new Map<number, { leg: WalkLeg; from: MapCoordinate; to: MapCoordinate }>();
+  // 지하철 → 지하철 환승 도보는 역 안(지하) 이동 — 거리 도보로 재계산하지 않고 카카오
+  // 시간을 그대로 쓰며, 지도에선 점선으로 그린다(지상 도보만 경사도색 실선).
+  const isInStationTransfer = (i: number) =>
+    steps[i]?.properties.type === 'WALKING'
+    && steps[i - 1]?.properties.type === 'SUBWAY'
+    && steps[i + 1]?.properties.type === 'SUBWAY';
   steps.forEach((step, i) => {
     if (step.properties.type !== 'WALKING') return;
+    if (isInStationTransfer(i)) return;
     const pts = step.path?.points;
     if (!pts || pts.length < 2) return;
-    const [sLng, sLat] = pts[0];
-    const [eLng, eLat] = pts[pts.length - 1];
-    walkTasks.push(
+    const toExitP   = steps[i + 1]?.properties.type === 'SUBWAY' ? boardExitPs.get(i + 1) : undefined;
+    const fromExitP = steps[i - 1]?.properties.type === 'SUBWAY' ? alightExitPs.get(i - 1) : undefined;
+    walkTasks.push((async () => {
+      const [toEx, fromEx] = await Promise.all([toExitP ?? noExit, fromExitP ?? noExit]);
+      const [sLng, sLat] = fromEx ? [fromEx.lon, fromEx.lat] : pts[0];
+      const [eLng, eLat] = toEx ? [toEx.lon, toEx.lat] : pts[pts.length - 1];
       // 이 중간 환승 도보 스텝은 표시용 시간·거리 텍스트로만 쓰이고 별도 GPS
       // 안내 화면을 만들지 않으므로 항상 light 조회로 충분하다.
-      computeWalkLeg(String(sLat), String(sLng), String(eLat), String(eLng), apiUserType, limit, legCache, true)
-        .then(leg => applyCchWalkLeg(uiSteps[i], segments[i], leg))
-    );
+      const leg = await computeWalkLeg(String(sLat), String(sLng), String(eLat), String(eLng), apiUserType, limit, legCache, true);
+      applyCchWalkLeg(uiSteps[i], segments[i], leg);
+      const ex = toEx ?? fromEx;
+      if (ex) {
+        midWalks.set(i, {
+          leg,
+          from: { latitude: Number(sLat), longitude: Number(sLng) },
+          to:   { latitude: Number(eLat), longitude: Number(eLng) },
+        });
+        uiSteps[i].title = withExitNo(uiSteps[i].title, ex.exit_no);
+      }
+    })());
   });
 
   await Promise.all(walkTasks);
+
+  // 출구 문구 — 한 지하철 스텝이 승차·하차 출구를 둘 다 가질 수 있어(지하철 한 번만
+  // 타는 경로 등) 비동기로 따로 덮어쓰지 않고 여기서 순서대로(들어감 → 나옴) 모은다.
+  // 답사 하드코딩보다 우선하고, 충전기 정보는 그 뒤에 붙인다.
+  steps.forEach((_, i) => {
+    const rows = [boardExits.get(i), alightExits.get(i)]
+      .filter((ex): ex is SubwayBestExit => !!ex)
+      .map(bestExitRow);
+    if (rows.length > 0) uiSteps[i].accessibility = rows;
+  });
+  if (boardChargers) applyChargerInfo(uiSteps[0], boardChargers);
+  if (alightChargers) applyChargerInfo(uiSteps[lastIdx], alightChargers);
+  const boardExit  = boardExits.get(0) ?? null;
+  const alightExit = alightExits.get(lastIdx) ?? null;
 
   // 미리보기 지도용 구간별 색상 — 도보는 경사도 zone 색, 탑승 구간은 그 스텝의
   // 노선 브랜드 색(지하철/버스 색)을 써서 경사도 팔레트와 안 겹치게 분리한다.
@@ -595,19 +679,31 @@ async function convertKakaoRoute(
     return [];
   };
 
-  if (preWalkLeg) {
-    const preSegs = walkLegToMapSegments(preWalkLeg);
-    if (preSegs.length > 0) {
-      mapSegments.push(...preSegs);
-    } else if (origin.lat && origin.lng && firstPoint) {
-      mapSegments.push({
-        coordinates: [
-          { latitude: Number(origin.lat), longitude: Number(origin.lng) },
-          { latitude: firstPoint[1], longitude: firstPoint[0] },
-        ],
-        color: C.walk,
-      });
-    }
+  const pushWalk = (leg: WalkLeg | null, from: MapCoordinate, to: MapCoordinate) => {
+    const segs = walkLegToMapSegments(leg);
+    if (segs.length > 0) mapSegments.push(...segs);
+    else mapSegments.push({ coordinates: [from, to], color: C.walk });
+  };
+
+  // 출구 ↔ 역 연결선(역 안 이동). 출구에 핀이 이미 있으면(출발/도착 = 그 역) 라벨은 생략.
+  const exitCoord = (ex: SubwayBestExit): MapCoordinate => ({ latitude: Number(ex.lat), longitude: Number(ex.lon) });
+  const ptCoord = (p: [number, number]): MapCoordinate => ({ latitude: p[1], longitude: p[0] });
+  const pushConnector = (from: MapCoordinate, to: MapCoordinate, ex: SubwayBestExit, pinned: boolean) => {
+    mapSegments.push({
+      coordinates: [from, to],
+      color: C.exitConnector,
+      dashed: true,
+      ...(pinned ? {} : { label: `${ex.exit_no}번 출구`, labelPoint: exitCoord(ex) }),
+    });
+  };
+  // 출발역 = 첫 탑승역 / 도착역 = 마지막 하차역이면 지도엔 역 ↔ 출구 거리 도보를 그리지 않고
+  // (점선과 겹쳐 되돌아가는 모양이 됨) 핀을 출구에 찍는다. 출발·도착 칸과 안내는 그대로.
+  const startPinnedAtExit = originIsBoard && !!boardExit;
+  const endPinnedAtExit   = destIsAlight && !!alightExit;
+
+  if (preWalkLeg && !startPinnedAtExit && origin.lat && origin.lng && firstPoint) {
+    const to = boardExit ? exitCoord(boardExit) : ptCoord(firstPoint);
+    pushWalk(preWalkLeg, { latitude: Number(origin.lat), longitude: Number(origin.lng) }, to);
   }
 
   steps.forEach((step, i) => {
@@ -615,7 +711,10 @@ async function convertKakaoRoute(
     if (!pts || pts.length < 2) return;
     const coords = pointsToCoordinates(pts);
     if (step.properties.type === 'WALKING') {
-      mapSegments.push({ coordinates: coords, color: C.walk });
+      const mid = midWalks.get(i);
+      if (isInStationTransfer(i)) mapSegments.push({ coordinates: coords, color: C.exitConnector, dashed: true });
+      else if (mid) pushWalk(mid.leg, mid.from, mid.to);
+      else mapSegments.push({ coordinates: coords, color: C.walk });
     } else if (step.properties.type === 'BUS') {
       const vehicle = step.properties.vehicles?.[0];
       const busNo = vehicle?.name;
@@ -624,25 +723,18 @@ async function convertKakaoRoute(
       // 실시간 배지(BusArrivalBadge, is_lowfloor)로만 보여준다.
       mapSegments.push({ coordinates: coords, color: busTypeColor(busNo) });
     } else {
+      const inEx = boardExits.get(i);
+      if (inEx) pushConnector(exitCoord(inEx), ptCoord(pts[0]), inEx, i === 0 && startPinnedAtExit);
       const vehicle = step.properties.vehicles?.[0];
-      const lineNo = vehicle?.name?.replace(/호선$/, '');
-      mapSegments.push({ coordinates: coords, color: (lineNo && SUBWAY_LINE_COLORS[lineNo]) || C.transitLineSubway });
+      mapSegments.push({ coordinates: coords, color: subwayLineColor(vehicle?.name) || C.transitLineSubway });
+      const outEx = alightExits.get(i);
+      if (outEx) pushConnector(ptCoord(pts[pts.length - 1]), exitCoord(outEx), outEx, i === lastIdx && endPinnedAtExit);
     }
   });
 
-  if (postWalkLeg) {
-    const postSegs = walkLegToMapSegments(postWalkLeg);
-    if (postSegs.length > 0) {
-      mapSegments.push(...postSegs);
-    } else if (destination.lat && destination.lng && lastPoint) {
-      mapSegments.push({
-        coordinates: [
-          { latitude: lastPoint[1], longitude: lastPoint[0] },
-          { latitude: Number(destination.lat), longitude: Number(destination.lng) },
-        ],
-        color: C.walk,
-      });
-    }
+  if (postWalkLeg && !endPinnedAtExit && destination.lat && destination.lng && lastPoint) {
+    const from = alightExit ? exitCoord(alightExit) : ptCoord(lastPoint);
+    pushWalk(postWalkLeg, from, { latitude: Number(destination.lat), longitude: Number(destination.lng) });
   }
 
   // 출발/도착이 역이면 그 출구를 출발 칸·도착 칸에 항상 보이게 표시한다.
@@ -661,13 +753,15 @@ async function convertKakaoRoute(
 
   if (preWalkLeg) {
     const preStep: any = makeWalkStep('walk-pre', preWalkLeg, `${origin.name ?? '출발지'}에서 승차 지점까지 이동`, false);
-    if (startExit?.message) preStep.accessibility = [exitAccessRow(startExit)];
+    // 출발역 = 첫 탑승역이면 같은 출구 문구가 지하철 칸에 이미 있으므로 출발 칸엔 붙이지 않는다.
+    if (startExit?.message && !originIsBoard) preStep.accessibility = [exitAccessRow(startExit)];
     uiSteps.unshift(preStep);
     segments.unshift(makeWalkSegment(preWalkLeg));
   }
   if (postWalkLeg) {
     const destStep: any = makeWalkStep('walk-post', postWalkLeg, `${destination.name ?? '목적지'} 도착`, true);
-    if (destExit?.message) destStep.accessibility = [exitAccessRow(destExit)];
+    // 도착역 = 마지막 하차역이면 같은 출구 문구가 지하철 칸에 이미 있으므로 도착 칸엔 붙이지 않는다.
+    if (destExit?.message && !destIsAlight) destStep.accessibility = [exitAccessRow(destExit)];
     uiSteps.push(destStep);
     segments.push(makeWalkSegment(postWalkLeg));
   }
@@ -678,7 +772,11 @@ async function convertKakaoRoute(
   // unshift/push되므로 인덱스가 계속 맞는다.
   segments.forEach((seg: any, i: number) => {
     const step: any = uiSteps[i];
-    if (seg.type === 'subway' && step?.lineNo) seg.label = `${step.lineNo}호선 ${formatMinutes(seg.duration)}`;
+    if (seg.type === 'subway' && step?.lineNo) {
+      seg.label = `${lineLabel(step.lineNo)} ${formatMinutes(seg.duration)}`;
+      // 경로 카드의 구간 막대·범례 점도 호선 색으로(지하철끼리 같은 색으로 뭉치지 않게)
+      if (step.lineColor) seg.color = step.lineColor;
+    }
     else if (seg.type === 'bus' && step?.busNo) seg.label = `${step.busNo} ${formatMinutes(seg.duration)}`;
   });
 
@@ -698,7 +796,7 @@ async function convertKakaoRoute(
   const hasKnownAccessibleLeg = uiSteps.some(s => (s.accessibility?.length ?? 0) > 0);
 
   // 탑승 구간(버스/지하철) 안내 — 도보1 끝난 뒤 ~ 도보2 시작 전 사이에 보여줄 카카오 원본 안내
-  const ridingGuidance = steps.map(s => s.properties.guidance);
+  const ridingGuidance = steps.map(s => s.properties.type === 'WALKING' ? dedupeStationPrefix(s.properties.guidance) : s.properties.guidance);
 
   // 하차 정류장/역명 — 반복 음성안내("OO역에서 내리세요")에 사용.
   // 마지막 탑승 스텝의 마지막 정류장이 실제 하차 지점이다.
@@ -732,6 +830,10 @@ async function convertKakaoRoute(
     startExitLabel: startExit ? `${startExit.station} ${startExit.exitNo}번 출구` : undefined,
     originIsBoard,
     destIsAlight,
+    // 출발/도착 = 그 역: 지도에서 출구 ↔ 역은 점선으로만 보이므로 안내 화면에서도
+    // 역 ↔ 출구 도보를 GPS 안내 구간(굵은 실선)으로 띄우지 않는다.
+    startPinnedAtExit,
+    endPinnedAtExit,
     endExitLabel: destExit ? `${destExit.station} ${destExit.exitNo}번 출구` : undefined,
     // 미리보기 지도용 — 도보(경사도 zone 색)/탑승(노선 색) 구간별 색상 폴리라인
     mapSegments,
@@ -739,13 +841,18 @@ async function convertKakaoRoute(
     journeySteps,
     // 지도 표시용: 각 스텝의 실제 좌표 경로 (도보 구간은 아직 직선; 지도에서 폴리라인으로 사용)
     mapPath: {
-      preWalk: (preWalkLeg as WalkLeg | null)?.serverRoute?.coordinates?.length
+      // 출발역 = 첫 탑승역: 출구 → 역 점선이 여정의 시작이라 출발 핀이 출구에 찍힌다
+      preWalk: startPinnedAtExit && boardExit && firstPoint
+        ? [[Number(boardExit.lon), Number(boardExit.lat)], firstPoint]
+        : (preWalkLeg as WalkLeg | null)?.serverRoute?.coordinates?.length
         ? (preWalkLeg as WalkLeg | null)!.serverRoute.coordinates
         : preWalkLeg && origin.lat && origin.lng && firstPoint
         ? [[Number(origin.lng), Number(origin.lat)], firstPoint]
         : null,
       transit: steps.flatMap(s => s.path?.points ?? []),
-      postWalk: (postWalkLeg as WalkLeg | null)?.serverRoute?.coordinates?.length
+      postWalk: endPinnedAtExit && alightExit && lastPoint
+        ? [lastPoint, [Number(alightExit.lon), Number(alightExit.lat)]]
+        : (postWalkLeg as WalkLeg | null)?.serverRoute?.coordinates?.length
         ? (postWalkLeg as WalkLeg | null)!.serverRoute.coordinates
         : postWalkLeg && destination.lat && destination.lng && lastPoint
         ? [lastPoint, [Number(destination.lng), Number(destination.lat)]]
@@ -814,7 +921,7 @@ const StepItem = ({ step, isLast }: { step: any; isLast: boolean }) => {
                 <Text style={[ss.stepTitle, step.isDestination && { color: C.danger }]}>{step.title}</Text>
                 {step.lineNo && (
                   <View style={[ss.lineBadge, { backgroundColor: step.lineColor || step.color }]}>
-                    <Text style={ss.lineBadgeText}>{step.lineNo}호선</Text>
+                    <Text style={ss.lineBadgeText}>{lineLabel(step.lineNo)}</Text>
                   </View>
                 )}
                 {step.busNo && (
@@ -1226,8 +1333,16 @@ export default function TransitContent({
     // 통째로 생략되는 부작용이 있었다. 진짜 같은 지점(역 정문 검색 등)일
     // 때만, 즉 출발/도착 마커가 겹쳐서 화면이 의미 없어지는 경우만 거른다.
     const MIN_WALK_LEG_M = 5;
-    const hasRealPreWalk  = !!currentRoute.preWalkRoute  && (currentRoute.preWalkDistanceM  ?? 0) >= MIN_WALK_LEG_M;
-    const hasRealPostWalk = !!currentRoute.postWalkRoute && (currentRoute.postWalkDistanceM ?? 0) >= MIN_WALK_LEG_M;
+    const hasRealPreWalk  = !!currentRoute.preWalkRoute  && (currentRoute.preWalkDistanceM  ?? 0) >= MIN_WALK_LEG_M
+      && !currentRoute.startPinnedAtExit;
+    const hasRealPostWalk = !!currentRoute.postWalkRoute && (currentRoute.postWalkDistanceM ?? 0) >= MIN_WALK_LEG_M
+      && !currentRoute.endPinnedAtExit;
+    // 도보 안내 구간을 건너뛰면 그 출구 문구는 탑승 안내 알림에 함께 띄운다.
+    const alertLines = [
+      currentRoute.startExitMessage,
+      ...(currentRoute.ridingGuidance ?? []),
+      ...(hasRealPostWalk ? [] : [currentRoute.stationExitMessage]),
+    ].filter(Boolean);
 
     // NavigationScreen 상단 여정 스테퍼용 — 전체 구간 요약 + 지금 안내 중인 구간의 인덱스.
     const journeySteps: any[] = currentRoute.journeySteps ?? [];
@@ -1294,15 +1409,16 @@ export default function TransitContent({
     } else if (postWalkParams) {
       // 카카오가 승차 전 도보 스텝을 안 줬거나, 도보 거리가 너무 짧아 생략된 경로
       // — 원래 preWalkParams에 실려갔을 탑승 안내를 놓치지 않도록 알림으로 띄운다.
+      // 출발역 = 첫 탑승역이면 승차 전 도보가 없으니, 들어갈 출구 안내를 탑승 안내 앞에 붙인다.
       if (currentRoute.ridingGuidance?.length) {
-        Alert.alert('탑승 안내', currentRoute.ridingGuidance.filter(Boolean).join('\n'));
+        Alert.alert('탑승 안내', alertLines.join('\n'));
       }
       navigation?.navigate('Navigation', postWalkParams);
     } else {
       // 도보 구간 자체가 없는 경로(버스/지하철만) — 안내할 도보 구간이 없어 스텁 이동.
       // 그래도 탑승 안내(몇 호선/몇 번 버스 타고 어디서 내리는지)는 놓치면 안 되니 알림으로.
       if (currentRoute.ridingGuidance?.length) {
-        Alert.alert('탑승 안내', currentRoute.ridingGuidance.filter(Boolean).join('\n'));
+        Alert.alert('탑승 안내', alertLines.join('\n'));
       }
       navigation?.navigate('Navigation', {
         routeId: currentRoute.id, mode: 'transit',

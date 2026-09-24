@@ -36,6 +36,8 @@ export const C = {
   // 뱃지·아이콘 등 목록 UI에는 영향 없음(거긴 계속 subway/bus 브랜드색 사용).
   transitLineBus:    '#8A8A8A',
   transitLineSubway: '#4A4A4A',
+  // 지하철 출구 ↔ 역(승강장) 연결 점선 — 거리 도보(경사도색)와 구분되는 역 안 이동
+  exitConnector: '#5C6370',
   lowFloor:     '#00BFA5',
   lowFloorBg:   '#E0F7F4',
   walk:         '#9E9E9E',
@@ -83,7 +85,17 @@ export const ZONE_COLORS: Record<string, string> = {
 export const SUBWAY_LINE_COLORS: Record<string, string> = {
   '1': '#0052A4', '2': '#00A84D', '3': '#EF7C1C', '4': '#00A4E3', '5': '#996CAC',
   '6': '#CD7C2F', '7': '#747F00', '8': '#E6186C', '9': '#BDB092',
+  '경의중앙': '#77C4A3', '공항철도': '#0090D2', '신분당': '#D4003B', '수인분당': '#FABE00',
+  '경춘': '#0C8E72', '경강': '#003DA5', '서해': '#8FC31F', '우이신설': '#B0CE18', '신림': '#6789CA',
+  '김포골드': '#A17800', 'GTX-A': '#9A6292', '의정부': '#FDA600', '에버라인': '#509F22',
+  '인천1': '#7CA8D5', '인천2': '#ED8B00',
 };
+
+// 카카오 노선명("4호선", "신분당선", "경의중앙선", "공항철도", "인천1호선") → 호선 색.
+export function subwayLineColor(name: string | undefined | null): string | undefined {
+  const n = (name || '').trim().replace(/호선$/, '');
+  return SUBWAY_LINE_COLORS[n] ?? SUBWAY_LINE_COLORS[n.replace(/선$/, '')];
+}
 
 // 서울시 버스 노선유형별 공식 색상(간선=파랑/지선=초록/순환=노랑/광역=빨강/마을=민트).
 // 카카오 API가 노선유형을 별도 필드로 안 줘서(vehicle.type 미검증), 서울시가

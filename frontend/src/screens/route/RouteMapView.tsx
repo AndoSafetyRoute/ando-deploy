@@ -18,6 +18,11 @@ export type MapRouteSegment = {
   borderColor?: string;
   slopeMean?: number;
   zone?: string;
+  // 지하철 출구 ↔ 역 연결처럼 거리 도보가 아닌 구간 — 점선 한 줄로 그린다.
+  dashed?: boolean;
+  // labelPoint에 작은 라벨(예: "3번 출구")을 띄운다.
+  label?: string;
+  labelPoint?: MapCoordinate;
 };
 
 export type MapRoute = {
@@ -65,6 +70,9 @@ function makeRouteMapHtml({ routes, selectedRouteId, startLabel, endLabel, width
         borderColor: seg.borderColor || r.color,
         slopeMean: seg.slopeMean,
         zone: seg.zone,
+        dashed: !!seg.dashed,
+        label: seg.label ? escapeHtmlText(seg.label) : undefined,
+        labelPoint: seg.labelPoint ? { lat: seg.labelPoint.latitude, lng: seg.labelPoint.longitude } : undefined,
       })),
     }))
   );
@@ -92,6 +100,15 @@ function makeRouteMapHtml({ routes, selectedRouteId, startLabel, endLabel, width
             font-size: 12px;
             font-weight: 700;
             box-shadow: 0 2px 8px rgba(0,0,0,0.16);
+            white-space: nowrap;
+          }
+          .exit-label {
+            padding: 3px 7px;
+            border-radius: 10px;
+            background: #5C6370;
+            color: #ffffff;
+            font-size: 11px;
+            font-weight: 700;
             white-space: nowrap;
           }
           .slope-arrow {
@@ -182,6 +199,27 @@ function makeRouteMapHtml({ routes, selectedRouteId, startLabel, endLabel, width
                   var segPath = seg.path.map(function (p) {
                     return new kakao.maps.LatLng(p.lat, p.lng);
                   });
+                  if (seg.dashed) {
+                    // 출구 ↔ 역: 흰 바탕 위 짧은 점선 — 경사도색 실선(거리 도보)과 헷갈리지 않게
+                    zoomLine(new kakao.maps.Polyline({
+                      map: map, path: segPath,
+                      strokeWeight: centerWeight, strokeColor: '#ffffff',
+                      strokeOpacity: opacity * 0.9, strokeStyle: 'solid'
+                    }), centerWeight, r.selected ? 4 : 2);
+                    zoomLine(new kakao.maps.Polyline({
+                      map: map, path: segPath,
+                      strokeWeight: Math.round(centerWeight * 0.5), strokeColor: seg.color || '#5C6370',
+                      strokeOpacity: opacity, strokeStyle: 'shortdash'
+                    }), Math.round(centerWeight * 0.5), 2);
+                    if (r.selected && seg.label && seg.labelPoint) {
+                      new kakao.maps.CustomOverlay({
+                        position: new kakao.maps.LatLng(seg.labelPoint.lat, seg.labelPoint.lng),
+                        content: '<div class="exit-label">' + seg.label + '</div>',
+                        yAnchor: 1.4
+                      }).setMap(map);
+                    }
+                    return;
+                  }
                   zoomLine(new kakao.maps.Polyline({
                     map: map,
                     path: segPath,

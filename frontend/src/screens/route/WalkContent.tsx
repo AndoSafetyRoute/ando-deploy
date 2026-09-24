@@ -367,18 +367,37 @@ export default function WalkContent({
   // 모든 후보(선택 여부 무관)에 경사도 구간색을 넣는다 — 비교 단계에서도 도보
   // 구간이 통짜 단색이 아니라 실제 경사도를 보여줘야 하기 때문. 테두리는 후보별
   // 선택지 색(LANE_COLORS)으로 통일해 어떤 경로가 어떤 후보인지 구분한다.
+  // 출발/도착이 역이면 경로는 안내 출구에서 시작·끝나므로, 역(검색한 역 좌표) ↔ 출구를
+  // 대중교통 탭과 같은 점선(역 안 이동)으로 잇는다. 핀은 출구에 그대로 둔다.
   const mapRoutes = useMemo(
     () =>
-      shown.map((s) => ({
-        id: String(s.shownPos),
-        color: LANE_COLORS[s.shownPos] ?? C.primary,
-        coordinates: (s.route.coordinates ?? []).map(([lng, lat]) => ({
+      shown.map((s) => {
+        const coordinates = (s.route.coordinates ?? []).map(([lng, lat]) => ({
           latitude: lat,
           longitude: lng,
-        })),
-        segments: buildWalkMapSegments(s.route),
-      })),
-    [shown]
+        }));
+        const first = coordinates[0];
+        const last = coordinates[coordinates.length - 1];
+        const exitPoint = (ex: StationExit, fallback?: { latitude: number; longitude: number }) =>
+          ex.lat != null && ex.lon != null ? { latitude: ex.lat, longitude: ex.lon } : fallback;
+        const startDash = startExit && startLatitude && startLongitude && first
+          ? [{ latitude: Number(startLatitude), longitude: Number(startLongitude) }, exitPoint(startExit, first)!, first]
+          : null;
+        const endDash = stationExit && endLatitude && endLongitude && last
+          ? [last, exitPoint(stationExit, last)!, { latitude: Number(endLatitude), longitude: Number(endLongitude) }]
+          : null;
+        return {
+          id: String(s.shownPos),
+          color: LANE_COLORS[s.shownPos] ?? C.primary,
+          coordinates,
+          segments: [
+            ...(startDash ? [{ coordinates: startDash, color: C.exitConnector, dashed: true }] : []),
+            ...buildWalkMapSegments(s.route),
+            ...(endDash ? [{ coordinates: endDash, color: C.exitConnector, dashed: true }] : []),
+          ],
+        };
+      }),
+    [shown, startExit, stationExit, startLatitude, startLongitude, endLatitude, endLongitude]
   );
 
   const { sheetExpanded, sheetHeight, toggleSheet, panHandlers } = useDraggableSheet(
@@ -484,50 +503,51 @@ export default function WalkContent({
           </View>
         </View>
 
-        {!!startExit && !loading && (
-          <View style={ss.exitBanner}>
-            <Text style={ss.exitBannerIcon}>
-              {startExit.facilities.includes('elevator') ? '🛗' : '🔼'}
-            </Text>
-            <Text style={ss.exitBannerText}>
-              {startExit.message}
-              {'\n'}
-              <Text style={ss.exitBannerSub}>경로는 이 출구에서 출발해요.</Text>
-            </Text>
-          </View>
-        )}
-
-        {!!stationExit && !loading && (
-          <View style={ss.exitBanner}>
-            <Text style={ss.exitBannerIcon}>
-              {stationExit.facilities.includes('elevator') ? '🛗' : '🔼'}
-            </Text>
-            <Text style={ss.exitBannerText}>
-              {stationExit.message}
-              {'\n'}
-              <Text style={ss.exitBannerSub}>경로는 이 출구까지 안내해요.</Text>
-            </Text>
-          </View>
-        )}
-
-        {isHybrid && (
-          <View style={ss.svcBanner}>
-            <Text style={ss.svcBannerIcon}>ℹ️</Text>
-            <Text style={ss.svcBannerText}>
-              {serviceArea?.origin_in_seoul === false && serviceArea?.dest_in_seoul === false
-                ? '출발·도착이 모두 서울 밖이에요. '
-                : '경로에 서울 밖 구간이 있어요. '}
-              밖 구간{fmtExtLen(serviceArea?.external_length_m)}은 경사 데이터가 없어 최단(직선)
-              안내만 제공돼요. 소요시간은 서울 안팎을 합쳐 계산했고, 구간 피드백/측정에서는 밖 구간을 제외해요.
-            </Text>
-          </View>
-        )}
-
         <ScrollView
           style={ss.sheetScroll}
           contentContainerStyle={ss.sheetScrollContent}
           showsVerticalScrollIndicator={false}
         >
+          {/* 출구·서울 밖 안내도 카드와 함께 스크롤 — 시트 위에 고정하면 배너가
+              공간을 차지해 거리우선/유형별 카드가 안 보였다 */}
+          {!!startExit && !loading && (
+            <View style={ss.exitBanner}>
+              <Text style={ss.exitBannerIcon}>
+                {startExit.facilities.includes('elevator') ? '🛗' : '🔼'}
+              </Text>
+              <Text style={ss.exitBannerText}>
+                {startExit.message}
+                {'\n'}
+                <Text style={ss.exitBannerSub}>경로는 이 출구에서 출발해요.</Text>
+              </Text>
+            </View>
+          )}
+
+          {!!stationExit && !loading && (
+            <View style={ss.exitBanner}>
+              <Text style={ss.exitBannerIcon}>
+                {stationExit.facilities.includes('elevator') ? '🛗' : '🔼'}
+              </Text>
+              <Text style={ss.exitBannerText}>
+                {stationExit.message}
+                {'\n'}
+                <Text style={ss.exitBannerSub}>경로는 이 출구까지 안내해요.</Text>
+              </Text>
+            </View>
+          )}
+
+          {isHybrid && (
+            <View style={ss.svcBanner}>
+              <Text style={ss.svcBannerIcon}>ℹ️</Text>
+              <Text style={ss.svcBannerText}>
+                {serviceArea?.origin_in_seoul === false && serviceArea?.dest_in_seoul === false
+                  ? '출발·도착이 모두 서울 밖이에요. '
+                  : '경로에 서울 밖 구간이 있어요. '}
+                밖 구간{fmtExtLen(serviceArea?.external_length_m)}은 경사 데이터가 없어 최단(직선)
+                안내만 제공돼요. 소요시간은 서울 안팎을 합쳐 계산했고, 구간 피드백/측정에서는 밖 구간을 제외해요.
+              </Text>
+            </View>
+          )}
           {loading ? (
             <View style={ss.emptyCard}>
               <ActivityIndicator color={C.primary} />
@@ -814,8 +834,9 @@ const ss = StyleSheet.create({
 
   sheetScrollContent: {
     padding: 14,
-    // absolute로 뜬 startBtnWrap 높이만큼 — 마지막 경로 카드가 버튼 뒤에 가리지 않게.
-    paddingBottom: 96,
+    // absolute로 뜬 startBtnWrap 높이(약 85)보다 넉넉하게 — 끝까지 내리면 마지막 경로 카드
+    // (유형별 추천)가 버튼 위로 여유 있게 다 보이도록.
+    paddingBottom: 150,
     gap: 12,
   },
 
@@ -1081,7 +1102,7 @@ const ss = StyleSheet.create({
 
     flexDirection: 'row', alignItems: 'flex-start', gap: 8,
 
-    marginHorizontal: 16, marginBottom: 8, padding: 12,
+    padding: 12,
 
     borderRadius: 12, backgroundColor: '#EEF4FF',
 
@@ -1097,9 +1118,6 @@ const ss = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'flex-start',
     gap: 6,
-    marginHorizontal: 16,
-    marginTop: 4,
-    marginBottom: 2,
     padding: 10,
     borderRadius: 10,
     backgroundColor: '#FFF4E2',

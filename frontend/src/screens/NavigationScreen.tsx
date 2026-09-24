@@ -428,7 +428,7 @@ function makeKakaoMapHtml({
   to:   string;
   showSlopeMarkers: boolean;
   journeyMapPath: Coordinate[];
-  journeyMapSegments: { coordinates: Coordinate[]; color: string }[];
+  journeyMapSegments: { coordinates: Coordinate[]; color: string; dashed?: boolean }[];
   finalDestinationName: string;
   finalOriginName: string;
   walkerType?: string; // navSegData 비었을 때 폴백(getSegmentColor)의 유형별 색칠용
@@ -443,6 +443,7 @@ function makeKakaoMapHtml({
     journeyMapSegments.map((seg) => ({
       path: seg.coordinates.map((c) => ({ lat: c.latitude, lng: c.longitude })),
       color: seg.color,
+      dashed: !!seg.dashed,
     }))
   );
 
@@ -582,6 +583,20 @@ function makeKakaoMapHtml({
                 var segLatLngs = seg.path.map(function (p) {
                   return new kakao.maps.LatLng(p.lat, p.lng);
                 });
+                // 지하철 출구 ↔ 역 연결: 미리보기와 같은 흰 바탕 점선
+                if (seg.dashed) {
+                  zoomLine(new kakao.maps.Polyline({
+                    map: map, path: segLatLngs,
+                    strokeWeight: 13, strokeColor: "#ffffff",
+                    strokeOpacity: 0.9, strokeStyle: "solid"
+                  }), 13, 4);
+                  zoomLine(new kakao.maps.Polyline({
+                    map: map, path: segLatLngs,
+                    strokeWeight: 6, strokeColor: seg.color || "#5C6370",
+                    strokeOpacity: 1, strokeStyle: "shortdash"
+                  }), 6, 2);
+                  return;
+                }
                 // 대중교통 탭 미리보기(RouteMapView)와 같은 테두리+중앙 2중 선 —
                 // 탑승(버스/지하철) 구간도 노선색으로 또렷하게 보이게 한다.
                 zoomLine(new kakao.maps.Polyline({
@@ -809,6 +824,7 @@ export default function NavigationScreen({ navigation, route }: Props) {
     return (raw as any[]).map((seg) => ({
       coordinates: normalizeCoordinates(seg.coordinates),
       color: seg.color,
+      dashed: !!seg.dashed,
     })).filter((seg) => seg.coordinates.length >= 2);
   }, [route?.params?.journeyMapSegments]);
 
