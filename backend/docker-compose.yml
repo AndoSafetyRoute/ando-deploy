@@ -24,6 +24,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 6G
+          # CCH 부팅 피크 ~9.4GB 실측(release_v10, 노드 2,027,476) — 6G/10G 는 OOM 위험
+          memory: 12G
         reservations:
-          memory: 4G
+          memory: 8G
