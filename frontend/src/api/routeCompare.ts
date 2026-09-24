@@ -30,6 +30,7 @@ export async function requestRouteCandidates(params: {
   endLatitude:    string | number;
   endLongitude:   string | number;
   userType?:      string;
+  endStationName?: string;
 }): Promise<RouteCompareResponse> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30_000);
@@ -50,6 +51,9 @@ export async function requestRouteCandidates(params: {
         dest_lon:   Number(params.endLongitude),
         user_type:  params.userType ?? "manual_wheelchair",
         [ROUTE_CANDIDATES_KEY]: ROUTE_CANDIDATES_COMPARE,
+
+        // 목적지가 지하철역이면 접근 가능한 출구로 스냅하기 위해 전달
+        end_station_name: params.endStationName,
       }),
       signal: controller.signal,
     });

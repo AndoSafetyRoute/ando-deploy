@@ -37,6 +37,7 @@ subway/facility.py — 지하철역 편의시설 DB
 
 import os
 import re
+import csv
 import math
 import time
 import logging
@@ -121,8 +122,43 @@ def _normalize_exit(raw: str) -> list[str] | None:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _normalize_station(raw: str) -> str:
-    """호선 구분자 제거: '종로3가(1)' → '종로3가'"""
-    return re.sub(r"\(\d+\w*\)$", "", raw.strip()).strip()
+    """
+    앱/카카오 역명과 서울교통공사 CSV 역명을 동일한 키로 정규화.
+
+    예:
+      "숙대입구역 4호선" -> "숙대입구"
+      "4호선 숙대입구역" -> "숙대입구"
+      "서울역(1)"        -> "서울"
+      "서울역 1호선"     -> "서울"
+      "종로3가(1)"       -> "종로3가"
+    """
+    if not raw:
+        return ""
+
+    name = str(raw).strip()
+
+    # 연속 공백 정리
+    name = re.sub(r"\s+", " ", name).strip()
+
+    # CSV 등에 붙은 괄호 호선 제거
+    # 종로3가(1) -> 종로3가
+    name = re.sub(r"\s*\(\d+[^)]*\)\s*$", "", name).strip()
+
+    # 뒤쪽 호선 제거
+    # 숙대입구역 4호선 -> 숙대입구역
+    name = re.sub(r"\s*\d+(?:-\d+)?호선\s*$", "", name).strip()
+
+    # 앞쪽 호선 제거
+    # 4호선 숙대입구역 -> 숙대입구역
+    name = re.sub(r"^\s*\d+(?:-\d+)?호선\s*", "", name).strip()
+
+    # 마지막 '역' 제거
+    # 숙대입구역 -> 숙대입구
+    if name.endswith("역"):
+        name = name[:-1].strip()
+
+    return name
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -130,88 +166,159 @@ def _normalize_station(raw: str) -> str:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _read_csv(path: str) -> list[list[str]]:
-    """EUC-KR CSV → 행 리스트 (헤더 제외)"""
-    with open(path, encoding=_ENC, errors="replace") as f:
-        lines = f.read().splitlines()
-    rows = []
-    for line in lines[1:]:          # 헤더 스킵
-        if line.strip():
-            rows.append(line.split(","))
+    """
+    서울교통공사 CSV를 안전하게 읽는다.
+    단순 split(",") 대신 csv.reader를 사용해 따옴표/쉼표가 포함된 필드도 처리한다.
+    """
+    rows: list[list[str]] = []
+    with open(path, "r", encoding=_ENC, errors="replace", newline="") as f:
+        reader = csv.reader(f)
+        next(reader, None)  # 헤더 스킵
+        for row in reader:
+            if row and any(str(v).strip() for v in row):
+                rows.append(row)
     return rows
 
 
 def _load_elevators(path: str) -> dict:
     """
-    엘리베이터 설치 정보 → {역명: [exit_entry, ...]}
-    exit_entry = {"exit_no": "2", "section": "B1-G1", "serial": "0104-656"}
+    엘리베이터 CSV 실제 구조:
+      0 연번
+      1 호선
+      2 역명
+      3 관리번호
+      4 (근접)출입구번호
+      ...
+      12 승강기 일련번호
+      13 데이터 기준일자
     """
     db: dict[str, list] = {}
+
     for cols in _read_csv(path):
         if len(cols) < 14:
             continue
+
         station = _normalize_station(cols[2])
-        exits   = _normalize_exit(cols[4])      # (근접)출입구번호
-        section = cols[13].strip() if len(cols) > 13 else ""
-        serial  = cols[12].strip() if len(cols) > 12 else ""
-        if exits:
-            for ex in exits:
-                db.setdefault(station, []).append({
-                    "type":    "elevator",
-                    "exit_no": ex,
-                    "section": section,
-                    "serial":  serial,
-                })
+        exits = _normalize_exit(cols[4])
+        serial = cols[12].strip()
+        data_date = cols[13].strip()
+
+        # 출구와 직접 연결되지 않는 "내부" 엘리베이터는 스냅 후보에서 제외
+        if not station or not exits:
+            continue
+
+        for ex in exits:
+            db.setdefault(station, []).append({
+                "type": "elevator",
+                "exit_no": ex,
+                "serial": serial,
+                "data_date": data_date,
+            })
+
     return db
+
+
+def _normalize_escalator_direction(raw: str) -> str:
+    """
+    '상행', '상 행', '하행', '하 행' 등을 동일하게 처리.
+    9호선 CSV에는 '하 행'처럼 공백이 들어간 값이 존재한다.
+    """
+    value = re.sub(r"\s+", "", str(raw or ""))
+
+    if value == "상행":
+        return "상행"
+    if value == "하행":
+        return "하행"
+
+    return value
 
 
 def _load_escalators(path: str, is_line9: bool = False) -> dict:
     """
-    에스컬레이터 설치 정보 → {역명: [exit_entry, ...]}
-    exit_entry = {"exit_no": "4", "direction": "상행", "section": "B1-G1", "serial": "..."}
+    에스컬레이터 CSV 실제 구조:
+      0 연번
+      1 호선
+      2 역명
+      3 관리번호
+      4 상하행구분
+      5 (근접)출입구번호
+      ...
+      13 승강기 일련번호
+      14 데이터 기준일자 (1~8호선)
+         또는 운행구간 (9호선)
+      15 설치위치 (9호선)
     """
     db: dict[str, list] = {}
+
     for cols in _read_csv(path):
         if len(cols) < 14:
             continue
-        station   = _normalize_station(cols[2])
-        direction = cols[4].strip()            # 상하행구분 (col4)
-        exits     = _normalize_exit(cols[5])   # (근접)출입구번호 (col5)
-        serial    = cols[13].strip() if len(cols) > 13 else ""
 
-        # 9호선은 col14에 운행구간, col15에 설치위치
-        section = cols[14].strip() if (is_line9 and len(cols) > 14) else ""
+        station = _normalize_station(cols[2])
+        direction = _normalize_escalator_direction(cols[4])
+        exits = _normalize_exit(cols[5])
+        serial = cols[13].strip()
 
-        if exits:
-            for ex in exits:
-                db.setdefault(station, []).append({
-                    "type":      "escalator",
-                    "exit_no":   ex,
-                    "direction": direction,
-                    "section":   section,
-                    "serial":    serial,
-                })
+        section = ""
+        data_date = ""
+
+        if is_line9:
+            section = cols[14].strip() if len(cols) > 14 else ""
+        else:
+            data_date = cols[14].strip() if len(cols) > 14 else ""
+
+        if not station or not exits:
+            continue
+
+        for ex in exits:
+            db.setdefault(station, []).append({
+                "type": "escalator",
+                "exit_no": ex,
+                "direction": direction,
+                "section": section,
+                "serial": serial,
+                "data_date": data_date,
+            })
+
     return db
 
 
 def _load_lifts(path: str) -> dict:
     """
-    휠체어리프트 설치 정보 → {역명: [exit_entry, ...]}
+    휠체어리프트 CSV 실제 구조:
+      0 연번
+      1 호선
+      2 역명
+      3 관리번호
+      4 (근접)출입구번호
+      ...
+      14 승강기 일련번호
+      15 데이터 기준일자
     """
     db: dict[str, list] = {}
+
     for cols in _read_csv(path):
         if len(cols) < 15:
             continue
+
         station = _normalize_station(cols[2])
-        exits   = _normalize_exit(cols[4])     # (근접) 출입구번호
-        serial  = cols[14].strip() if len(cols) > 14 else ""
-        if exits:
-            for ex in exits:
-                db.setdefault(station, []).append({
-                    "type":    "lift",
-                    "exit_no": ex,
-                    "serial":  serial,
-                })
+        exits = _normalize_exit(cols[4])
+        serial = cols[14].strip()
+        data_date = cols[15].strip() if len(cols) > 15 else ""
+
+        if not station or not exits:
+            continue
+
+        for ex in exits:
+            db.setdefault(station, []).append({
+                "type": "lift",
+                "exit_no": ex,
+                "serial": serial,
+                "data_date": data_date,
+            })
+
     return db
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -227,7 +334,7 @@ def _kakao_exit_coord(station: str, exit_no: str) -> tuple[float, float] | None:
     if cache_key in _exit_coord_cache:
         return _exit_coord_cache[cache_key]
 
-    query = f"{station} {exit_no}번출구"
+    query = f"{station}역 {exit_no}번출구"
     try:
         resp = requests.get(
             "https://dapi.kakao.com/v2/local/search/keyword.json",
@@ -453,33 +560,102 @@ class SubwayFacilityDB:
 
     # ── CSV 로드 ─────────────────────────────────────────────────────────────
     def _load(self, data_dir: str):
-        def _fp(name):
+        """
+        편의시설 CSV를 서버 시작 시 한 번 로드한다.
+        파일이 없거나 경로가 틀리면 빈 DB로 조용히 넘어가지 않고 로그를 남긴다.
+        """
+        data_dir = os.path.abspath(os.path.expanduser(str(data_dir)))
+
+        print("\n========== FACILITY CSV LOAD ==========")
+        print(f"[CSV] data_dir     = {data_dir}")
+        print(f"[CSV] dir exists   = {os.path.isdir(data_dir)}")
+
+        if os.path.isdir(data_dir):
+            try:
+                print(f"[CSV] files        = {os.listdir(data_dir)}")
+            except Exception as e:
+                print(f"[CSV] listdir fail = {e}")
+        else:
+            log.error("[SubwayFacility] 데이터 폴더가 없습니다: %s", data_dir)
+
+        def _fp(name: str) -> str:
             return os.path.join(data_dir, name)
 
         # 엘리베이터
         elev_path = _fp("서울교통공사_엘리베이터 설치 정보_20250310.csv")
-        if os.path.exists(elev_path):
-            self._elev = _load_elevators(elev_path)
-            log.info("[SubwayFacility] 엘리베이터 %d역 로드", len(self._elev))
+        print(f"[CSV] elevator exists={os.path.isfile(elev_path)} path={elev_path}")
 
-        # 에스컬레이터 (1-8호선)
+        if os.path.isfile(elev_path):
+            try:
+                self._elev = _load_elevators(elev_path)
+                log.info("[SubwayFacility] 엘리베이터 %d역 로드", len(self._elev))
+                print(f"[CSV] elevator stations={len(self._elev)}")
+                print(f"[CSV] 숙대입구 elevators={self._elev.get('숙대입구', [])}")
+            except Exception:
+                log.exception("[SubwayFacility] 엘리베이터 CSV 로드 실패: %s", elev_path)
+        else:
+            log.error("[SubwayFacility] 엘리베이터 CSV 없음: %s", elev_path)
+
+        # 에스컬레이터 1~8호선
         esc_path = _fp("서울교통공사_에스컬레이터 설치 정보_20250310.csv")
-        if os.path.exists(esc_path):
-            self._esc = _load_escalators(esc_path)
+        print(f"[CSV] escalator exists={os.path.isfile(esc_path)} path={esc_path}")
 
-        # 에스컬레이터 (9호선) — 병합
-        esc9_path = _fp("서울교통공사_9호선2_3단계 에스컬레이터 설치현황_20260131.CSV")
-        if os.path.exists(esc9_path):
-            line9 = _load_escalators(esc9_path, is_line9=True)
-            for stn, entries in line9.items():
-                self._esc.setdefault(stn, []).extend(entries)
-        log.info("[SubwayFacility] 에스컬레이터 %d역 로드", len(self._esc))
+        if os.path.isfile(esc_path):
+            try:
+                self._esc = _load_escalators(esc_path)
+                log.info("[SubwayFacility] 에스컬레이터(1~8호선) %d역 로드", len(self._esc))
+            except Exception:
+                log.exception("[SubwayFacility] 에스컬레이터 CSV 로드 실패: %s", esc_path)
+        else:
+            log.error("[SubwayFacility] 에스컬레이터 CSV 없음: %s", esc_path)
+
+        # 에스컬레이터 9호선 2·3단계
+        # 실제 업로드 파일명(20260131)과 예전 파일명 둘 다 허용
+        esc9_candidates = [
+            "서울교통공사_9호선2_3단계 에스컬레이터 설치현황_20260131.CSV",
+            "서울교통공사_9호선2_3단계 에스컬레이터 설치현황.CSV",
+        ]
+
+        esc9_path = None
+        for filename in esc9_candidates:
+            candidate = _fp(filename)
+            if os.path.isfile(candidate):
+                esc9_path = candidate
+                break
+
+        print(f"[CSV] escalator9 path={esc9_path}")
+
+        if esc9_path:
+            try:
+                line9 = _load_escalators(esc9_path, is_line9=True)
+                for stn, entries in line9.items():
+                    self._esc.setdefault(stn, []).extend(entries)
+                log.info("[SubwayFacility] 9호선 에스컬레이터 병합 완료")
+            except Exception:
+                log.exception("[SubwayFacility] 9호선 에스컬레이터 CSV 로드 실패: %s", esc9_path)
+        else:
+            log.warning("[SubwayFacility] 9호선 에스컬레이터 CSV 없음")
 
         # 휠체어리프트
         lift_path = _fp("서울교통공사_휠체어리프트 설치현황_20250310.csv")
-        if os.path.exists(lift_path):
-            self._lift = _load_lifts(lift_path)
-            log.info("[SubwayFacility] 휠체어리프트 %d역 로드", len(self._lift))
+        print(f"[CSV] lift exists={os.path.isfile(lift_path)} path={lift_path}")
+
+        if os.path.isfile(lift_path):
+            try:
+                self._lift = _load_lifts(lift_path)
+                log.info("[SubwayFacility] 휠체어리프트 %d역 로드", len(self._lift))
+            except Exception:
+                log.exception("[SubwayFacility] 휠체어리프트 CSV 로드 실패: %s", lift_path)
+        else:
+            log.error("[SubwayFacility] 휠체어리프트 CSV 없음: %s", lift_path)
+
+        print(
+            "[CSV] FINAL "
+            f"elevator_stations={len(self._elev)} "
+            f"escalator_stations={len(self._esc)} "
+            f"lift_stations={len(self._lift)}"
+        )
+        print("=======================================\n")
 
     # ── 내부 헬퍼 ────────────────────────────────────────────────────────────
     def _active(self, entries: list[dict], broken: set[str]) -> list[dict]:
@@ -529,6 +705,15 @@ class SubwayFacilityDB:
                    데이터 결측이지 "이 방향 아님"이 아니므로 양쪽 다 후보로 남긴다.
         """
         stn    = _normalize_station(station_name)
+        print(f"[FACILITY] station_name={station_name!r} normalized={stn!r}")
+        print(f"[FACILITY] user_type={user_type} direction={direction}")
+        print(f"[FACILITY] raw elevators={self._elev.get(stn, [])}")
+        print(f"[FACILITY] raw escalators={self._esc.get(stn, [])}")
+        print(
+            f"[FACILITY] loaded counts: "
+            f"elev={len(self._elev)} esc={len(self._esc)} lift={len(self._lift)}"
+        )
+
         # 이 역에 해당 시설 데이터가 아예 없으면(광화문 등) 운행상태 조회 없이 끝낸다.
         if user_type not in _ELEVATOR_ONLY and user_type not in _ESC_PREFERRED:
             return []

@@ -41,7 +41,7 @@ SEOUL_CHARGER_KEY        = os.environ.get("SEOUL_CHARGER_KEY", "")
 # ── 지하철 CSV 데이터 경로 ────────────────────────────────────────────────────
 SUBWAY_DATA_DIR = os.environ.get(
     "SUBWAY_DATA_DIR",
-    os.path.join(BASE_DIR, "..", "subway_data"),   # gradpj/subway_data/
+    os.path.join(BASE_DIR, "subway_data"),   # backend/subway_data/ (레포에 포함)
 )
 
 # ── 저상버스 노선별 보유율 (OA-22229, REST API 없음 — 파일 다운로드 방식) ────

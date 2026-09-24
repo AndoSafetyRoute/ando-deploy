@@ -316,6 +316,7 @@ export default function WalkContent({
           endLatitude: endLatitude!,
           endLongitude: endLongitude!,
           userType: walkerType || 'manual_wheelchair',
+          endStationName: endName,
         });
         if (!alive) return;
         const { shown: s } = buildComparison(res.candidateRoutes);
