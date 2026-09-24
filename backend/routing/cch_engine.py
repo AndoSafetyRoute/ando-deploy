@@ -133,6 +133,23 @@ ALPHA_SEARCH_EARLY_STOP_REL     = 0.01
 ALPHA_SEARCH_LOCAL_ENABLED = True
 # 등거리 근사 투영(lon_to_m = 111320·cos(mean_lat)) 왜곡 방어용 타원 여유.
 ALPHA_SEARCH_LOCAL_MARGIN  = 1.02
+# 부분그래프 dijkstra 조기 종료 — path_d(최단거리 경로, 항상 타원 안)의 현재 alpha
+# 가중치 합이 dst 까지 비용의 상한이므로 그 이상은 탐색하지 않는다(scipy limit).
+# 결과 경로는 동일(동비용 타이브레이크만 달라질 수 있음). False 면 전체 탐색.
+ALPHA_SEARCH_LOCAL_LIMIT = True
+
+# 출발/도착 스냅을 "계단 없이 서로 오갈 수 있는 주 네트워크"(계단 엣지를 뺀
+# 그래프의 최대 강연결요소) 노드로만 한다. 전 유형이 계단 차단인데, 최근접
+# 노드가 계단으로만 빠져나갈 수 있는 작은 주머니(역사 내부·테라스 보도 등)에
+# 걸리면 우회 한도 안에 계단 없는 경로가 원천적으로 없어 계단이 강제됐다
+# (실측 2026-09-24: 서울역·남산도서관 출발 3건, 주머니 24~207노드, 계단 최대 549m).
+# False 면 전체 노드 최근접(기존 동작).
+SNAP_ACCESSIBLE_ENABLED = True
+# 주 네트워크 노드가 전체 최근접보다 이만큼(m) 넘게 더 멀면 기존 최근접을 쓴다 —
+# 너무 멀리 옮기면 사용자가 실제 있는 곳과 동떨어진 출발점이 된다. 실측(무작위
+# 3000점): 스냅이 바뀌는 건 0.9%, 추가거리 p50 18m·p90 182m·max 365m. 남산도서관
+# 165m 는 허용(계단 549m 강제보다 낫다고 판단).
+SNAP_ACCESSIBLE_MAX_EXTRA_M = 200.0
 
 # 이진탐색 진입 빈도 실측용 프로세스 전역 카운터(#A) — 요청마다 리셋되지
 # 않고 서버 수명 동안 누적해 트리거율을 로그로 확인한다.
@@ -213,7 +230,8 @@ class CCHEngine:
                  metric_dist_safe=None,
                  basis_weights=None,
                  edge_tail=None, edge_head=None,
-                 coords_m=None, tail_np=None, head_np=None):
+                 coords_m=None, tail_np=None, head_np=None,
+                 acc_tree=None, acc_ids=None):
         self.G           = G
         self.cch         = cch
         self.node_list   = node_list
@@ -238,14 +256,22 @@ class CCHEngine:
         self._coords_m = coords_m                  # (n, 2) float64 | None
         self._tail_np  = tail_np                   # (m,) uint32 | None
         self._head_np  = head_np                   # (m,) uint32 | None
+        # SNAP_ACCESSIBLE_ENABLED — 계단 없는 주 네트워크 노드만 담은 KDTree
+        self._acc_tree = acc_tree                  # KDTree | None
+        self._acc_ids  = acc_ids                   # (k,) int — acc_tree 인덱스 → 노드 ID
 
     # ── 내부 헬퍼 ────────────────────────────────────────────────────────────
 
     def _nearest_id(self, lon: float, lat: float) -> int:
-        """WGS84 좌표 → 최근접 CCH 노드 ID (KDTree)."""
+        """WGS84 좌표 → 최근접 CCH 노드 ID (KDTree). SNAP_ACCESSIBLE_ENABLED 면
+        계단 없는 주 네트워크 노드 중 최근접."""
         x = lon * self._lon_to_m
         y = lat * self._lat_to_m
-        _, idx = self.tree.query([x, y])
+        d_all, idx = self.tree.query([x, y])
+        if SNAP_ACCESSIBLE_ENABLED and self._acc_tree is not None:
+            d_acc, k = self._acc_tree.query([x, y])
+            if d_acc - d_all <= SNAP_ACCESSIBLE_MAX_EXTRA_M:
+                return int(self._acc_ids[k])
         return int(idx)
 
     def _path_dist_m(self, path_nodes: list) -> float:
@@ -278,7 +304,7 @@ class CCHEngine:
         return np.maximum(1, w).astype(np.int64).tolist()
 
     def _local_alpha_subgraph(self, src_id: int, dst_id: int, user_type: str,
-                              radius_m: float) -> dict:
+                              radius_m: float, path_d_ids=None) -> dict:
         """alpha 이진탐색 진입 시 1회 — 타원 부분그래프의 CSR 구조를 만든다.
 
         노드 v 가 euclid(src,v)+euclid(v,dst) ≤ radius_m 인 것만, 엣지는 양 끝이
@@ -288,9 +314,17 @@ class CCHEngine:
         """
         xy = self._coords_m
         tail, head = self._tail_np, self._head_np
-        d_sum = (np.hypot(xy[:, 0] - xy[src_id, 0], xy[:, 1] - xy[src_id, 1])
-                 + np.hypot(xy[:, 0] - xy[dst_id, 0], xy[:, 1] - xy[dst_id, 1]))
-        node_mask = d_sum <= radius_m
+        # 타원 안의 점은 두 초점 중점에서 radius/2 이내라, 그 정사각형으로 먼저 거른 뒤
+        # 후보에만 hypot 을 계산한다(전 노드 hypot 2회 → 비교 4회, 결과 동일).
+        mx = (xy[src_id, 0] + xy[dst_id, 0]) / 2
+        my = (xy[src_id, 1] + xy[dst_id, 1]) / 2
+        h = radius_m / 2
+        cand = np.nonzero((np.abs(xy[:, 0] - mx) <= h) & (np.abs(xy[:, 1] - my) <= h))[0]
+        cx, cy = xy[cand, 0], xy[cand, 1]
+        d_sum = (np.hypot(cx - xy[src_id, 0], cy - xy[src_id, 1])
+                 + np.hypot(cx - xy[dst_id, 0], cy - xy[dst_id, 1]))
+        node_mask = np.zeros(len(xy), dtype=bool)
+        node_mask[cand[d_sum <= radius_m]] = True
         nodes = np.nonzero(node_mask)[0]
         k = len(nodes)
         local = np.full(len(xy), -1, dtype=np.int64)
@@ -308,6 +342,23 @@ class CCHEngine:
 
         indptr = np.zeros(k + 1, dtype=np.int64)
         np.cumsum(np.bincount(lt, minlength=k), out=indptr[1:])
+
+        # ALPHA_SEARCH_LOCAL_LIMIT — path_d 엣지들의 부분그래프 내 위치(상한 계산용)
+        pd_pos = None
+        if path_d_ids is not None:
+            try:
+                pl = local[np.asarray(path_d_ids)]
+                if (pl >= 0).all():
+                    pos = []
+                    for u, v in zip(pl[:-1], pl[1:]):
+                        a, b = indptr[u], indptr[u + 1]
+                        j = np.nonzero(lh[a:b] == v)[0]
+                        if len(j) == 0:
+                            raise KeyError
+                        pos.append(a + int(j[0]))
+                    pd_pos = np.asarray(pos, dtype=np.int64)
+            except KeyError:
+                pd_pos = None
         return {
             "nodes":   nodes,                       # local → CCH 노드 ID
             "src":     int(local[src_id]),
@@ -318,6 +369,7 @@ class CCHEngine:
             "dist_wf": self._dist_wf[eidx],
             "delta":   self._slope_minus_dist[user_type][eidx],
             "n_edges": len(eidx),
+            "pd_pos":  pd_pos,                      # path_d 엣지 위치 | None
         }
 
     def _local_alpha_query(self, sub: dict, alpha: float):
@@ -332,8 +384,12 @@ class CCHEngine:
         w = np.maximum(1, sub["dist_wf"] + alpha * sub["delta"]).astype(np.int64)
         k = len(sub["nodes"])
         g = csr_matrix((w, sub["indices"], sub["indptr"]), shape=(k, k))
+        limit = np.inf
+        if ALPHA_SEARCH_LOCAL_LIMIT and sub.get("pd_pos") is not None:
+            # path_d 는 이 가중치에서도 src→dst 경로이므로 그 비용이 최적 비용의 상한
+            limit = float(w[sub["pd_pos"]].sum()) + 1.0
         dist, pred = dijkstra(g, directed=True, indices=sub["src"],
-                              return_predecessors=True)
+                              return_predecessors=True, limit=limit)
         dst = sub["dst"]
         if not np.isfinite(dist[dst]):
             return None
@@ -419,6 +475,7 @@ class CCHEngine:
                     sub = self._local_alpha_subgraph(
                         src_id, dst_id, user_type,
                         max_detour_ratio * shortest_dist * ALPHA_SEARCH_LOCAL_MARGIN,
+                        path_d_ids=[self.node_to_id[nd] for nd in path_d],
                     )
                     print(f"[CCH] 부분그래프 노드={len(sub['nodes']):,} "
                           f"엣지={sub['n_edges']:,}  "
@@ -687,6 +744,7 @@ def build_cch_engine(G, order_cache_path: str | None = None) -> CCHEngine:
     length_arr = np.empty(m, dtype=np.float64)        # 엣지 길이(m) — 기저함수용
     slope_wf = {ut: np.empty(m, dtype=np.float64)     # 경사 가중치 (alpha=1)
                 for ut in USER_TYPES}
+    stairs_np = np.zeros(m, dtype=bool)               # OSM highway=steps
 
     for i, (u, v, data) in enumerate(edges):
         tail_np[i] = node_to_id[u]
@@ -697,6 +755,7 @@ def build_cch_engine(G, order_cache_path: str | None = None) -> CCHEngine:
         #있다(graph.py). 슬로프 기반 forbidden과 별개 축이라 OR로 합친다.
         is_stairs   = data.get("highway") == "steps"
         dist_wf[i]  = length * WEIGHT_SCALE
+        stairs_np[i] = is_stairs
         dist_safe_wf[i] = (
             length * FORBIDDEN_PENALTY * WEIGHT_SCALE
             if is_forbidden_for_any_type(sp) or is_facility_blocked_for_any_type(is_stairs)
@@ -765,6 +824,23 @@ def build_cch_engine(G, order_cache_path: str | None = None) -> CCHEngine:
         except Exception as e:
             print(f"[CCH] 기저 가중치 캐시 저장 실패 (무시하고 계속): {e}")
 
+    # ── 6. 계단 없는 주 네트워크 스냅용 KDTree (SNAP_ACCESSIBLE_ENABLED) ──────
+    acc_tree, acc_ids = None, None
+    try:
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.csgraph import connected_components
+        keep = ~stairs_np
+        g_ns = csr_matrix((np.ones(int(keep.sum()), dtype=np.int8),
+                           (tail_np[keep], head_np[keep])), shape=(n, n))
+        _, labels = connected_components(g_ns, directed=True, connection="strong")
+        main = np.bincount(labels).argmax()
+        acc_ids = np.nonzero(labels == main)[0]
+        acc_tree = KDTree(coords_m[acc_ids])
+        print(f"[CCH] 계단 없는 주 네트워크 {len(acc_ids):,}/{n:,} 노드 "
+              f"({len(acc_ids) / n * 100:.1f}%) — 스냅 대상")
+    except Exception as e:
+        print(f"[CCH] 주 네트워크 스냅 트리 구성 실패(전체 노드 스냅 유지): {e}")
+
     elapsed = time.time() - t0
     print(f"[CCH] 전체 초기화 완료 ({elapsed:.1f}s)  노드={n:,}  엣지={m:,}")
 
@@ -787,4 +863,6 @@ def build_cch_engine(G, order_cache_path: str | None = None) -> CCHEngine:
         coords_m=coords_m,
         tail_np=tail_np,
         head_np=head_np,
+        acc_tree=acc_tree,
+        acc_ids=acc_ids,
     )
