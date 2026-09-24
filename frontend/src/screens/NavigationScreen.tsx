@@ -504,16 +504,13 @@ function makeKakaoMapHtml({
             padding:2px 5px; white-space:nowrap;
           }
           .legend-toggle {
-            /* guidanceBanner(RN, top:98~124 · left/right:14 전체폭)가 WebView보다
-               나중에 렌더돼 위에 덮이므로, 그 아래로 안 겹치게 충분히 내림
-               (안내 중엔 항상 떠 있는 배너라 top:112였던 예전 값은 늘 가려졌었다). */
-            position:absolute; right:12px; top:180px; z-index:11; border:none;
+            position:absolute; right:12px; top:112px; z-index:11; border:none;
             border-radius:999px; padding:9px 13px;
             background:rgba(27,15,74,0.92); color:#fff; font-size:12px;
             font-weight:800; box-shadow:0 2px 8px rgba(0,0,0,0.22);
           }
           .legend {
-            position:absolute; right:12px; top:222px;
+            position:absolute; right:12px; top:154px;
             background:rgba(20,24,31,0.9); border-radius:14px;
             padding:10px 12px; box-shadow:0 2px 8px rgba(0,0,0,0.22);
             font-size:12px; font-weight:700; color:#fff; z-index:10;
@@ -2340,7 +2337,12 @@ const ss = StyleSheet.create({
   guidanceBanner: {
     position: "absolute",
     top: Platform.OS === "ios" ? 124 : 98,
-    left: 14, right: 14,
+    left: 14,
+    // 지도(WebView) 우측 상단의 "접근성 경로 ⓘ" 범례 토글(.legend-toggle:
+    // right:12px, top:112px)과 이 배너가 같은 자리에서 겹쳐서, 토글 폭만큼
+    // 오른쪽을 비워둔다 — routeInfoPanel이 top:300으로 이 범례를 피한 것과
+    // 같은 이유.
+    right: 140,
     backgroundColor: "rgba(20,24,31,0.92)",
     borderRadius: 16,
     paddingVertical: 10, paddingHorizontal: 14,
@@ -2353,11 +2355,11 @@ const ss = StyleSheet.create({
 
   // 예상시간/거리/평균경사 — 지도 위 "접근성 경로 ⓘ" 범례와 같은 자리(우측
   // 상단)에, 같은 접이식 방식으로 붙인다. 예전엔 하단 전체폭 패널이었다.
-  // 지도(WebView) 안의 "접근성 경로 ⓘ" 범례(top:180~약 334, 펼친 상태 기준 —
-  // guidanceBanner에 안 가리게 아래로 내린 값) 바로 아래, 겹치지 않는 위치에 고정.
+  // 지도(WebView) 안의 "접근성 경로 ⓘ" 범례(top:112~약 284, 펼친 상태 기준)
+  // 바로 아래, 겹치지 않는 위치에 고정.
   routeInfoPanel: {
     position: "absolute",
-    top: 360,
+    top: 300,
     right: 14,
     alignItems: "flex-end",
     zIndex: 5,
