@@ -15,6 +15,8 @@ export type SubwayArrivalItem = {
   updn_line:    string | null; // "상행"/"하행" 원문(있을 때만)
   train_type:   string | null; // "일반"/"급행" 등
   arriving:     boolean;
+  // 초(seconds)를 안 주는 노선(1호선·경의중앙·공항철도·신분당 등)은 "[N]번째 전역"의 N
+  stations_away?: number | null;
   data_age_s:   number | null;
 };
 

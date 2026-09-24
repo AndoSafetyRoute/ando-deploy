@@ -14,10 +14,11 @@ import { getSubwayArrival, type SubwayArrival } from "../api/subwayArrival";
 const REFRESH_MS = 20_000;
 const TICK_MS = 1_000;
 
-/** 초 → "3분 20초", "45초", "곧 도착" — 매초 그대로(반올림 없이) */
-function fmtEta(sec: number | null, arriving: boolean): string {
+/** 초 → "3분 20초", "45초", "곧 도착" — 매초 그대로(반올림 없이).
+ *  초가 없는 노선은 "N정거장 전" 으로 */
+function fmtEta(sec: number | null, arriving: boolean, stationsAway?: number | null): string {
   if (arriving || (sec != null && sec <= 0)) return "곧 도착";
-  if (sec == null) return "";
+  if (sec == null) return stationsAway != null ? `${stationsAway}정거장 전` : "";
   const m = Math.floor(sec / 60);
   const s = sec % 60;
   return m > 0 ? `${m}분 ${String(s).padStart(2, "0")}초` : `${s}초`;
@@ -74,16 +75,19 @@ export default function SubwayArrivalBadge({ station, lineNo }: Props) {
 
   const t0 = data.trains[0];
   const t0Seconds = liveSeconds(t0.seconds);
-  const eta = fmtEta(t0Seconds, t0.arriving);
+  const eta = fmtEta(t0Seconds, t0.arriving, t0.stations_away);
   const stale = (data.data_age_s ?? 0) > 90;
-  const lineMismatch = !!(lineNo && t0.line_no && t0.line_no !== lineNo);
+  // lineNo 는 카카오 "경의중앙선"처럼 "선"이 남아 올 수 있어 서버 표기("경의중앙")와 맞춰 비교
+  const normLine = (s: string) => s.replace(/(호선|선)$/, "");
+  const lineMismatch = !!(lineNo && t0.line_no && t0.line_no !== normLine(lineNo));
+  const lineLabel = (s: string) => (/^\d+$/.test(s) ? `${s}호선` : s);
 
   return (
     <View style={ss.wrap}>
       <View style={[ss.pill, ss.pillOk]}>
         <View style={[ss.dot, { backgroundColor: C.success }]} />
         <Text style={ss.pillText}>
-          {lineMismatch ? `${t0.line_no}호선(!) · ` : ""}
+          {lineMismatch ? `${lineLabel(t0.line_no!)}(!) · ` : ""}
           실시간 · 다음 열차 {eta}
           {t0.direction ? ` · ${t0.direction}행` : ""}
           {t0.train_type && t0.train_type !== "일반" ? ` · ${t0.train_type}` : ""}
@@ -92,9 +96,9 @@ export default function SubwayArrivalBadge({ station, lineNo }: Props) {
           <Text style={[ss.refreshIcon, loading && ss.refreshIconBusy]}>↻</Text>
         </TouchableOpacity>
       </View>
-      {data.trains[1] && (data.trains[1].seconds != null || data.trains[1].arriving) && (
+      {data.trains[1] && (data.trains[1].seconds != null || data.trains[1].arriving || data.trains[1].stations_away != null) && (
         <Text style={ss.subText}>
-          다음 {fmtEta(liveSeconds(data.trains[1].seconds), data.trains[1].arriving)}
+          다음 {fmtEta(liveSeconds(data.trains[1].seconds), data.trains[1].arriving, data.trains[1].stations_away)}
           {data.trains[1].direction ? ` · ${data.trains[1].direction}행` : ""}
         </Text>
       )}

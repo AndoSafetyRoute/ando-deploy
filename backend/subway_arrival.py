@@ -113,9 +113,14 @@ def _data_age_s(recptn_dt: str | None) -> int | None:
     return None
 
 
+_STATIONS_AWAY_RE = re.compile(r"\[(\d+)\]번째 전역")
+
+
 def _train_slot(it: dict) -> dict:
     sec = _to_int(it.get("barvlDt"))
     arvl_cd = (it.get("arvlCd") or "").strip()
+    msg2 = (it.get("arvlMsg2") or "").strip()
+    m = _STATIONS_AWAY_RE.search(msg2)
     return {
         "seconds":     sec if sec > 0 else None,
         "text":        (it.get("arvlMsg2") or "").strip() or None,
@@ -125,10 +130,35 @@ def _train_slot(it: dict) -> dict:
         "direction":   (it.get("bstatnNm") or "").strip() or None,
         "updn_line":   (it.get("updnLine") or "").strip() or None,
         "train_type":  (it.get("btrainSttus") or "").strip() or None,
-        # arvlCd: 0/1/4/5 =진입~전역도착 근접 상태, 99=일반운행중
-        "arriving":    arvl_cd in ("0", "1", "4", "5"),
+        # arvlCd: 0 진입 / 1 도착 / 2 출발 / 3 전역출발 / 4 전역진입 / 5 전역도착 / 99 운행중
+        "arriving":    arvl_cd in ("0", "1", "3", "4", "5"),
+        "departed":    arvl_cd == "2",
+        # barvlDt 는 일부 노선(2·4호선 등)만 채워 주고 1호선·경의중앙·공항철도·신분당 등은
+        # 대부분 0 이다(실측 2026-09-24). 그 경우 "[N]번째 전역" 문구의 N으로 대신 정렬·표시.
+        "stations_away": int(m.group(1)) if m else None,
         "data_age_s":  _data_age_s(it.get("recptnDt")),
     }
+
+
+# 도착/진입 상태 행이 이보다 오래됐으면 이미 떠난 열차로 본다(정차 ~30초~1분).
+_ARRIVING_STALE_S = 120
+# 정렬용 역간 소요 추정(초) — 표시엔 안 쓰고 "N번째 전역" 열차 순서 매길 때만.
+_SEC_PER_STATION = 120
+
+
+def _eta_key(t: dict) -> float | None:
+    """정렬 키(초). 쓸 수 없는 행(이미 출발·오래된 도착·정보 없음)은 None."""
+    if t["departed"]:
+        return None
+    if t["arriving"]:
+        if (t["data_age_s"] or 0) > _ARRIVING_STALE_S:
+            return None
+        return 0.0
+    if t["seconds"] is not None:
+        return float(t["seconds"])
+    if t["stations_away"] is not None:
+        return float(t["stations_away"] * _SEC_PER_STATION)
+    return None
 
 
 # ── 캐시 래퍼 ───────────────────────────────────────────────────────────────
@@ -199,10 +229,15 @@ def arrival_for_boarding(station_name: str, line_no: str | None = None) -> dict:
         if filtered:
             items = filtered
 
-    trains = sorted(
-        (t for t in items if t["seconds"] is not None or t["arriving"]),
-        key=lambda t: t["seconds"] if t["seconds"] is not None else 0,
-    )[:2]
+    # 같은 열차가 중복 행으로 오는 경우가 있어(실측: GTX-A 동일 행 2개) 걸러낸다.
+    seen, uniq = set(), []
+    for t in items:
+        k = (t["line_no"], t["updn_line"], t["direction"], t["text"], t["data_age_s"])
+        if k not in seen:
+            seen.add(k)
+            uniq.append(t)
+    keyed = [(k, t) for t in uniq if (k := _eta_key(t)) is not None]
+    trains = [t for _, t in sorted(keyed, key=lambda kt: kt[0])][:2]
 
     out.update({
         "available": bool(trains),
