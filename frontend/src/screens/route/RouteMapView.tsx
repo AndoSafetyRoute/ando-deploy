@@ -296,6 +296,8 @@ export default function RouteMapView({ routes, selectedRouteId, startLabel, endL
   // map 인스턴스 리셋)되어 시트를 만지작거리는 도중 줌이 먹통이 된다. 레이아웃이
   // 멈춘 뒤(디바운스)에만 반영해서 애니메이션 중 리로드를 막는다.
   const layoutDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const layoutSizeRef = useRef<{ width: number; height: number } | null>(null);
+  const pendingSizeRef = useRef<{ width: number; height: number } | null>(null);
 
   useEffect(() => {
     return () => {
@@ -333,11 +335,33 @@ export default function RouteMapView({ routes, selectedRouteId, startLabel, endL
     <View
       style={s.container}
       onLayout={(e) => {
-        const { width, height } = e.nativeEvent.layout;
+        const width = Math.round(e.nativeEvent.layout.width);
+        const height = Math.round(e.nativeEvent.layout.height);
         if (width <= 0 || height <= 0) return;
 
+        const prev = layoutSizeRef.current;
+        // 첫 측정은 바로 반영 — 부모(시트 등)가 미세한 레이아웃 변화로 onLayout 을 계속
+        // 재발화하면 디바운스가 끝나지 않아 지도가 스피너에 멈춰 있었다(에뮬 재현).
+        if (!prev) {
+          layoutSizeRef.current = { width, height };
+          setLayoutSize({ width, height });
+          return;
+        }
+        // 1px 미만(반올림 후 동일) 변화는 무시 — 리로드 유발 안 함
+        if (prev.width === width && prev.height === height) {
+          if (layoutDebounceRef.current) clearTimeout(layoutDebounceRef.current);
+          pendingSizeRef.current = null;
+          return;
+        }
+        // 같은 크기가 반복 발화되면 타이머를 다시 걸지 않는다(디바운스가 영영 안 끝나는 것 방지)
+        const pending = pendingSizeRef.current;
+        if (pending && pending.width === width && pending.height === height) return;
+
+        pendingSizeRef.current = { width, height };
         if (layoutDebounceRef.current) clearTimeout(layoutDebounceRef.current);
         layoutDebounceRef.current = setTimeout(() => {
+          pendingSizeRef.current = null;
+          layoutSizeRef.current = { width, height };
           setLayoutSize({ width, height });
         }, 200);
       }}
