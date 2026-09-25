@@ -232,6 +232,8 @@ export default function WalkContent({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [reloadKey, setReloadKey] = useState(0);
+  // BE가 맞춤형을 못 준 이유(S8 personalized=false 의 reason). 없으면 기본 문구.
+  const [personalReason, setPersonalReason] = useState<string | null>(null);
   // 지도 위 출발/도착 라벨 — from/to(검색창 입력, 즉시 바뀜)와 분리해서 실제
   // 경로 데이터(shown)가 갱신될 때만 같이 바뀌게 한다. TransitContent와 동일 이유.
   const [mapStartLabel, setMapStartLabel] = useState('');
@@ -326,6 +328,7 @@ export default function WalkContent({
         if (!alive) return;
         const { shown: s } = buildComparison(res.candidateRoutes);
         setShown(s);
+        setPersonalReason(res.personalized === false && res.reason ? res.reason : null);
         setSelectedPos(0);
         setStationExit(res.stationExit ?? null);
         setStartExit(res.startStationExit ?? null);
@@ -571,15 +574,38 @@ export default function WalkContent({
               </TouchableOpacity>
             </View>
           ) : (
-            shown.map((cand) => (
-              <CompareCard
-                key={cand.shownPos}
-                cand={cand}
-                color={LANE_COLORS[cand.shownPos] ?? C.primary}
-                selected={selectedPos === cand.shownPos}
-                onSelect={setSelectedPos}
-              />
-            ))
+            <>
+              {shown.map((cand) => (
+                <CompareCard
+                  key={cand.shownPos}
+                  cand={cand}
+                  color={LANE_COLORS[cand.shownPos] ?? C.primary}
+                  selected={selectedPos === cand.shownPos}
+                  onSelect={setSelectedPos}
+                />
+              ))}
+              {/* 맞춤형 후보가 없으면(학습 데이터 부족 = S8 fallback, 또는 BE 미구현) 고정 순서
+                  마지막 자리에 비활성 카드만 둔다 — 선택 불가, shown 에 안 넣으므로
+                  route_choice 로그(n_shown)에도 안 잡힌다. 하이브리드 응답은 compare 가
+                  아니라 맞춤형이 원래 없으므로 표시하지 않는다. BE가 personal 을 주면
+                  buildComparison 이 일반 카드로 그리므로 이 자리는 자동으로 사라진다. */}
+              {!isHybrid && !shown.some((c) => c.mergedKinds.includes('personal')) && (
+                <View style={[ss.routeCard, ss.routeCardDisabled]}>
+                  <View style={[ss.routeCardBar, { backgroundColor: C.textMute }]} />
+                  <View style={ss.routeCardHeader}>
+                    <View style={[ss.routeTag, { backgroundColor: C.textMute + '18' }]}>
+                      <Text style={[ss.routeTagText, { color: C.textMute }]}>
+                        {CANDIDATE_LABELS.personal}
+                      </Text>
+                    </View>
+                    <Text style={ss.disabledBadgeText}>개인화 준비 중</Text>
+                  </View>
+                  <Text style={ss.disabledDesc}>
+                    {personalReason ?? '내 이동 기록이 더 쌓이면 맞춤 경로를 제공해요.'}
+                  </Text>
+                </View>
+              )}
+            </>
           )}
 
           <View style={{ height: 20 }} />
@@ -856,6 +882,26 @@ const ss = StyleSheet.create({
 
   routeCardBar: {
     height: 4,
+  },
+
+  routeCardDisabled: {
+    elevation: 0,
+    shadowOpacity: 0,
+    backgroundColor: C.bg,
+  },
+
+  disabledBadgeText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: C.textMute,
+  },
+
+  disabledDesc: {
+    fontSize: 12,
+    color: C.textMute,
+    paddingHorizontal: 14,
+    paddingTop: 2,
+    paddingBottom: 12,
   },
 
   routeCardHeader: {

@@ -35,6 +35,11 @@ export type RouteCompareResponse = {
   candidateRoutes: CandidateRoute[];
   stationExit?:   StationExit;          // 도착역 출구
   startStationExit?: StationExit;       // 출발역 출구(역에서 나옴)
+  // S8 설계(미구현) — 맞춤형 fallback(유효 트립 < PERSONAL_MIN_TRIPS 또는 오르막/내리막
+  // 유효 행 < PERSONAL_MIN_ROWS)이면 BE가 personalized=false + reason을 준다.
+  // 지금 BE는 이 필드를 안 보내므로 FE는 없으면 기본 "준비 중" 문구로 처리한다.
+  personalized?:  boolean;
+  reason?:        string;
 };
 
 export async function requestRouteCandidates(params: {
