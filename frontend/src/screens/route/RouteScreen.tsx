@@ -101,8 +101,12 @@ const WALKER_TYPES = [
   { key: "cane", label: "지팡이", icon: "🦯" },
   { key: "leg_injury", label: "목발 사용자", icon: "🩹" },
   { key: "elderly", label: "고령자", icon: "👴" },
-  { key: "general", label: "일반", icon: "🧍" },
 ];
+
+// 개발 테스트용이던 'general'(일반)은 선택지에서 뺐다. 다만 이미 로컬에 '일반'이
+// 저장된 기기는 그대로 general로 요청하므로(백엔드·chk_user_type은 아직 허용),
+// 표시 라벨이 엉뚱한 유형(WALKER_TYPES[0])으로 보이지 않게 조회용으로만 남긴다.
+const LEGACY_WALKER_TYPES = [{ key: "general", label: "일반", icon: "🧍" }];
 
 function safeParseRouteData(routeData?: string) {
   if (!routeData) return null;
@@ -333,7 +337,7 @@ export default function RouteScreen({ navigation, route }: Props) {
   const toRef = useRef<TextInput>(null);
 
   const currentWalker =
-    WALKER_TYPES.find((walker) => walker.key === walkerType) ??
+    [...WALKER_TYPES, ...LEGACY_WALKER_TYPES].find((walker) => walker.key === walkerType) ??
     WALKER_TYPES[0];
 
   const startEditing = (field: "from" | "to") => {

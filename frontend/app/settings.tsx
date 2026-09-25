@@ -128,7 +128,6 @@ export default function SettingScreen() {
     { id: "지팡이", label: "지팡이", icon: "hiking" },
     { id: "고령자", label: "고령자", icon: "human-male" },
     { id: "다리부상", label: "다리부상", icon: "bandage" },
-    { id: "일반", label: "일반", icon: "walk-fast" },
   ];
 
   return (
