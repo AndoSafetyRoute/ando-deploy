@@ -23,7 +23,7 @@ import time
 import numpy as np
 from scipy.spatial import KDTree
 
-from config import MAX_DETOUR_RATIO, FORBIDDEN_PENALTY, BASE_DIR
+from config import MAX_DETOUR_RATIO, FORBIDDEN_PENALTY, STAIRS_PENALTY, BASE_DIR
 from routing.cost import USER_TYPES, slope_cost, slope_score, is_facility_blocked, is_facility_blocked_for_any_type, personal_edge_cost
 from routing.basis import precompute_basis_weights, save_basis_weights, load_basis_weights
 
@@ -238,7 +238,8 @@ class CCHEngine:
                  edge_tail=None, edge_head=None,
                  coords_m=None, tail_np=None, head_np=None,
                  acc_tree=None, acc_ids=None,
-                 edge_slope=None, edge_length=None, edge_stairs=None):
+                 edge_slope=None, edge_length=None, edge_stairs=None,
+                 metric_base=None):
         self.G           = G
         self.cch         = cch
         self.node_list   = node_list
@@ -253,6 +254,9 @@ class CCHEngine:
         # 연산 — 이 배열은 3.8M+ 원소라 반복 호출 시 무시 못 할 비용).
         self._slope_minus_dist = {ut: sw - dist_wf for ut, sw in slope_wf.items()}
         self.metric_dist = metric_dist       # CCHMetric
+        # 유형별 탐색의 alpha=0 기준선(최단 거리·우회율 분모) metric. dist_wf 와 짝 —
+        # SHORTEST_AVOID_STAIRS 면 둘 다 계단 회피 거리(build_cch_engine 참고).
+        self._metric_base = metric_base if metric_base is not None else metric_dist
         self.metrics_a1  = metrics_a1        # {ut: CCHMetric}
         self.metric_dist_safe = metric_dist_safe   # CCHMetric | None
         self.metric_dist_nostairs = metric_dist_nostairs   # CCHMetric | None (SHORTEST_AVOID_STAIRS)
@@ -429,8 +433,8 @@ class CCHEngine:
         if src_id == dst_id:
             raise ValueError("출발지와 목적지가 동일한 노드입니다.")
 
-        # ── 1. 최단 거리 기준 (alpha=0) ──────────────────────────────────────
-        path_d = self._query(self.metric_dist, src_id, dst_id)
+        # ── 1. 최단 거리 기준 (alpha=0) — 계단 회피 최단(SHORTEST_AVOID_STAIRS) ──
+        path_d = self._query(self._metric_base, src_id, dst_id)
         if path_d is None:
             raise ValueError("경로를 찾을 수 없습니다.")
         shortest_dist = self._path_dist_m(path_d)
@@ -677,13 +681,13 @@ class CCHEngine:
         """
         S8 — user_model_params 로 전체 엣지의 personal 비용 c_u(e) 를 벡터 계산해
         CCHMetric 에 넣을 정수 가중치 list 로 반환. 계단은 다른 metric 과 같은
-        관례로 FORBIDDEN_PENALTY 배(전 유형 계단 차단, S7 시설 정책).
+        관례로 STAIRS_PENALTY 배(전 유형 계단 차단, S7 시설 정책).
         요청 경로에서 호출 금지 — 서버 시작 시 PersonalMetricCache 적재에서만 쓴다.
         """
         if self._edge_slope is None:
             raise RuntimeError("personal metric 용 엣지 배열이 없습니다")
         cost = personal_edge_cost(params, self._edge_slope, self._edge_length)
-        cost = np.where(self._edge_stairs, cost * FORBIDDEN_PENALTY, cost)
+        cost = np.where(self._edge_stairs, cost * STAIRS_PENALTY, cost)
         return np.maximum(1, cost * WEIGHT_SCALE).astype(np.int64).tolist()
 
     def find_route_with_metric(self, origin_lonlat: tuple, dest_lonlat: tuple,
@@ -799,15 +803,17 @@ def build_cch_engine(G, order_cache_path: str | None = None) -> CCHEngine:
         dist_wf[i]  = length * WEIGHT_SCALE
         stairs_np[i] = is_stairs
         dist_safe_wf[i] = (
-            length * FORBIDDEN_PENALTY * WEIGHT_SCALE
-            if is_forbidden_for_any_type(sp) or is_facility_blocked_for_any_type(is_stairs)
+            length * STAIRS_PENALTY * WEIGHT_SCALE
+            if is_facility_blocked_for_any_type(is_stairs)
+            else length * FORBIDDEN_PENALTY * WEIGHT_SCALE
+            if is_forbidden_for_any_type(sp)
             else length * WEIGHT_SCALE
         )
         slope_arr[i]  = sp
         length_arr[i] = length
         for ut in USER_TYPES:
             slope_wf[ut][i] = (
-                length * FORBIDDEN_PENALTY * WEIGHT_SCALE
+                length * STAIRS_PENALTY * WEIGHT_SCALE
                 if is_facility_blocked(ut, is_stairs)
                 else slope_cost(sp, ut, length) * WEIGHT_SCALE
             )
@@ -842,9 +848,15 @@ def build_cch_engine(G, order_cache_path: str | None = None) -> CCHEngine:
     metric_dist_safe = CCHMetric(cch, dist_safe_w_list)
 
     print(f"[CCH] 계단 회피 거리 metric 생성...")
-    dist_ns_wf = np.where(stairs_np, dist_wf * FORBIDDEN_PENALTY, dist_wf)
+    dist_ns_wf = np.where(stairs_np, dist_wf * STAIRS_PENALTY, dist_wf)
     metric_dist_nostairs = CCHMetric(cch, np.maximum(1, dist_ns_wf).astype(np.int64).tolist())
-    del dist_ns_wf
+
+    # 유형별(find_route) alpha 보간의 거리 쪽과 기준선도 계단 회피 거리로 — 순수 거리를
+    # 쓰면 우회 한도(MAX_DETOUR_RATIO) 때문에 alpha 가 내려갈수록 계단 벌점이 사라져
+    # 유형별 경로에 계단이 섞였다(2026-09-26 서울역→남산 elderly 계단 2구간 실측).
+    # 계단 엣지는 slope_wf 도 STAIRS_PENALTY 배라 보간 전 구간에서 계단 비용이 유지된다.
+    interp_dist_wf = dist_ns_wf if SHORTEST_AVOID_STAIRS else dist_wf
+    metric_base    = metric_dist_nostairs if SHORTEST_AVOID_STAIRS else metric_dist
 
     metrics_a1 = {}
     for ut in USER_TYPES:
@@ -899,7 +911,7 @@ def build_cch_engine(G, order_cache_path: str | None = None) -> CCHEngine:
         tree=tree,
         lon_to_m=lon_to_m,
         lat_to_m=lat_to_m,
-        dist_wf=dist_wf,
+        dist_wf=interp_dist_wf,
         slope_wf=slope_wf,
         metric_dist=metric_dist,
         metrics_a1=metrics_a1,
@@ -916,4 +928,5 @@ def build_cch_engine(G, order_cache_path: str | None = None) -> CCHEngine:
         edge_slope=slope_arr,
         edge_length=length_arr,
         edge_stairs=stairs_np,
+        metric_base=metric_base,
     )
