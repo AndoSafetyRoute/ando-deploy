@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity,
-  ScrollView, Animated, Dimensions, Platform, Alert,
+  ScrollView, Animated, Dimensions, Platform, Alert, ActivityIndicator,
 } from 'react-native';
 import { C, ZONE_COLORS, busTypeColor, subwayLineColor } from '../../constants/colors';
 import { formatMinutes } from '../../utils/storage';
@@ -14,7 +14,9 @@ import {
 import {
   requestWalkLeg, requestSubwayBestExit, SubwayBestExit,
   requestStationChargers, StationCharger,
+  createWalkLegBatcher, WalkLegRequest, WalkLegsMeta, WalkRouteKind,
 } from '../../api/routeApi';
+import { getAuthToken } from '../../api';
 import RouteMapView, { MapCoordinate } from './RouteMapView';
 import { useDraggableSheet } from './useDraggableSheet';
 import BusArrivalBadge from '../../components/BusArrivalBadge';
@@ -240,6 +242,31 @@ function createLimiter(concurrency: number) {
 
 type Limiter = <T>(fn: () => Promise<T>) => Promise<T>;
 
+// 도보 구간 1개를 서버에 물어보는 방법 — 응답은 /route/safe 형태로 통일.
+// 유형별(초기 화면)은 기존대로 구간마다 요청(동시 제한 limit), 최단/맞춤형 토글은
+// 묶음 요청(/route/legs)으로 왕복 수를 줄인다.
+type LegFetcher = (req: WalkLegRequest, light: boolean) => Promise<any>;
+
+function singleLegFetcher(apiUserType: string, limit: Limiter, routeKind: WalkRouteKind = 'type'): LegFetcher {
+  return (req, light) => limit(() => requestWalkLeg({
+    startLatitude: req.fromLat, startLongitude: req.fromLng,
+    endLatitude: req.toLat, endLongitude: req.toLng,
+    userType: apiUserType,
+    light,
+    endStationName: req.endStationName,
+    startStationName: req.startStationName,
+    routeKind,
+  }));
+}
+
+// 묶음 요청은 후보 목록용(light)만 — 안내 시작 시 full 재조회는 singleLegFetcher 로.
+function batchLegFetcher(
+  apiUserType: string, routeKind: WalkRouteKind, onMeta?: (m: WalkLegsMeta) => void,
+): LegFetcher {
+  const batch = createWalkLegBatcher(apiUserType, routeKind, onMeta);
+  return (req) => batch(req);
+}
+
 // 카카오 경로 하나의 승차 지점/하차 지점 좌표 추출(steps[0]/steps[마지막])이
 // 어긋나면(예: 스텝이 사실상 도보 하나뿐이거나 경로 형태가 예상과 다르면)
 // "구간"이 실제로는 전체 경로 규모(수 km~십수 km)로 계산되는 경우가 있었다.
@@ -248,6 +275,13 @@ type Limiter = <T>(fn: () => Promise<T>) => Promise<T>;
 // 도보 구간은 이보다 훨씬 짧은 게 정상이므로, 넘는 경우 계산을 아예 생략하고
 // 직선거리 추정치로 대체한다.
 const MAX_LEG_STRAIGHT_M = 2000;
+
+// 대중교통 탭 "경로 선택" 헤더의 도보 구간 경로 종류 토글.
+const WALK_KIND_TABS: { key: WalkRouteKind; label: string }[] = [
+  { key: 'type',     label: '유형별' },
+  { key: 'distance', label: '최단' },
+  { key: 'personal', label: '맞춤형' },
+];
 
 // 15개 경로 중 상당수가 같은 정류장/역에서 타고 내리는 경우가 많아, 같은
 // 좌표쌍에 대해 동일한 구간 조회가 여러 번 중복 발생한다. load() 한 번의
@@ -268,7 +302,7 @@ async function computeWalkLeg(
   fromLat: string, fromLng: string,
   toLat: string, toLng: string,
   apiUserType: string,
-  limit: Limiter,
+  fetchLeg: LegFetcher,
   cache: LegCache,
   light: boolean,
   endStationName?: string,
@@ -278,7 +312,7 @@ async function computeWalkLeg(
   const cached = cache.get(key);
   if (cached) return cached;
 
-  const promise = computeWalkLegUncached(fromLat, fromLng, toLat, toLng, apiUserType, limit, light, endStationName, startStationName);
+  const promise = computeWalkLegUncached(fromLat, fromLng, toLat, toLng, apiUserType, fetchLeg, light, endStationName, startStationName);
   cache.set(key, promise);
   return promise;
 }
@@ -287,7 +321,7 @@ async function computeWalkLegUncached(
   fromLat: string, fromLng: string,
   toLat: string, toLng: string,
   apiUserType: string,
-  limit: Limiter,
+  fetchLeg: LegFetcher,
   light: boolean,
   endStationName?: string,
   startStationName?: string,
@@ -303,14 +337,10 @@ async function computeWalkLegUncached(
   }
 
   try {
-    const res = await limit(() => requestWalkLeg({
-      startLatitude: fromLat, startLongitude: fromLng,
-      endLatitude: toLat, endLongitude: toLng,
-      userType: apiUserType,
+    const res = await fetchLeg(
+      { fromLat, fromLng, toLat, toLng, endStationName, startStationName },
       light,
-      endStationName,
-      startStationName,
-    }));
+    );
     const bestRoute = res?.routes?.[0] ?? null;
     // navigation_segments(구간 색상)/waypoints(음성안내)/measurement_units(GPS 실측
     // 제출 단위)는 routes[0]이 아니라 응답 최상위 필드라서, NavigationScreen이
@@ -480,7 +510,7 @@ async function convertKakaoRoute(
   apiUserType: string,
   origin: { lat?: string; lng?: string; name?: string },
   destination: { lat?: string; lng?: string; name?: string },
-  limit: Limiter,
+  fetchLeg: LegFetcher,
   legCache: LegCache,
   subwayCache: SubwayExitCache,
   chargerCache: ChargerCache,
@@ -582,7 +612,7 @@ async function convertKakaoRoute(
       // 출발지(역) = 첫 탑승역이어도 출발 칸·안내용으로 역 → 출구 도보는 계산한다(지도엔 안 그림).
       const [tLat, tLng] = ex ? [String(ex.lat), String(ex.lon)] : [String(firstPoint[1]), String(firstPoint[0])];
       preWalkLeg = await computeWalkLeg(origin.lat!, origin.lng!, tLat, tLng,
-        apiUserType, limit, legCache, true, undefined, originIsBoard ? undefined : originStation);
+        apiUserType, fetchLeg, legCache, true, undefined, originIsBoard ? undefined : originStation);
     })());
   }
   if (lastPoint && destination.lat && destination.lng) {
@@ -592,13 +622,13 @@ async function convertKakaoRoute(
         // 도착지(역) = 마지막 하차역: 도착 칸·안내용으로 하차 지점 → 그 역의 나오는 출구 도보
         // (지도엔 안 그림). 출구를 못 찾으면 목적지 좌표까지.
         const [tLat, tLng] = ex ? [String(ex.lat), String(ex.lon)] : [destination.lat!, destination.lng!];
-        postWalkLeg = await computeWalkLeg(String(lastPoint[1]), String(lastPoint[0]), tLat, tLng, apiUserType, limit, legCache, true);
+        postWalkLeg = await computeWalkLeg(String(lastPoint[1]), String(lastPoint[0]), tLat, tLng, apiUserType, fetchLeg, legCache, true);
         return;
       }
       // 마지막 하차가 지하철이면 그 역 출구에서, 아니면(버스) 하차 지점에서.
       const [fLat, fLng] = ex ? [String(ex.lat), String(ex.lon)] : [String(lastPoint[1]), String(lastPoint[0])];
       postWalkLeg = await computeWalkLeg(fLat, fLng, destination.lat!, destination.lng!,
-        apiUserType, limit, legCache, true, destStation);
+        apiUserType, fetchLeg, legCache, true, destStation);
     })());
   }
 
@@ -627,7 +657,7 @@ async function convertKakaoRoute(
       const [eLng, eLat] = toEx ? [toEx.lon, toEx.lat] : pts[pts.length - 1];
       // 이 중간 환승 도보 스텝은 표시용 시간·거리 텍스트로만 쓰이고 별도 GPS
       // 안내 화면을 만들지 않으므로 항상 light 조회로 충분하다.
-      const leg = await computeWalkLeg(String(sLat), String(sLng), String(eLat), String(eLng), apiUserType, limit, legCache, true);
+      const leg = await computeWalkLeg(String(sLat), String(sLng), String(eLat), String(eLng), apiUserType, fetchLeg, legCache, true);
       applyCchWalkLeg(uiSteps[i], segments[i], leg);
       const ex = toEx ?? fromEx;
       if (ex) {
@@ -1074,7 +1104,28 @@ export type TransitRoutesState = {
   // "지도는 그대로인데 이름표만 먼저 바뀌는" 어색한 과도상태가 안 생긴다.
   mapStartLabel: string;
   mapEndLabel: string;
+  // 도보 구간 경로 종류 토글 — 초기 화면은 항상 유형별. 최단/맞춤형은 초기 화면 직후
+  // 백그라운드로 미리 계산해 두고(종류별 캐시), 끝나기 전에 누르면 kindLoading.
+  routeKind: WalkRouteKind;
+  selectRouteKind: (kind: WalkRouteKind) => void;
+  kindLoading: boolean;
+  // 맞춤형 사용 가능 여부 — null=아직 모름(계산 중), false 면 reason 표시·토글 비활성.
+  personalInfo: { available: boolean | null; reason?: string };
 };
+
+type TransitKindContext = {
+  gen: number;
+  kakao: KakaoTransitRoute[];
+  apiUserType: string;
+  origin: { lat?: string; lng?: string; name?: string };
+  destination: { lat?: string; lng?: string; name?: string };
+  subwayCache: SubwayExitCache;
+  chargerCache: ChargerCache;
+  typeRoutes: any[];
+  kinds: Map<WalkRouteKind, Promise<any[]>>;
+};
+
+const PERSONAL_LOGIN_REASON = '로그인하면 내 이동 기록을 반영한 맞춤 경로를 볼 수 있어요.';
 
 export function useTransitRoutes({
   startLatitude,
@@ -1099,9 +1150,92 @@ export function useTransitRoutes({
   const [selectedRoute, setSelectedRoute] = useState('');
   const [mapStartLabel, setMapStartLabel] = useState('');
   const [mapEndLabel, setMapEndLabel] = useState('');
+  const [routeKind, setRouteKind] = useState<WalkRouteKind>('type');
+  const [kindLoading, setKindLoading] = useState(false);
+  const [personalInfo, setPersonalInfoState] = useState<{ available: boolean | null; reason?: string }>({ available: null });
+  const personalInfoRef = useRef(personalInfo);
+  const setPersonalInfo = (v: { available: boolean | null; reason?: string }) => {
+    personalInfoRef.current = v;
+    setPersonalInfoState(v);
+  };
+  // 검색이 새로 시작될 때마다 gen 이 올라가 이전 검색의 늦은 응답을 버린다.
+  const genRef = useRef(0);
+  const kindRef = useRef<WalkRouteKind>('type');
+  const ctxRef = useRef<TransitKindContext | null>(null);
+
+  // 종류별 후보 경로 계산(종류당 1회, 결과 promise 캐시). 출구/충전기 조회 캐시는
+  // 유형별 계산 때 채운 것을 그대로 재사용하므로(승강기 출구 로직 동일), 새로
+  // 나가는 요청은 도보 구간 묶음(/route/legs)뿐이다.
+  const ensureKind = (kind: WalkRouteKind): Promise<any[]> => {
+    const ctx = ctxRef.current;
+    if (!ctx) return Promise.reject(new Error('no transit context'));
+    if (kind === 'type') return Promise.resolve(ctx.typeRoutes);
+    const hit = ctx.kinds.get(kind);
+    if (hit) return hit;
+    const onMeta = kind === 'personal'
+      ? (m: WalkLegsMeta) => {
+          if (genRef.current !== ctx.gen) return;
+          setPersonalInfo(m.personalized ? { available: true } : { available: false, reason: m.reason });
+        }
+      : undefined;
+    const fetchLeg = batchLegFetcher(ctx.apiUserType, kind, onMeta);
+    const legCache: LegCache = new Map();
+    const promise = Promise.all(
+      ctx.kakao.map((r, i) =>
+        convertKakaoRoute(r, i, ctx.apiUserType, ctx.origin, ctx.destination,
+          fetchLeg, legCache, ctx.subwayCache, ctx.chargerCache)
+      )
+    );
+    ctx.kinds.set(kind, promise);
+    promise.catch(() => { ctx.kinds.delete(kind); });
+    return promise;
+  };
+
+  const selectRouteKind = (kind: WalkRouteKind) => {
+    const ctx = ctxRef.current;
+    if (!ctx || kind === kindRef.current) return;
+    if (kind === 'personal' && personalInfoRef.current.available === false) return;
+    kindRef.current = kind;
+    setRouteKind(kind);
+    if (kind === 'type') {
+      setKindLoading(false);
+      setRoutes(ctx.typeRoutes);
+      return;
+    }
+    setKindLoading(true);
+    ensureKind(kind)
+      .then((next) => {
+        if (genRef.current !== ctx.gen || kindRef.current !== kind) return;
+        // 맞춤형이 fallback(데이터 부족 등)이면 결과가 유형별과 같으므로 보여주지 않고 되돌린다.
+        if (kind === 'personal' && personalInfoRef.current.available === false) {
+          kindRef.current = 'type';
+          setRouteKind('type');
+          setRoutes(ctx.typeRoutes);
+          return;
+        }
+        setRoutes(next);
+      })
+      .catch(() => {
+        if (genRef.current !== ctx.gen || kindRef.current !== kind) return;
+        kindRef.current = 'type';
+        setRouteKind('type');
+        setRoutes(ctx.typeRoutes);
+      })
+      .finally(() => {
+        // 그 사이 다른 종류(아직 계산 중)로 바꿨으면 그쪽 로딩 표시는 건드리지 않는다.
+        const current = kindRef.current;
+        if (genRef.current === ctx.gen && (current === kind || current === 'type')) setKindLoading(false);
+      });
+  };
 
   useEffect(() => {
     let cancelled = false;
+    const gen = ++genRef.current;
+    kindRef.current = 'type';
+    ctxRef.current = null;
+    setRouteKind('type');
+    setKindLoading(false);
+    setPersonalInfo({ available: null });
 
     async function load() {
       if (!startLatitude || !startLongitude || !endLatitude || !endLongitude) {
@@ -1141,13 +1275,15 @@ export function useTransitRoutes({
         const legCache: LegCache = new Map();
         const subwayCache: SubwayExitCache = new Map();
         const chargerCache: ChargerCache = new Map();
+        const origin = { lat: startLatitude, lng: startLongitude, name: startName };
+        const destination = { lat: endLatitude, lng: endLongitude, name: endName };
         const converted = await Promise.all(
           kakaoRoutes.map((r, i) =>
             convertKakaoRoute(
               r, i, apiUserType,
-              { lat: startLatitude, lng: startLongitude, name: startName },
-              { lat: endLatitude, lng: endLongitude, name: endName },
-              limit,
+              origin,
+              destination,
+              singleLegFetcher(apiUserType, limit),
               legCache,
               subwayCache,
               chargerCache,
@@ -1156,6 +1292,24 @@ export function useTransitRoutes({
         );
 
         if (cancelled) return;
+        ctxRef.current = {
+          gen, kakao: kakaoRoutes, apiUserType, origin, destination,
+          subwayCache, chargerCache, typeRoutes: converted, kinds: new Map(),
+        };
+        // 미리 계산(백그라운드) — 초기 화면(유형별)을 먼저 띄운 뒤 시작해 첫 화면을
+        // 늦추지 않는다. 맞춤형은 로그인 사용자만(비로그인은 바로 비활성 + 사유).
+        setTimeout(() => {
+          if (genRef.current !== gen) return;
+          ensureKind('distance').catch(() => {});
+          getAuthToken().catch(() => null).then((token) => {
+            if (genRef.current !== gen) return;
+            if (!token) {
+              setPersonalInfo({ available: false, reason: PERSONAL_LOGIN_REASON });
+              return;
+            }
+            ensureKind('personal').catch(() => {});
+          });
+        }, 0);
         setRoutes(converted);
         setSelectedRoute(converted[0]?.id ?? '');
         setMapStartLabel(startName || '');
@@ -1174,7 +1328,10 @@ export function useTransitRoutes({
     return () => { cancelled = true; };
   }, [startLatitude, startLongitude, endLatitude, endLongitude, startName, endName, walkerType]);
 
-  return { routes, loading, errorMessage, selectedRoute, setSelectedRoute, mapStartLabel, mapEndLabel };
+  return {
+    routes, loading, errorMessage, selectedRoute, setSelectedRoute, mapStartLabel, mapEndLabel,
+    routeKind, selectRouteKind, kindLoading, personalInfo,
+  };
 }
 
 // ── 메인 ───────────────────────────────────────────────────────
@@ -1205,7 +1362,12 @@ export default function TransitContent({
   onToggleSlopeMarkers,
   transitState,
 }: Props) {
-  const { routes, loading, errorMessage, selectedRoute, setSelectedRoute, mapStartLabel, mapEndLabel } = transitState;
+  const {
+    routes, loading, errorMessage, selectedRoute, setSelectedRoute, mapStartLabel, mapEndLabel,
+    routeKind, selectRouteKind, kindLoading, personalInfo,
+  } = transitState;
+  // 비활성 맞춤형 칩을 눌렀을 때만 사유 한 줄을 보여준다.
+  const [showPersonalHint, setShowPersonalHint] = useState(false);
   const [activeFilter, setActiveFilter]   = useState('all');
   const [view, setView]                   = useState<'routes' | 'steps'>('routes');
   const [containerHeight, setContainerHeight] = useState(H);
@@ -1284,7 +1446,9 @@ export default function TransitContent({
     const apiUserType = walkerType || 'manual_wheelchair';
     let preWalkRoute  = currentRoute.preWalkRoute;
     let postWalkRoute = currentRoute.postWalkRoute;
-    const fullLimit = createLimiter(2);
+    // 목록에서 보던 경로 종류(유형별/최단/맞춤형) 그대로 full 조회해야 안내 경로가
+    // 카드와 같다.
+    const fullFetch = singleLegFetcher(apiUserType, createLimiter(2), routeKind);
     const refetchTasks: Promise<void>[] = [];
 
     if (preWalkRoute && startLatitude && startLongitude) {
@@ -1293,7 +1457,7 @@ export default function TransitContent({
         refetchTasks.push(
           computeWalkLegUncached(
             startLatitude, startLongitude, String(boardPt[1]), String(boardPt[0]),
-            apiUserType, fullLimit, false, undefined,
+            apiUserType, fullFetch, false, undefined,
             currentRoute.startExitMessage && !currentRoute.originIsBoard ? stationNameOf(startName) : undefined,
           ).then(leg => { if (leg.serverRoute) preWalkRoute = leg.serverRoute; })
         );
@@ -1309,7 +1473,7 @@ export default function TransitContent({
               ? [String(postWalkRoute.coordinates[postWalkRoute.coordinates.length - 1][1]),
                  String(postWalkRoute.coordinates[postWalkRoute.coordinates.length - 1][0])] as [string, string]
               : [endLatitude, endLongitude] as [string, string]),
-            apiUserType, fullLimit, false,
+            apiUserType, fullFetch, false,
             currentRoute.destIsAlight ? undefined : stationNameOf(endName),
           ).then(leg => { if (leg.serverRoute) postWalkRoute = leg.serverRoute; })
         );
@@ -1471,6 +1635,30 @@ export default function TransitContent({
             <Text style={ss.sheetTitle}>
               {view === 'routes' ? '경로 선택' : `${currentRoute?.tag} 상세 안내`}
             </Text>
+            {view === 'routes' && !loading && !errorMessage && (
+              <View style={ss.kindToggle}>
+                {WALK_KIND_TABS.map((k) => {
+                  const disabled = k.key === 'personal' && personalInfo.available === false;
+                  const active = routeKind === k.key;
+                  return (
+                    <TouchableOpacity
+                      key={k.key}
+                      style={[ss.kindChip, active && ss.kindChipActive, disabled && ss.kindChipDisabled]}
+                      activeOpacity={0.8}
+                      onPress={() => {
+                        if (disabled) { setShowPersonalHint((v) => !v); return; }
+                        setShowPersonalHint(false);
+                        selectRouteKind(k.key);
+                      }}
+                    >
+                      <Text style={[ss.kindChipText, active && ss.kindChipTextActive, disabled && ss.kindChipTextDisabled]}>
+                        {k.label}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            )}
             <Text style={ss.sheetSub}>
               {view === 'routes' ? `${routes.length}개 경로` : `${currentRoute?.steps.length}단계`}
             </Text>
@@ -1498,8 +1686,25 @@ export default function TransitContent({
           </View>
         )}
 
+        {view === 'routes' && !loading && !errorMessage && showPersonalHint && personalInfo.available === false && (
+          <Text style={ss.kindHint}>{personalInfo.reason ?? '맞춤 경로를 아직 사용할 수 없어요.'}</Text>
+        )}
+
+        {view === 'routes' && !loading && !errorMessage && kindLoading && (
+          <View style={ss.kindLoadingRow}>
+            <ActivityIndicator size="small" color={C.primary} />
+            <Text style={ss.kindLoadingText}>
+              {WALK_KIND_TABS.find((k) => k.key === routeKind)?.label} 기준으로 도보 구간을 계산하는 중...
+            </Text>
+          </View>
+        )}
+
         {view === 'routes' && !loading && !errorMessage && (
-          <ScrollView style={ss.sheetScroll} contentContainerStyle={ss.sheetScrollContent} showsVerticalScrollIndicator={false}>
+          <ScrollView
+            style={[ss.sheetScroll, kindLoading && { opacity: 0.4 }]}
+            contentContainerStyle={ss.sheetScrollContent}
+            showsVerticalScrollIndicator={false}
+          >
             {filteredRoutes.map(route => (
               <RouteCard
                 key={route.id} route={route}
@@ -1618,6 +1823,19 @@ const ss = StyleSheet.create({
   viewSwitchBtn: { paddingHorizontal: 10, paddingVertical: 4, backgroundColor: C.primaryBg, borderRadius: 12 },
   viewSwitchText: { fontSize: 12, color: C.primary, fontWeight: '600' },
   sheetExpandIcon: { fontSize: 14, color: C.textMute },
+  kindToggle: { flexDirection: 'row', gap: 4 },
+  kindChip: {
+    paddingHorizontal: 8, paddingVertical: 3, borderRadius: 12,
+    backgroundColor: C.bg, borderWidth: 1, borderColor: C.border,
+  },
+  kindChipActive: { backgroundColor: C.primary, borderColor: C.primary },
+  kindChipDisabled: { opacity: 0.45 },
+  kindChipText: { fontSize: 11, color: C.textSub, fontWeight: '600' },
+  kindChipTextActive: { color: C.white, fontWeight: '700' },
+  kindChipTextDisabled: { color: C.textMute },
+  kindHint: { fontSize: 12, color: C.textSub, paddingHorizontal: 16, paddingBottom: 6 },
+  kindLoadingRow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 16, paddingBottom: 6 },
+  kindLoadingText: { fontSize: 12, color: C.textSub },
   sheetScroll: { flex: 1 },
   // 하단 96px은 이제 absolute로 뜬 startBtnWrap 높이만큼 — 마지막 스텝이 버튼 뒤에 가리지 않게.
   sheetScrollContent: { padding: 14, paddingBottom: 96, gap: 10 },

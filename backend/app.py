@@ -125,9 +125,14 @@ def _personal_flags(reason: str | None) -> dict:
             "reason": _PERSONAL_REASONS.get(reason, _PERSONAL_REASONS["no_model"])}
 
 
+_ROUTE_KINDS = (None, "type", "distance", "personal")
+
+
 def _shortest_len_m(origin: tuple, dest: tuple) -> float:
-    """우회 가드레일 기준 — 계단 회피 최단(최단 카드와 같은 기준) 경로 길이(m)."""
-    return _cch.find_distance_route(origin, dest)["total_length_m"]
+    """personal 우회 가드레일 기준 — 계단 회피 최단(최단 카드와 같은 기준) 길이(m).
+    계단 포함 순수 최단을 기준으로 잡으면, 계단을 피하느라 조금 돌아가는 personal
+    경로가 detour_exceeded 로 잘못 빠진다(personal 도 계단 차단)."""
+    return _cch.find_distance_route(origin, dest, avoid_stairs=True)["total_length_m"]
 _subway_db: SubwayFacilityDB | None = None
 # extract_waypoints(G)는 그래프 전체 노드를 순회해 교차로를 찾는다 — 서울 전역
 # 그래프(수십만 노드)에서 이걸 매 /route 요청마다 다시 계산하면 요청당 유의미한
@@ -1417,9 +1422,11 @@ class RouteRequest(BaseModel):
     # 않을 GPS 안내 데이터를 매번 계산하는 낭비를 없앤다. 실제로 안내를 시작할
     # 경로(선택된 1개)는 이 플래그 없이 다시 조회해 전체 데이터를 받는다.
     light: bool = False
-    # S8 — single 모드에서 "personal" 이면 요청자 개인 metric 으로 메인 경로를 찾는다.
-    # 개인 파라미터가 없거나 fallback 조건 미충족이면 type 경로 + personalized=false.
-    # None/"type" = 기존 유형별 경로(기본). compare 모드에서는 무시(후보로 따로 붙음).
+    # single 모드에서 메인 경로의 종류. None/"type" = 기존 유형별 경로(기본).
+    # "distance" = 계단 회피 최단(최단 거리 카드와 같은 기준),
+    # "personal" = 요청자 개인 metric(S8) — 개인 파라미터가 없거나 fallback 조건
+    # 미충족이면 type 경로 + personalized=false. compare 모드에서는 무시(후보로 따로 붙음).
+    # distance/personal 은 유형별 탐색(alpha 이진탐색, 가장 느린 단계)을 건너뛴다.
     route_kind: str | None = None
 
 
@@ -1594,6 +1601,8 @@ def api_route(
         raise HTTPException(400, f"유효하지 않은 user_type: {body.user_type}")
     if body.candidates not in ("single", "compare"):
         raise HTTPException(400, "candidates는 'single' 또는 'compare'여야 합니다")
+    if body.route_kind not in _ROUTE_KINDS:
+        raise HTTPException(400, "route_kind는 'type'/'distance'/'personal' 중 하나여야 합니다")
 
     _t_handler_start = time.perf_counter()   # [TIMING] 출구 선택까지 포함하려고 맨 앞에서 잰다
     try:
@@ -1678,16 +1687,17 @@ def api_route(
         # 다름없었다 — 느리게 성공하는 대신 즉시 에러로 명확히 실패한다.
         if _cch is None:
             raise ValueError("라우팅 엔진이 아직 준비되지 않았습니다. 잠시 후 다시 시도해주세요.")
-        try:
-            result = _cch.find_route(origin, dest, body.user_type)
-        except Exception as e:
-            print(f"[CCH] 쿼리 실패: {e}")
-            raise ValueError("경로를 찾을 수 없습니다.")
-
-        # S8 — single 모드 route_kind="personal": 개인 metric 이 있으면 메인 경로를
-        # 그걸로 교체, 없으면(fallback) 위 type 경로 그대로 + personalized=false.
+        # single 모드 route_kind — distance/personal 이면 그 경로를 먼저 구하고,
+        # 못 구했을 때만(personal fallback 등) 유형별 경로를 계산한다.
+        result = None
+        single_kind = body.route_kind if body.candidates != "compare" else None
         single_personal_reason = None
-        if body.route_kind == "personal" and body.candidates != "compare":
+        if single_kind == "distance":
+            try:
+                result = _cch.find_distance_route(origin, dest, avoid_stairs=True)
+            except Exception as e:
+                print(f"[route2] 최단경로 조회 실패 → type 경로로 대체: {e}")
+        elif single_kind == "personal":
             p_metric, single_personal_reason = _personal_metric_or_reason(decoded)
             if p_metric is not None:
                 try:
@@ -1699,8 +1709,14 @@ def api_route(
                     else:
                         result = p_result
                 except Exception as e:
-                    print(f"[route3] 맞춤경로 조회 실패 → type 경로 유지: {e}")
+                    print(f"[route3] 맞춤경로 조회 실패 → type 경로로 대체: {e}")
                     single_personal_reason = "route_failed"
+        if result is None:
+            try:
+                result = _cch.find_route(origin, dest, body.user_type)
+            except Exception as e:
+                print(f"[CCH] 쿼리 실패: {e}")
+                raise ValueError("경로를 찾을 수 없습니다.")
         _t_find_route = time.perf_counter()
 
         coords = [
@@ -1740,7 +1756,7 @@ def api_route(
         # '최단 거리' 카드 — 유형별 경로와 나란히 WalkContent 2번째 탭으로.
         # light(대중교통 대량 조회) / compare(개인화 3경로)엔 붙이지 않는다.
         shortest_obj = None
-        if not body.light and body.candidates != "compare":
+        if not body.light and body.candidates != "compare" and single_kind in (None, "type"):
             try:
                 shortest_obj = _shortest_route_card(
                     origin, dest, body.user_type, total_length_m, speed_profile,
@@ -1889,7 +1905,7 @@ def api_route(
             # FE의 PROXIMITY_THRESHOLD 도착판정·D신호 지도 하이라이트용).
             "measurement_units": measurement_units,
         }
-        if body.route_kind == "personal" and body.candidates != "compare":
+        if single_kind == "personal":
             response.update(_personal_flags(single_personal_reason))
 
         if body.candidates == "compare":
@@ -1919,7 +1935,8 @@ def api_route(
             dist_result = None
             if _cch is not None:
                 try:
-                    dist_result = _cch.find_distance_route(origin, dest)
+                    # 전 유형 계단 차단 — "최단" 후보도 최단 거리 카드처럼 계단 회피 최단.
+                    dist_result = _cch.find_distance_route(origin, dest, avoid_stairs=True)
                     dist_coords = [
                         [G.nodes[n]["lon"], G.nodes[n]["lat"]]
                         for n in dist_result["path_nodes"]
@@ -2060,6 +2077,68 @@ def api_route_safe(
 ):
     """내부 그래프 기반 경로 탐색 (/route 동일 로직, FE 호환을 위해 엔드포인트 유지)"""
     return api_route(body, db, decoded)
+
+
+# ── 도보 구간 묶음 조회 (대중교통 탭 최단/유형별/맞춤형 토글) ─────────────────
+class WalkLegItem(BaseModel):
+    origin_lat: float
+    origin_lon: float
+    dest_lat:   float
+    dest_lon:   float
+    end_station_name:   str | None = None
+    start_station_name: str | None = None
+
+
+class WalkLegsRequest(BaseModel):
+    user_type:  str = "manual_wheelchair"
+    route_kind: str = "type"          # "type" | "distance" | "personal"
+    light:      bool = True
+    legs:       list[WalkLegItem]
+
+
+_MAX_LEGS_PER_BATCH = 60
+
+
+@app.post("/route/legs")
+def api_route_legs(
+    body: WalkLegsRequest,
+    db: Session = Depends(get_db),
+    decoded: dict | None = Depends(_optional_verified),
+):
+    """
+    대중교통 탭의 승차 전/하차 후/환승 도보 구간 여러 개를 한 번에 계산한다.
+    구간마다 /route/safe(single) 와 같은 응답을 results[i] 에 담고(실패 구간은 null),
+    요청 1건으로 끝내 FE 동시요청 제한(4개)에 걸려 왕복이 쌓이던 지연을 없앤다.
+    route_kind="personal" 이면 personalized/reason 을 최상위에 한 번 붙인다
+    (구간별 fallback 은 type 경로로 채워진다).
+    """
+    if body.route_kind not in ("type", "distance", "personal"):
+        raise HTTPException(400, "route_kind는 'type'/'distance'/'personal' 중 하나여야 합니다")
+    if len(body.legs) > _MAX_LEGS_PER_BATCH:
+        raise HTTPException(400, f"legs는 최대 {_MAX_LEGS_PER_BATCH}개입니다")
+
+    t0 = time.perf_counter()
+    results = []
+    for leg in body.legs:
+        try:
+            results.append(api_route(RouteRequest(
+                origin_lat=leg.origin_lat, origin_lon=leg.origin_lon,
+                dest_lat=leg.dest_lat, dest_lon=leg.dest_lon,
+                user_type=body.user_type, light=body.light,
+                route_kind=body.route_kind,
+                end_station_name=leg.end_station_name,
+                start_station_name=leg.start_station_name,
+            ), db, decoded))
+        except Exception as e:
+            print(f"[legs] 구간 조회 실패 (null): {e}")
+            results.append(None)
+    print(f"[TIMING] /route/legs kind={body.route_kind} n={len(body.legs)} "
+          f"total={time.perf_counter() - t0:.3f}s")
+
+    out: dict = {"results": results}
+    if body.route_kind == "personal":
+        out.update(_personal_flags(_personal_metric_or_reason(decoded)[1]))
+    return out
 
 
 # ── 지하철 입구 스냅 (카카오 대중교통 응답의 stops[].name과 매칭) ─────────────

@@ -1,4 +1,9 @@
 import { stationNameOf } from "../utils/stationName";
+import { getAuthToken } from "../api";
+
+// 도보 경로 종류 — 대중교통 탭 도보 구간 토글(유형별/최단/맞춤형).
+// type=유형별(기본), distance=계단 회피 최단, personal=개인 맞춤(S8, 로그인 필요).
+export type WalkRouteKind = "type" | "distance" | "personal";
 
 // 에뮬레이터: 10.0.2.2 / 실기기(같은 WiFi): .env 에 EXPO_PUBLIC_ROUTE_API_URL=http://192.168.x.x:8000 추가
 const API_BASE_URL: string =
@@ -150,17 +155,22 @@ export async function requestWalkLeg({
   light = false,
   endStationName,
   startStationName,
-}: RouteRequest) {
+  routeKind,
+}: RouteRequest & { routeKind?: WalkRouteKind }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 60_000);
+  // personal 은 서버가 로그인 사용자의 개인 metric 을 찾아야 해서 토큰이 필요하다.
+  const token = routeKind === "personal" ? await getAuthToken().catch(() => null) : null;
 
   try {
     const response = await fetch(`${API_BASE_URL}/route/safe`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
       body: JSON.stringify({
+        ...(routeKind && routeKind !== "type" ? { route_kind: routeKind } : {}),
         origin_lat:  Number(startLatitude),
         origin_lon:  Number(startLongitude),
         dest_lat:    Number(endLatitude),
@@ -280,4 +290,98 @@ export async function requestLowfloorBusInfo(routeNo: string): Promise<LowfloorB
   } finally {
     clearTimeout(timer);
   }
+}
+
+// ── 도보 구간 묶음 조회 (POST /route/legs) ───────────────────────────────────
+// 대중교통 탭에서 최단/맞춤형으로 토글할 때, 후보 경로들의 도보 구간 수십 개를
+// 개별 요청(동시 4개 제한 → 왕복이 7~8번 쌓임) 대신 요청 1건으로 계산한다.
+export type WalkLegRequest = {
+  fromLat: string; fromLng: string;
+  toLat:   string; toLng:   string;
+  endStationName?:   string;
+  startStationName?: string;
+};
+
+export type WalkLegsMeta = {
+  personalized?: boolean;
+  reason?: string;
+  reason_code?: string;
+};
+
+const LEGS_BATCH_MAX = 60;       // 백엔드 _MAX_LEGS_PER_BATCH 와 동일
+const LEGS_BATCH_WINDOW_MS = 30; // 이 시간 안에 들어온 요청을 한 번에 보낸다
+
+/**
+ * requestWalkLeg 와 같은 응답(/route/safe light)을 돌려주는 함수를 만든다 — 호출은
+ * 구간마다 따로 하지만 LEGS_BATCH_WINDOW_MS 안에 모인 요청은 /route/legs 1건으로
+ * 묶여 나간다. 실패한 구간은 reject(호출부가 직선거리 추정으로 폴백).
+ * onMeta: personal 일 때 서버가 준 personalized/reason 을 받는다(첫 응답마다 호출).
+ */
+export function createWalkLegBatcher(
+  userType: string,
+  routeKind: WalkRouteKind,
+  onMeta?: (meta: WalkLegsMeta) => void,
+): (req: WalkLegRequest) => Promise<any> {
+  type Pending = { req: WalkLegRequest; resolve: (v: any) => void; reject: (e: any) => void };
+  let queue: Pending[] = [];
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const send = async (batch: Pending[]) => {
+    const controller = new AbortController();
+    const abort = setTimeout(() => controller.abort(), 60_000);
+    try {
+      const token = routeKind === "personal" ? await getAuthToken().catch(() => null) : null;
+      const response = await fetch(`${API_BASE_URL}/route/legs`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({
+          user_type:  userType,
+          route_kind: routeKind,
+          light:      true,
+          legs: batch.map(({ req }) => ({
+            origin_lat: Number(req.fromLat),
+            origin_lon: Number(req.fromLng),
+            dest_lat:   Number(req.toLat),
+            dest_lon:   Number(req.toLng),
+            end_station_name:   stationNameOf(req.endStationName),
+            start_station_name: stationNameOf(req.startStationName),
+          })),
+        }),
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const data = await response.json();
+      if (onMeta && "personalized" in data) {
+        onMeta({ personalized: data.personalized, reason: data.reason, reason_code: data.reason_code });
+      }
+      const results: any[] = Array.isArray(data?.results) ? data.results : [];
+      batch.forEach((p, i) => {
+        const r = results[i];
+        if (r) p.resolve(r);
+        else p.reject(new Error("walk leg failed"));
+      });
+    } catch (e) {
+      batch.forEach((p) => p.reject(e));
+    } finally {
+      clearTimeout(abort);
+    }
+  };
+
+  const flush = () => {
+    timer = null;
+    const all = queue;
+    queue = [];
+    for (let i = 0; i < all.length; i += LEGS_BATCH_MAX) {
+      send(all.slice(i, i + LEGS_BATCH_MAX));
+    }
+  };
+
+  return (req) =>
+    new Promise((resolve, reject) => {
+      queue.push({ req, resolve, reject });
+      if (!timer) timer = setTimeout(flush, LEGS_BATCH_WINDOW_MS);
+    });
 }

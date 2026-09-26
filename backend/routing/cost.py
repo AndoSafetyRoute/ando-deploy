@@ -222,10 +222,12 @@ def set_edge_weights(G, user_type: str, alpha: float = 1.0):
 def predict_pace(model_a: dict, slope_pct):
     """
     A 모델: log_pace = a_u + b_u·up + c_u·down  → pace(s/m).
-    up/down 은 S0(가장 빠른 경사, 기본 −5%) 기준 힌지:
-      up = max(s − S0, 0), down = max(S0 − s, 0).
-    (0% 기준 힌지로 풀면 로컬 CSV 실측 log pace 와 절편이 안 맞고, S0 기준일 때
-    a_u 가 실측 중앙값과 맞는다 — 2026-09-26 대조.)
+    up/down 은 "오르막/내리막"이 아니라 S0(가장 빠른 경사, model_A["S0"]=−5%) 기준 힌지:
+      up   = max(s − S0, 0)  — S0 보다 완만한 쪽(−2%, 0%, +3% … 전부 여기)
+      down = max(S0 − s, 0)  — S0 보다 가파른 내리막(−8%, −10% …)만
+    (Colab 정의 확인 완료, 2026-09-26.)
+    ⚠️ 이 S0 는 개인 속도곡선의 꼭짓점일 뿐, 위 USER_TYPES 의 g_opt/g_warn
+       (slope zone 등급·유형별 비용 구간)과는 무관하다 — 섞어 쓰지 말 것.
     """
     s   = np.asarray(slope_pct, dtype=np.float64)
     s0  = float(model_a.get("S0", -5.0))
