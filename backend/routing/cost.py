@@ -5,7 +5,8 @@
   shortest(거리)   : length                              — set_edge_weights(alpha=0.0)
   type(유형별)      : length × f_type(slope) = slope_cost(slope, user_type, length)
                                                           — set_edge_weights(alpha=1.0)
-  personal(맞춤형)  : c_u(e) — 아직 미구현(S8 예정, user_model_params 기반).
+  personal(맞춤형)  : c_u(e) = t_u(e) × (1 + λ·P_u(힘듦|e)) × X_u(e)
+                       — personal_edge_cost(), user_model_params(arm='H') 기반.
                        f_type과 user_type 피처를 쓰지 않는다는 게 S8의 요구사항.
 
   세 함수 모두 시설 정책(FACILITY_POLICY, is_facility_blocked)을 적용한다 —
@@ -14,7 +15,9 @@
   제거하는 대신 큰 유한 비용(FORBIDDEN_PENALTY × length)을 주는 기존 관례를
   그대로 따른다(경사 forbidden 처리와 동일 패턴, 우회 가드레일도 그대로 적용됨).
 """
-from config import FORBIDDEN_PENALTY
+import numpy as np
+
+from config import FORBIDDEN_PENALTY, PERSONAL_LAMBDA, PERSONAL_EXTRAPOLATION_PENALTY
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 유형별 파라미터
@@ -209,3 +212,62 @@ def set_edge_weights(G, user_type: str, alpha: float = 1.0):
         if is_facility_blocked(user_type, data.get("highway") == "steps"):
             weight = max(weight, FORBIDDEN_PENALTY * length)
         data["weight"] = weight
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# S8 — personal(맞춤형) 비용. Colab A+D 계층모델(user_model_params_final.json) 이식.
+# 모든 함수는 스칼라/numpy 배열 둘 다 받는다(그래프 전체 엣지에 벡터로 적용).
+# slope_pct 는 부호 있는 경사(%) — 오르막 +, 내리막 −.
+# ──────────────────────────────────────────────────────────────────────────────
+def predict_pace(model_a: dict, slope_pct):
+    """
+    A 모델: log_pace = a_u + b_u·up + c_u·down  → pace(s/m).
+    up/down 은 S0(가장 빠른 경사, 기본 −5%) 기준 힌지:
+      up = max(s − S0, 0), down = max(S0 − s, 0).
+    (0% 기준 힌지로 풀면 로컬 CSV 실측 log pace 와 절편이 안 맞고, S0 기준일 때
+    a_u 가 실측 중앙값과 맞는다 — 2026-09-26 대조.)
+    """
+    s   = np.asarray(slope_pct, dtype=np.float64)
+    s0  = float(model_a.get("S0", -5.0))
+    up   = np.maximum(s - s0, 0.0)
+    down = np.maximum(s0 - s, 0.0)
+    log_pace = model_a["a_u"] + model_a["b_u"] * up + model_a["c_u"] * down
+    return np.exp(log_pace)
+
+
+def hardship_prob(model_d: dict, slope_pct):
+    """
+    D 모델(순서형 로짓): 경사를 직접 입력(slowdown 매개 폐기 — Colab 진단).
+      eta = alpha_u + beta_up·(max(s,0)/scale) + beta_down·(max(−s,0)/scale)
+      P(힘듦) = sigmoid(eta − cutpoints[1])
+    """
+    s     = np.asarray(slope_pct, dtype=np.float64)
+    scale = float(model_d.get("slope_scale", 10.0))
+    eta = (model_d["alpha_u"]
+           + model_d["beta_up"]   * (np.maximum(s, 0.0)  / scale)
+           + model_d["beta_down"] * (np.maximum(-s, 0.0) / scale))
+    return 1.0 / (1.0 + np.exp(-(eta - model_d["cutpoints"][1])))
+
+
+def extrapolation_factor(slope_pct, obs_slope_min: float, obs_slope_max: float,
+                         penalty: float = PERSONAL_EXTRAPOLATION_PENALTY):
+    """X_u(e): 관측 경사 범위 [obs_min, obs_max] 밖이면 penalty(유한), 안이면 1.0."""
+    s = np.asarray(slope_pct, dtype=np.float64)
+    return np.where((s < obs_slope_min) | (s > obs_slope_max), penalty, 1.0)
+
+
+def personal_edge_cost(params: dict, slope_pct, length_m):
+    """
+    c_u(e) = t_u(e) × (1 + λ·P_u(힘듦|e)) × X_u(e),  t_u(e) = length × pace_u(s).
+    단위는 초(s) 기반 — 다른 metric(거리 m 기반)과 섞지 않고 personal metric
+    안에서만 비교하므로 무방하다.
+    params: {"model_A", "model_D", "obs_slope_min", "obs_slope_max",
+             ("lambda"), ("extrapolation_penalty")}
+    """
+    L   = np.asarray(length_m, dtype=np.float64)
+    lam = float(params.get("lambda", PERSONAL_LAMBDA))
+    pen = float(params.get("extrapolation_penalty", PERSONAL_EXTRAPOLATION_PENALTY))
+    t_u = L * predict_pace(params["model_A"], slope_pct)
+    h_u = hardship_prob(params["model_D"], slope_pct)
+    x_u = extrapolation_factor(slope_pct, params["obs_slope_min"], params["obs_slope_max"], pen)
+    return t_u * (1.0 + lam * h_u) * x_u

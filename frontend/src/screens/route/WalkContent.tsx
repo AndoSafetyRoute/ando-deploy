@@ -151,6 +151,9 @@ const CompareCard = ({
       : kind === 'personal'
       ? '내 이동 기록을 반영한 맞춤 경로예요.'
       : '경사·유형별 이동 부담을 고려한 경로예요.';
+  // BE 가 준 맞춤형 경로가 이 카드(최단/유형별)와 좌표가 같아 병합된 경우 —
+  // 맞춤형 카드가 따로 안 보여도 개인화가 적용됐다는 걸 알 수 있게 한 줄 덧붙인다.
+  const mergedPersonal = kind !== 'personal' && cand.mergedKinds.includes('personal');
 
   const handlePress = () => {
     Animated.sequence([
@@ -191,6 +194,9 @@ const CompareCard = ({
               </Text>
             </View>
             <Text style={ss.routeDesc}>{desc}</Text>
+            {mergedPersonal && (
+              <Text style={ss.routeDesc}>내 맞춤 경로도 이 경로와 같아요.</Text>
+            )}
           </View>
 
           <View style={ss.routeStats}>

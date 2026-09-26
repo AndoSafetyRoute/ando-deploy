@@ -86,6 +86,18 @@ class PersonalMetricCache:
             self._store[uid]      = new_metric        # 포인터만 교체 (원자적)
             self._updated_at[uid] = time.time()
 
+    def update_weights(self, uid: str, weights: list) -> None:
+        """
+        S8 — 이미 계산된 엣지 가중치(CCHEngine.personal_weights)로 새 CCHMetric 을
+        만들어 캐시에 넣는다. θ·basis 선형결합이 아닌 비선형 c_u(e)(A+D 모델)용.
+        update() 와 같은 규칙: 항상 새 객체, 포인터만 교체.
+        """
+        from routingkit_cch import CCHMetric
+        new_metric = CCHMetric(self._cch, weights)
+        with self._lock:
+            self._store[uid]      = new_metric
+            self._updated_at[uid] = time.time()
+
     def evict(self, uid: str) -> None:
         with self._lock:
             self._store.pop(uid, None)

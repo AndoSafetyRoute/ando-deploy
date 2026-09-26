@@ -109,3 +109,14 @@ BASIS_KNOTS_RIGHT = 3  # [CORE_MAX, G_MAX] 구간 매듭 수 (양 끝 포함)
 # 평지(|g|<0.5%) 누적 관측 거리가 이 값에 도달하기 전엔 EMA 결과를 쓰지 않고
 # 유형 문헌 기본값으로 폴백한다(별도 캘리브레이션 화면 없이 자동 누적).
 CALIBRATION_FLAT_M = 300.0
+
+# ── 개인 맞춤(personal) 경로 — S8 (user_model_params, arm='H') ────────────────
+# fallback: 유효 학습 트립 < PERSONAL_MIN_TRIPS 또는 오르막/내리막 유효 행 <
+# PERSONAL_MIN_ROWS 면 personal 을 만들지 않고 type 경로 + personalized=false.
+PERSONAL_ARM       = "H"
+PERSONAL_MIN_TRIPS = 3
+PERSONAL_MIN_ROWS  = 15
+# c_u(e) = t_u(e) × (1 + LAMBDA × P_u(힘듦|e)) × X_u(e). 파라미터 JSON 에 값이
+# 있으면 그걸 쓰고(Colab 최종본 lambda=0.4, penalty=3.0), 없을 때만 이 기본값.
+PERSONAL_LAMBDA               = 0.4
+PERSONAL_EXTRAPOLATION_PENALTY = 3.0

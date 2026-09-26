@@ -24,7 +24,7 @@ import numpy as np
 from scipy.spatial import KDTree
 
 from config import MAX_DETOUR_RATIO, FORBIDDEN_PENALTY, BASE_DIR
-from routing.cost import USER_TYPES, slope_cost, slope_score, is_facility_blocked, is_facility_blocked_for_any_type
+from routing.cost import USER_TYPES, slope_cost, slope_score, is_facility_blocked, is_facility_blocked_for_any_type, personal_edge_cost
 from routing.basis import precompute_basis_weights, save_basis_weights, load_basis_weights
 
 
@@ -237,7 +237,8 @@ class CCHEngine:
                  basis_weights=None,
                  edge_tail=None, edge_head=None,
                  coords_m=None, tail_np=None, head_np=None,
-                 acc_tree=None, acc_ids=None):
+                 acc_tree=None, acc_ids=None,
+                 edge_slope=None, edge_length=None, edge_stairs=None):
         self.G           = G
         self.cch         = cch
         self.node_list   = node_list
@@ -266,6 +267,11 @@ class CCHEngine:
         # SNAP_ACCESSIBLE_ENABLED — 계단 없는 주 네트워크 노드만 담은 KDTree
         self._acc_tree = acc_tree                  # KDTree | None
         self._acc_ids  = acc_ids                   # (k,) int — acc_tree 인덱스 → 노드 ID
+        # S8 personal metric 용 엣지 원본(CCH arc 인덱스와 동일 순서). personal 비용은
+        # 경사의 비선형 함수라 basis_weights(θ 선형결합)로 못 담아 엣지별로 직접 계산한다.
+        self._edge_slope  = edge_slope             # (m,) float64 | None
+        self._edge_length = edge_length            # (m,) float64 | None
+        self._edge_stairs = edge_stairs            # (m,) bool | None
 
     # ── 내부 헬퍼 ────────────────────────────────────────────────────────────
 
@@ -667,6 +673,19 @@ class CCHEngine:
         dst_id = self._nearest_id(*dest_lonlat)
         return self._build_distance_result(path_nodes, False, src_id, dst_id)
 
+    def personal_weights(self, params: dict) -> list:
+        """
+        S8 — user_model_params 로 전체 엣지의 personal 비용 c_u(e) 를 벡터 계산해
+        CCHMetric 에 넣을 정수 가중치 list 로 반환. 계단은 다른 metric 과 같은
+        관례로 FORBIDDEN_PENALTY 배(전 유형 계단 차단, S7 시설 정책).
+        요청 경로에서 호출 금지 — 서버 시작 시 PersonalMetricCache 적재에서만 쓴다.
+        """
+        if self._edge_slope is None:
+            raise RuntimeError("personal metric 용 엣지 배열이 없습니다")
+        cost = personal_edge_cost(params, self._edge_slope, self._edge_length)
+        cost = np.where(self._edge_stairs, cost * FORBIDDEN_PENALTY, cost)
+        return np.maximum(1, cost * WEIGHT_SCALE).astype(np.int64).tolist()
+
     def find_route_with_metric(self, origin_lonlat: tuple, dest_lonlat: tuple,
                                 metric, label: str, kind: str) -> dict:
         """
@@ -894,4 +913,7 @@ def build_cch_engine(G, order_cache_path: str | None = None) -> CCHEngine:
         head_np=head_np,
         acc_tree=acc_tree,
         acc_ids=acc_ids,
+        edge_slope=slope_arr,
+        edge_length=length_arr,
+        edge_stairs=stairs_np,
     )

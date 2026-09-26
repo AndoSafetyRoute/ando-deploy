@@ -27,6 +27,25 @@ else:
 
 SessionLocal = sessionmaker(bind=engine) if engine else None
 
+# S8 — init_db() 와 scripts/load_user_model_params.py 가 같이 쓴다.
+USER_MODEL_PARAMS_DDL = """
+CREATE TABLE IF NOT EXISTS user_model_params (
+    uid               TEXT        NOT NULL,
+    arm               TEXT        NOT NULL,
+    model             TEXT        NOT NULL CHECK (model IN ('A','D')),
+    version           TEXT        NOT NULL,
+    params_json       JSONB       NOT NULL,
+    posterior_sd_json JSONB,
+    n_trips           INT         NOT NULL DEFAULT 0,
+    n_rows            INT         NOT NULL DEFAULT 0,
+    obs_slope_min     FLOAT,
+    obs_slope_max     FLOAT,
+    frozen            BOOLEAN     NOT NULL DEFAULT FALSE,
+    fitted_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (uid, arm, model, version)
+)
+"""
+
 
 def get_db() -> Session:
     # DATABASE_URL 미설정이면 SessionLocal 자체가 None 이라 SessionLocal() 호출이
@@ -462,6 +481,12 @@ def init_db():
         conn.execute(text(
             "ALTER TABLE user_slope_curve ADD COLUMN IF NOT EXISTS v_flat_used FLOAT"
         ))
+
+        # S8 — 개인 맞춤(personal) 경로 파라미터. (uid, arm, model) 별 최신 1행을
+        # 라우팅이 쓴다. model 'A'=경사별 소요시간, 'D'=힘듦 순서형 로짓.
+        # 지금은 Colab 에서 만든 값을 scripts/load_user_model_params.py 로 수동 적재
+        # (자동 배치 학습은 후속 과제). 서버는 시작 시 1회 읽어 개인 metric 을 만든다.
+        conn.execute(text(USER_MODEL_PARAMS_DDL))
 
         # 공유 파라미터 (전원 공통, 단일 행)
         conn.execute(text("""
@@ -2459,3 +2484,51 @@ def get_segment_hardest_pick(db: Session, route_id: int, uid: str) -> dict | Non
         "picked_seg_index":  int(row[1]) if row[1] is not None else None,
         "picked_none":       bool(row[2]),
     }
+
+
+def get_all_user_model_params(db: Session, arm: str) -> dict:
+    """
+    S8 — arm 의 사용자별 최신(fitted_at) A·D 파라미터를 personal_edge_cost() 입력
+    형태로 묶어 반환. {uid: {"model_A", "model_D", "obs_slope_min", "obs_slope_max",
+    "lambda", "extrapolation_penalty", "n_trips", "n_rows", "version"}}.
+    A 와 D 중 하나라도 없으면 그 uid 는 제외(호출측에서 fallback 사유로 처리).
+    """
+    if not engine:
+        return {}
+    rows = db.execute(text("""
+        SELECT DISTINCT ON (uid, model)
+               uid, model, version, params_json, n_trips, n_rows,
+               obs_slope_min, obs_slope_max
+        FROM user_model_params
+        WHERE arm = :arm
+        ORDER BY uid, model, fitted_at DESC
+    """), {"arm": arm}).fetchall()
+
+    by_uid: dict = {}
+    for uid, model, version, params, n_trips, n_rows, smin, smax in rows:
+        if isinstance(params, str):
+            params = json.loads(params)
+        by_uid.setdefault(uid, {})[model] = (version, params, n_trips, n_rows, smin, smax)
+
+    out = {}
+    for uid, models in by_uid.items():
+        if "A" not in models or "D" not in models:
+            continue
+        a_ver, a_params, n_trips, n_rows, smin, smax = models["A"]
+        _, d_params, *_ = models["D"]
+        d_params = dict(d_params)
+        entry = {
+            "model_A":       a_params,
+            "model_D":       d_params,
+            "obs_slope_min": smin,
+            "obs_slope_max": smax,
+            "n_trips":       int(n_trips or 0),
+            "n_rows":        int(n_rows or 0),
+            "version":       a_ver,
+        }
+        # lambda / extrapolation_penalty 는 D 행 params_json 에 같이 저장한다.
+        for k in ("lambda", "extrapolation_penalty"):
+            if k in d_params:
+                entry[k] = d_params.pop(k)
+        out[uid] = entry
+    return out

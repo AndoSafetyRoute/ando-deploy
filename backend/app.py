@@ -17,7 +17,10 @@ from sqlalchemy import text
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from config import GEOJSON_PATH
+from config import (
+    GEOJSON_PATH, MAX_DETOUR_RATIO,
+    PERSONAL_ARM, PERSONAL_MIN_TRIPS, PERSONAL_MIN_ROWS,
+)
 from routing import build_graph, USER_TYPES, classify_zone, precompute_edge_costs
 from routing.search import build_spatial_index, nearest_node
 from routing.graph import haversine
@@ -36,8 +39,9 @@ from database import (
     get_slow_segments, save_segment_hardship_feedback, get_segment_hardship_feedback,
     save_segment_hardest_pick, get_segment_hardest_pick,
     start_session, record_gps_fix_stage, add_navigation_measurement, save_gps_batch,
-    get_route_measurements,
+    get_route_measurements, get_all_user_model_params,
 )
+from database import SessionLocal
 from routing.speed import get_zone_key, estimate_route_time, get_default_speed
 from routing.segments import build_navigation_segments, extract_waypoints
 from routing.measurement_units import build_measurement_units
@@ -54,6 +58,76 @@ G = None
 _spatial_index = None
 _cch: CCHEngine | None = None
 _personal_cache: PersonalMetricCache | None = None
+# S8 — uid → personal 을 못 주는 사유 코드(적재 시 결정). 캐시에 metric 이 있는
+# uid 는 여기 없다. 여기에도 캐시에도 없는 uid = user_model_params 행 없음.
+_personal_skip: dict[str, str] = {}
+
+_PERSONAL_REASONS = {
+    "login_required":     "로그인하면 내 이동 기록을 반영한 맞춤 경로를 받을 수 있어요.",
+    "no_model":           "내 이동 기록이 더 쌓이면 맞춤 경로를 제공해요.",
+    "insufficient_data":  "맞춤 경로에 필요한 이동 기록이 아직 부족해요.",
+    "engine_unavailable": "맞춤 경로 기능을 잠시 사용할 수 없어요.",
+    "detour_exceeded":    "맞춤 경로가 너무 돌아가서 이번 경로에서는 제외했어요.",
+    "route_failed":       "맞춤 경로를 찾지 못했어요.",
+}
+
+
+def _load_personal_metrics() -> None:
+    """
+    S8 — 서버 시작 시 1회: user_model_params(arm=PERSONAL_ARM) 를 읽어 fallback
+    조건(PERSONAL_MIN_TRIPS / PERSONAL_MIN_ROWS)을 통과한 사용자만 개인 CCHMetric
+    을 만든다. 요청 경로에서는 가중치를 계산하지 않는다(설계 규칙) — 파라미터를
+    새로 적재했으면 서버를 재시작해야 반영된다(자동 배치/갱신은 후속 과제).
+    """
+    if _cch is None or _personal_cache is None or SessionLocal is None:
+        return
+    db = SessionLocal()
+    try:
+        all_params = get_all_user_model_params(db, PERSONAL_ARM)
+    except Exception as e:
+        print(f"[PERSONAL] user_model_params 조회 실패 (personal 비활성): {e}")
+        return
+    finally:
+        db.close()
+    for uid, params in all_params.items():
+        if params["n_trips"] < PERSONAL_MIN_TRIPS or params["n_rows"] < PERSONAL_MIN_ROWS:
+            _personal_skip[uid] = "insufficient_data"
+            print(f"[PERSONAL] {uid} fallback — trips={params['n_trips']}/{PERSONAL_MIN_TRIPS} "
+                  f"rows={params['n_rows']}/{PERSONAL_MIN_ROWS}")
+            continue
+        try:
+            t0 = time.time()
+            _personal_cache.update_weights(uid, _cch.personal_weights(params))
+            print(f"[PERSONAL] {uid} metric 적재 ({params['version']}, "
+                  f"trips={params['n_trips']} rows={params['n_rows']}, {time.time() - t0:.1f}s)")
+        except Exception as e:
+            _personal_skip[uid] = "engine_unavailable"
+            print(f"[PERSONAL] {uid} metric 생성 실패: {e}")
+
+
+def _personal_metric_or_reason(decoded: dict | None):
+    """(metric, None) 또는 (None, 사유 코드)."""
+    if _cch is None or _personal_cache is None:
+        return None, "engine_unavailable"
+    if decoded is None:
+        return None, "login_required"
+    metric = _personal_cache.get(decoded["uid"])
+    if metric is not None:
+        return metric, None
+    return None, _personal_skip.get(decoded["uid"], "no_model")
+
+
+def _personal_flags(reason: str | None) -> dict:
+    """응답에 붙일 personalized / reason 필드 (FE RouteCompareResponse)."""
+    if reason is None:
+        return {"personalized": True}
+    return {"personalized": False, "reason_code": reason,
+            "reason": _PERSONAL_REASONS.get(reason, _PERSONAL_REASONS["no_model"])}
+
+
+def _shortest_len_m(origin: tuple, dest: tuple) -> float:
+    """우회 가드레일 기준 — 계단 회피 최단(최단 카드와 같은 기준) 경로 길이(m)."""
+    return _cch.find_distance_route(origin, dest)["total_length_m"]
 _subway_db: SubwayFacilityDB | None = None
 # extract_waypoints(G)는 그래프 전체 노드를 순회해 교차로를 찾는다 — 서울 전역
 # 그래프(수십만 노드)에서 이걸 매 /route 요청마다 다시 계산하면 요청당 유의미한
@@ -377,6 +451,10 @@ async def lifespan(app: FastAPI):
         init_db()
     except Exception as e:
         print(f"[DB] 초기화 실패 (DB 없이 계속 실행): {e}")
+    try:
+        _load_personal_metrics()
+    except Exception as e:
+        print(f"[PERSONAL] 적재 실패 (personal 비활성): {e}")
     try:
         _subway_db = get_facility_db()
         print("[Subway] 편의시설 DB 로딩 완료")
@@ -1339,6 +1417,10 @@ class RouteRequest(BaseModel):
     # 않을 GPS 안내 데이터를 매번 계산하는 낭비를 없앤다. 실제로 안내를 시작할
     # 경로(선택된 1개)는 이 플래그 없이 다시 조회해 전체 데이터를 받는다.
     light: bool = False
+    # S8 — single 모드에서 "personal" 이면 요청자 개인 metric 으로 메인 경로를 찾는다.
+    # 개인 파라미터가 없거나 fallback 조건 미충족이면 type 경로 + personalized=false.
+    # None/"type" = 기존 유형별 경로(기본). compare 모드에서는 무시(후보로 따로 붙음).
+    route_kind: str | None = None
 
 
 # ── 장소 검색 ─────────────────────────────────────────────────────────────────
@@ -1601,6 +1683,24 @@ def api_route(
         except Exception as e:
             print(f"[CCH] 쿼리 실패: {e}")
             raise ValueError("경로를 찾을 수 없습니다.")
+
+        # S8 — single 모드 route_kind="personal": 개인 metric 이 있으면 메인 경로를
+        # 그걸로 교체, 없으면(fallback) 위 type 경로 그대로 + personalized=false.
+        single_personal_reason = None
+        if body.route_kind == "personal" and body.candidates != "compare":
+            p_metric, single_personal_reason = _personal_metric_or_reason(decoded)
+            if p_metric is not None:
+                try:
+                    p_result = _cch.find_route_with_metric(
+                        origin, dest, p_metric, label="맞춤 경로", kind="personal",
+                    )
+                    if p_result["total_length_m"] > MAX_DETOUR_RATIO * _shortest_len_m(origin, dest):
+                        single_personal_reason = "detour_exceeded"
+                    else:
+                        result = p_result
+                except Exception as e:
+                    print(f"[route3] 맞춤경로 조회 실패 → type 경로 유지: {e}")
+                    single_personal_reason = "route_failed"
         _t_find_route = time.perf_counter()
 
         coords = [
@@ -1789,12 +1889,13 @@ def api_route(
             # FE의 PROXIMITY_THRESHOLD 도착판정·D신호 지도 하이라이트용).
             "measurement_units": measurement_units,
         }
+        if body.route_kind == "personal" and body.candidates != "compare":
+            response.update(_personal_flags(single_personal_reason))
 
         if body.candidates == "compare":
-            # "personal" 후보는 로그인한 사용자의 캐시에 θ 기반 metric이 이미 있을
-            # 때만 채워진다 (⑧ PersonalMetricCache). 배치 스크립트(⑨)가 아직 없어서
-            # 지금은 캐시가 항상 비어있고, 그래서 아직은 사실상 "type"+"distance" 2개
-            # 뿐이다 — 배치가 채워지기 시작하면 코드 변경 없이 자동으로 3개가 된다.
+            # "personal" 후보는 로그인한 사용자의 개인 metric 이 캐시에 있을 때만
+            # 채워진다 (⑧ PersonalMetricCache, S8 — 서버 시작 시 user_model_params 에서
+            # fallback 조건을 통과한 사용자만 적재). 못 주면 personalized=false + reason.
             # FE는 candidateRoutes 배열을 그대로 순회하면 되고, 길이를 2/3으로
             # 가정하면 안 된다. 라벨은 반드시 중립(예: "경로 A/B/C")으로 표시하고,
             # shown_pos는 매 응답마다 무작위로 섞어서 내려줘야 한다 (6.4절).
@@ -1861,60 +1962,66 @@ def api_route(
                 except Exception as e:
                     print(f"[route2] 거리경로 조회 실패 (무시): {e}")
 
-            if _personal_cache is not None and decoded is not None:
-                personal_metric = _personal_cache.get(decoded["uid"])
-                if personal_metric is not None:
-                    try:
-                        personal_result = _cch.find_route_with_metric(
-                            origin, dest, personal_metric,
-                            label="맞춤 경로", kind="personal",
+            personal_metric, personal_reason = _personal_metric_or_reason(decoded)
+            if personal_metric is not None:
+                try:
+                    personal_result = _cch.find_route_with_metric(
+                        origin, dest, personal_metric,
+                        label="맞춤 경로", kind="personal",
+                    )
+                    # 우회 가드레일(S8 설계 "우회비율 가드레일 유지") — type 경로와
+                    # 같은 기준(최단 대비 MAX_DETOUR_RATIO)을 넘으면 제시하지 않는다.
+                    shortest_len = (dist_result["total_length_m"] if dist_result is not None
+                                    else _shortest_len_m(origin, dest))
+                    if personal_result["total_length_m"] > MAX_DETOUR_RATIO * shortest_len:
+                        personal_reason = "detour_exceeded"
+                    # ①type/②distance 와 노드열이 같아도 후보로 넣는다 — FE
+                    # buildComparison 이 좌표 동일 후보를 한 카드로 병합(6.3절)하고
+                    # mergedKinds 에 personal 을 남기므로 가짜 선택은 생기지 않고,
+                    # "맞춤형도 같은 경로"라는 정보가 화면·로그에 보존된다.
+                    # (예전엔 여기서 버려서 personal 이 활성인데도 FE 가 "준비 중"으로 보였다.)
+                    else:
+                        personal_coords = [
+                            [G.nodes[n]["lon"], G.nodes[n]["lat"]]
+                            for n in personal_result["path_nodes"]
+                        ]
+                        personal_speed_profile: dict = {}
+                        try:
+                            personal_speed_profile = get_user_speed_profile(db, decoded["uid"])
+                        except Exception:
+                            pass
+                        personal_segs_for_time = [
+                            {"zone": classify_zone(s["slope_pct"], s["direction"], body.user_type),
+                             "direction": s["direction"], "length_m": s["length_m"]}
+                            for s in personal_result["segments"]
+                        ]
+                        personal_nav_segs, personal_waypoints = _nav_segs_and_waypoints(
+                            personal_result["path_nodes"], body.user_type
                         )
-                        # 이미 나온 경로(①type, ②distance)와 노드열이 같으면 중복
-                        # 후보로 넣지 않는다 (6.3절 — 가짜 선택 데이터가 β·γ 추정을 오염시킴).
-                        already_shown = any(
-                            r is not None and personal_result["path_nodes"] == r["path_nodes"]
-                            for r in (result, dist_result)
-                        )
-                        if not already_shown:
-                            personal_coords = [
-                                [G.nodes[n]["lon"], G.nodes[n]["lat"]]
-                                for n in personal_result["path_nodes"]
-                            ]
-                            personal_speed_profile: dict = {}
-                            try:
-                                personal_speed_profile = get_user_speed_profile(db, decoded["uid"])
-                            except Exception:
-                                pass
-                            personal_segs_for_time = [
-                                {"zone": classify_zone(s["slope_pct"], s["direction"], body.user_type),
-                                 "direction": s["direction"], "length_m": s["length_m"]}
-                                for s in personal_result["segments"]
-                            ]
-                            personal_nav_segs, personal_waypoints = _nav_segs_and_waypoints(
-                                personal_result["path_nodes"], body.user_type
-                            )
-                            try:
-                                personal_measurement_units = _measurement_units_payload(personal_result["path_nodes"])
-                            except Exception as _pmu_err:
-                                print(f"[NAV] personal 후보 measurement_units 생성 실패 (무시): {_pmu_err}")
-                                personal_measurement_units = []
-                            candidate_routes.append({
-                                "kind":          "personal",
-                                "coordinates":   personal_coords,
-                                "totalDistance": round(personal_result["total_length_m"], 1),
-                                "avgSlope":      round(personal_result["avg_slope_pct"], 2),
-                                "estimatedTimeS": estimate_route_time(
-                                    personal_segs_for_time, body.user_type, personal_speed_profile
-                                ),
-                                "routeSegments": _candidate_segs(personal_result["segments"], body.user_type),
-                                "navigation_segments": personal_nav_segs,
-                                "waypoints":     personal_waypoints,
-                                "measurement_units": personal_measurement_units,
-                            })
-                    except Exception as e:
-                        print(f"[route3] 맞춤경로 조회 실패 (무시): {e}")
+                        try:
+                            personal_measurement_units = _measurement_units_payload(personal_result["path_nodes"])
+                        except Exception as _pmu_err:
+                            print(f"[NAV] personal 후보 measurement_units 생성 실패 (무시): {_pmu_err}")
+                            personal_measurement_units = []
+                        candidate_routes.append({
+                            "kind":          "personal",
+                            "coordinates":   personal_coords,
+                            "totalDistance": round(personal_result["total_length_m"], 1),
+                            "avgSlope":      round(personal_result["avg_slope_pct"], 2),
+                            "estimatedTimeS": estimate_route_time(
+                                personal_segs_for_time, body.user_type, personal_speed_profile
+                            ),
+                            "routeSegments": _candidate_segs(personal_result["segments"], body.user_type),
+                            "navigation_segments": personal_nav_segs,
+                            "waypoints":     personal_waypoints,
+                            "measurement_units": personal_measurement_units,
+                        })
+                except Exception as e:
+                    print(f"[route3] 맞춤경로 조회 실패 (무시): {e}")
+                    personal_reason = "route_failed"
 
             response["candidateRoutes"] = candidate_routes
+            response.update(_personal_flags(personal_reason))
 
         # 도착지가 역이라 출구로 스냅했으면 FE 표시용 출구 정보(역·출구번호·시설·문구)
         if start_exit_info:
