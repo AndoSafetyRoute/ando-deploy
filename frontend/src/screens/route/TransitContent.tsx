@@ -1435,7 +1435,9 @@ export default function TransitContent({
   const navigatingRef = useRef(false);
 
   const handleStartNavigation = async () => {
-    if (!currentRoute || navigatingRef.current) return;
+    // 토글 계산 중엔 목록(currentRoute)은 이전 종류, routeKind 는 새 종류라 안내 경로가
+    // 섞인다 — 계산이 끝날 때까지 시작하지 않는다(버튼도 비활성).
+    if (!currentRoute || navigatingRef.current || kindLoading) return;
     navigatingRef.current = true;
     setTimeout(() => { navigatingRef.current = false; }, 1500);
 
@@ -1745,12 +1747,15 @@ export default function TransitContent({
 
       <View style={ss.startBtnWrap}>
         <TouchableOpacity
-          style={[ss.startBtn, { backgroundColor: C.subway }]}
+          style={[ss.startBtn, { backgroundColor: C.subway }, kindLoading && { opacity: 0.5 }]}
           activeOpacity={0.85}
+          disabled={kindLoading}
           onPress={handleStartNavigation}
         >
           <Text style={ss.startBtnIcon}>🚌</Text>
-          <Text style={ss.startBtnText}>{currentRoute?.tag} 경로로 대중교통 안내 시작</Text>
+          <Text style={ss.startBtnText}>
+            {kindLoading ? '도보 구간 계산 중...' : `${currentRoute?.tag} 경로로 대중교통 안내 시작`}
+          </Text>
           <Text style={ss.startBtnArrow}>→</Text>
         </TouchableOpacity>
       </View>
